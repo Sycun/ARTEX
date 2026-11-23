@@ -1700,3 +1700,288 @@ CREATE TABLE IF NOT EXISTS mcp_audit_log (
     duration_ms BIGINT NOT NULL DEFAULT 0,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 企业版首版：身份、项目、报告版本、审计。只追加，不改既有业务表的数据。
+CREATE TABLE IF NOT EXISTS ent_users (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    directory_status TEXT NOT NULL CHECK (directory_status IN ('pending_bind','verified','disabled')),
+    employment TEXT NOT NULL CHECK (employment IN ('active','inactive')),
+    platform_role TEXT NOT NULL DEFAULT '',
+    external_id TEXT,
+    directory_version BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ent_users_external ON ent_users(external_id) WHERE external_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS ent_identities (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES ent_users(id),
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (issuer, subject)
+);
+
+CREATE TABLE IF NOT EXISTS ent_sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES ent_users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    absolute_expires TIMESTAMPTZ NOT NULL,
+    idle_expires TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS ent_init_grants (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL CHECK (status IN ('pending','approved')),
+    approved_by TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_projects (
+    id TEXT PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active','archived')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_members (
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    user_id TEXT NOT NULL REFERENCES ent_users(id),
+    role TEXT NOT NULL CHECK (role IN ('owner','member','reader')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (project_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS ent_duties (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    user_id TEXT NOT NULL REFERENCES ent_users(id),
+    duty TEXT NOT NULL CHECK (duty IN ('approve','review','audit')),
+    granted_by TEXT NOT NULL,
+    grant_ref TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (project_id, user_id, duty)
+);
+
+CREATE TABLE IF NOT EXISTS ent_join_requests (
+    id TEXT PRIMARY KEY,
+    receipt_no TEXT NOT NULL UNIQUE,
+    applicant_id TEXT NOT NULL REFERENCES ent_users(id),
+    project_code TEXT NOT NULL,
+    project_id TEXT REFERENCES ent_projects(id),
+    purpose_display TEXT NOT NULL DEFAULT '',
+    purpose_sealed TEXT NOT NULL DEFAULT '',
+    credential_removed BOOLEAN NOT NULL DEFAULT false,
+    status TEXT NOT NULL CHECK (status IN ('pending','approved','rejected')),
+    role_granted TEXT NOT NULL DEFAULT '',
+    structured_reason TEXT NOT NULL DEFAULT '',
+    decided_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ent_join_open
+    ON ent_join_requests(applicant_id, project_code) WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS ent_project_findings (
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    finding_id BIGINT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    PRIMARY KEY (project_id, finding_id)
+);
+
+CREATE TABLE IF NOT EXISTS ent_project_tasks (
+    project_id TEXT NOT NULL REFERENCES ent_projects(id) ON DELETE CASCADE,
+    task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    sample_key TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (project_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ent_project_tasks_sample ON ent_project_tasks(sample_key);
+
+CREATE TABLE IF NOT EXISTS ent_originals (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    finding_id BIGINT NOT NULL,
+    filename TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_asset_obs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    asset_name TEXT NOT NULL,
+    observation TEXT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (project_id, asset_name)
+);
+
+CREATE TABLE IF NOT EXISTS ent_reports (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    title TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_finding_report (
+    finding_id BIGINT PRIMARY KEY REFERENCES findings(id) ON DELETE CASCADE,
+    report_id TEXT NOT NULL REFERENCES ent_reports(id)
+);
+
+CREATE TABLE IF NOT EXISTS ent_report_sources (
+    report_id TEXT NOT NULL REFERENCES ent_reports(id),
+    finding_id BIGINT NOT NULL,
+    PRIMARY KEY (report_id, finding_id)
+);
+
+CREATE TABLE IF NOT EXISTS ent_versions (
+    id TEXT PRIMARY KEY,
+    report_id TEXT NOT NULL REFERENCES ent_reports(id),
+    number INT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('draft','in_review','withdrawn','returned','issued')),
+    body TEXT NOT NULL DEFAULT '',
+    body_hash TEXT NOT NULL DEFAULT '',
+    editors JSONB NOT NULL DEFAULT '[]',
+    lineage JSONB NOT NULL DEFAULT '[]',
+    source_version_id TEXT,
+    submitted_by TEXT NOT NULL DEFAULT '',
+    frozen_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (report_id, number)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ent_version_open
+    ON ent_versions(report_id) WHERE status IN ('draft','in_review');
+
+CREATE TABLE IF NOT EXISTS ent_review_records (
+    version_id TEXT PRIMARY KEY REFERENCES ent_versions(id),
+    reason_display TEXT NOT NULL,
+    reason_sealed TEXT NOT NULL DEFAULT '',
+    credential_removed BOOLEAN NOT NULL DEFAULT false,
+    actor_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_issues (
+    version_id TEXT PRIMARY KEY REFERENCES ent_versions(id),
+    issuer_id TEXT NOT NULL,
+    file_hash TEXT NOT NULL,
+    file_bytes BYTEA NOT NULL,
+    filename TEXT NOT NULL,
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_delegations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    version_id TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    action TEXT NOT NULL,
+    grantee_id TEXT NOT NULL REFERENCES ent_users(id),
+    granted_by TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_audit_delegations (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES ent_projects(id),
+    grantee_id TEXT NOT NULL REFERENCES ent_users(id),
+    granted_by TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_original_grants (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    original_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('view_original','view_credential')),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS ent_evidence_requests (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    report_id TEXT NOT NULL,
+    finding_id BIGINT NOT NULL,
+    original_id TEXT NOT NULL,
+    applicant_id TEXT NOT NULL,
+    purpose_display TEXT NOT NULL DEFAULT '',
+    purpose_sealed TEXT NOT NULL DEFAULT '',
+    purpose_credential_removed BOOLEAN NOT NULL DEFAULT false,
+    status TEXT NOT NULL,
+    reason_display TEXT NOT NULL DEFAULT '',
+    reason_sealed TEXT NOT NULL DEFAULT '',
+    reason_credential_removed BOOLEAN NOT NULL DEFAULT false,
+    decided_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS ent_todos (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    project_id TEXT,
+    assignee_id TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    preview TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open','closed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ent_todo_open
+    ON ent_todos(kind, assignee_id, subject_id) WHERE status = 'open';
+
+CREATE TABLE IF NOT EXISTS ent_audit (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    actor_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    structured_reason TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    subject_type TEXT NOT NULL DEFAULT '',
+    subject_id TEXT NOT NULL DEFAULT '',
+    version_no INT,
+    content_hash TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_notifications (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_sample_loads (
+    sample_key TEXT PRIMARY KEY,
+    loaded_by TEXT NOT NULL,
+    finding_id BIGINT,
+    result JSONB NOT NULL DEFAULT '{}',
+    loaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ent_cold_archives (
+    id TEXT PRIMARY KEY,
+    sample_key TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_label TEXT NOT NULL,
+    status TEXT NOT NULL,
+    restored BOOLEAN NOT NULL DEFAULT false
+);
+
+CREATE TABLE IF NOT EXISTS ent_unclaimed (
+    id TEXT PRIMARY KEY,
+    sample_key TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    body_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    UNIQUE (sample_key, object_key)
+);

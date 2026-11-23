@@ -29,6 +29,9 @@ web/public/demo-version.json
 # docs
 /docs/
 
+# 企业版本地演示库与数据目录，不进入版本库
+/.demo/
+
 # os
 .DS_Store
 Thumbs.db

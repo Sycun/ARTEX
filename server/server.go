@@ -21,6 +21,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/enterprise"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/intercept/jev"
 	"github.com/Autumn-27/artex/llmpool"
@@ -52,6 +53,11 @@ type Server struct {
 	skillDir  string // root directory for skill subdirectories
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 	basicAuth basicAuthGate
+
+	entMode      bool
+	ent          *enterprise.Service
+	demo         *demoIDP
+	publicOrigin string
 
 	// mcpStoreOverride replaces the PostgreSQL-backed MCP server store in tests.
 	mcpStoreOverride mcpStore
@@ -319,6 +325,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		go s.runCredentialProcessor()
 	}
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.bootEnterprise()
 	return s
 }
 
@@ -1158,6 +1165,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/intercept/judge", s.interceptSetJudgeConfig)
 	mux.HandleFunc("GET /api/intercept/judge/usage", s.interceptJudgeUsage) // 兜底审批累计 token 用量
 
+	s.registerEnterprise(mux)
+
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (no JWT required; the optional Basic Auth gate wraps both). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
@@ -1270,6 +1279,12 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		"goals_total":   len(goals),
 		"goals_met":     goalsMet,
 	}
+	if _, ok := currentActor(r); ok {
+		delete(out, "traffic")
+		delete(out, "traffic_enabled")
+		delete(out, "assets")
+		delete(out, "asset_counts")
+	}
 	writeJSON(w, 200, out)
 }
 
@@ -1305,6 +1320,27 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 			Low:      metric.Findings.Low,
 		}
 		dtos = append(dtos, dto)
+	}
+	if actor, ok := currentActor(r); ok {
+		visible, err := s.ent.VisibleTaskIDs(r.Context(), actor)
+		if err != nil {
+			writeEnt(w, err)
+			return
+		}
+		allow := map[string]bool{}
+		for _, id := range visible {
+			allow[strconv.FormatInt(id, 10)] = true
+		}
+		scoped := make([]TaskDTO, 0, len(dtos))
+		for _, dto := range dtos {
+			if allow[dto.ID] {
+				scoped = append(scoped, dto)
+			}
+		}
+		dtos = scoped
+		if !allow[active] {
+			active = ""
+		}
 	}
 	writeJSON(w, 200, map[string]any{"tasks": dtos, "active": active})
 }
@@ -2334,6 +2370,51 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 			s.resolveAssetIDs(sourceAssetIDs),
 		)...)
 	}
+	if actor, ok := currentActor(r); ok {
+		scoped := make([]FindingDTO, 0, len(out))
+		for _, item := range out {
+			if item.Inherited {
+				continue
+			}
+			scoped = append(scoped, item)
+		}
+		taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+		if hide, err := s.ent.HidesEvidence(r.Context(), actor, taskID); err != nil {
+			writeEnt(w, err)
+			return
+		} else if hide {
+			for i := range scoped {
+				scoped[i].Evidence = ""
+			}
+		}
+		rows, err := s.ent.ProjectFindings(r.Context(), actor, taskID)
+		if err != nil {
+			writeEnt(w, err)
+			return
+		}
+		seen := map[string]bool{}
+		for _, item := range scoped {
+			if item.FindingID != "" {
+				seen[item.FindingID] = true
+			}
+		}
+		for _, row := range rows {
+			id := strconv.FormatInt(row.ID, 10)
+			if seen[id] {
+				continue
+			}
+			evidence := row.Evidence
+			if row.Redact {
+				evidence = ""
+			}
+			scoped = append(scoped, FindingDTO{
+				ID: id, FindingID: id, Name: row.Name, Severity: row.Severity, Status: row.Status,
+				Summary: row.Summary, Evidence: evidence, TaskID: t.ID, TaskDescription: t.Description,
+				TS: rfc3339(row.Created),
+			})
+		}
+		out = scoped
+	}
 	writeJSON(w, 200, out)
 }
 
@@ -2621,6 +2702,12 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	if id <= 0 {
 		writeErr(w, 400, "bad finding id")
 		return
+	}
+	if actor, ok := currentActor(r); ok {
+		if _, err := s.ent.FindingAccess(r.Context(), actor, id, true); err != nil {
+			writeEnt(w, err)
+			return
+		}
 	}
 	var body struct {
 		Status    *string `json:"status"`

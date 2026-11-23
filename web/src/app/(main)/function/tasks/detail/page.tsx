@@ -7,6 +7,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { ArchiveIcon, ArrowLeftIcon, BrainIcon, CheckIcon, CircleAlertIcon, PauseIcon, PlayIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import { WorkbenchBanner, useWorkbench } from "@/components/enterprise/workbench";
 import { IntelligencePanel } from "@/components/intelligence-panel";
 import { StatusBadge } from "@/components/status-badge";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
@@ -217,6 +218,7 @@ function TaskDetailInner() {
 
   const router = useRouter();
   const searchParams = useSearchParams();
+  const bench = useWorkbench();
   const id = searchParams.get("id") ?? "";
   const [task, setTask] = React.useState<Task | null>(null);
   const [paused, setPaused] = React.useState(false);
@@ -381,6 +383,7 @@ function TaskDetailInner() {
       className="flex flex-1 flex-col gap-0"
     >
       {/* Top fixed area */}
+      <WorkbenchBanner bench={bench} />
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
         <div className="flex items-center gap-2">
           <SidebarTrigger className="-ml-1" />
@@ -396,14 +399,14 @@ function TaskDetailInner() {
             {task.id}
           </code>
           <Separator orientation="vertical" className="mx-1 hidden h-4 sm:block" />
-          <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />
+          {!(bench?.active && !bench.can_run) && <TaskLLMControl task={task} profiles={profiles} onUpdated={load} />}
           <StatusBadge
             stopReason={task.stop_reason}
             domain={terminal ? "task" : "engine"}
             value={terminal ? task.status : engineMode}
             dot
           />
-          {canArchive ? (
+          {!(bench?.active && !bench.can_edit) && (canArchive ? (
             <AlertDialog>
               <AlertDialogTrigger asChild>{archiveTrigger}</AlertDialogTrigger>
               <AlertDialogContent>
@@ -430,11 +433,13 @@ function TaskDetailInner() {
               </TooltipTrigger>
               <TooltipContent>{archiveDisabledReason}</TooltipContent>
             </Tooltip>
+          ))}
+          {!(bench?.active && !bench.can_run) && (
+            <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
+              {controlIcon}
+              {controlLabel}
+            </Button>
           )}
-          <Button size="sm" variant={controlVariant} onClick={togglePause} disabled={terminal}>
-            {controlIcon}
-            {controlLabel}
-          </Button>
         </div>
         <p className="truncate text-xs text-muted-foreground">{task.goal}</p>
         {task.paused && task.pause_reason && (

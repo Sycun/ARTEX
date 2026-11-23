@@ -22,9 +22,11 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
+  const [enterprise, setEnterprise] = useState<"off" | "ready" | "down">("off");
   const [agreed, setAgreed] = useState(false);
   const [termsOpen, setTermsOpen] = useState(false);
   const [readToEnd, setReadToEnd] = useState(false);
+  const [switchReader, setSwitchReader] = useState(false);
   const termsBodyRef = useRef<HTMLDivElement>(null);
 
   // 滚动到条款底部（含无需滚动即可完整展示的情况）方可点击「同意」。
@@ -43,22 +45,41 @@ export default function LoginPage() {
   }, [termsOpen]);
 
   useEffect(() => {
-    // 已登录直接进主界面（静态导出下无 middleware 代劳这层跳转）。
-    const token = auth.getToken();
-    if (token) {
-      // localStorage 可能仍有凭据但 cookie 已丢失。先同步，再发起全新请求，
-      // 避免服务端守卫或路由缓存把跳转送回仍处于 checking 状态的登录页。
-      auth.setToken(token);
-      window.location.replace("/function/tasks");
-      return;
-    }
-    api
-      .authStatus()
-      .then(({ initialized }) => {
-        if (!initialized) router.replace("/setup");
+    const query = new URLSearchParams(window.location.search);
+    const down = query.get("idp") === "down";
+    setSwitchReader(query.get("switch") === "reader");
+    fetch("/api/enterprise/status")
+      .then((response) => (response.ok ? response.json() : { enterprise: false }))
+      .then((status: { enterprise?: boolean; idp_available?: boolean }) => {
+        if (status.enterprise) {
+          setEnterprise(!status.idp_available || down ? "down" : "ready");
+          const token = auth.getToken();
+          if (token && status.idp_available && !down) {
+            auth.setToken(token);
+            window.location.replace("/enterprise/landing");
+            return;
+          }
+          setChecking(false);
+          return;
+        }
+        const token = auth.getToken();
+        if (token) {
+          auth.setToken(token);
+          window.location.replace("/function/tasks");
+          return;
+        }
+        api
+          .authStatus()
+          .then(({ initialized }) => {
+            if (!initialized) router.replace("/setup");
+          })
+          .catch(() => setError("auth.backendUnavailable"))
+          .finally(() => setChecking(false));
       })
-      .catch(() => setError("auth.backendUnavailable"))
-      .finally(() => setChecking(false));
+      .catch(() => {
+        setError("auth.backendUnavailable");
+        setChecking(false);
+      });
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
@@ -105,49 +126,81 @@ export default function LoginPage() {
       <div className="flex w-full items-center justify-center bg-background p-8 lg:w-2/3">
         <div className="w-full max-w-md space-y-10 py-24 lg:py-32">
           <div className="space-y-4 text-center">
-            <h2 className="text-2xl font-medium tracking-tight">{t("auth.login")}</h2>
-            <p className="mx-auto max-w-xl text-muted-foreground">{t("auth.welcome")}</p>
+            <h2 className="text-2xl font-medium tracking-tight">
+              {enterprise === "off" ? t("auth.login") : "使用企业账号登录"}
+            </h2>
+            <p className="mx-auto max-w-xl text-muted-foreground">
+              {enterprise === "down"
+                ? "企业登录暂不可用。没有建立新会话。请等演示身份源恢复后再试。"
+                : enterprise === "ready"
+                  ? switchReader
+                    ? "下一步会打开企业登录。请选择梁阅，身份是项目 A 只读审核。口令使用下一页已经填好的虚构口令。这是重新登录，不会沿用平台管理员的权限。"
+                    : "使用企业账号登录。员工进入原来的任务工作台，领导进入报告与结论，平台管理员进入管理后台。岗位由服务端认定。"
+                  : t("auth.welcome")}
+            </p>
           </div>
-          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="username">{t("auth.username")}</Label>
-              <Input id="username" value="ARTEX" readOnly className="bg-muted text-muted-foreground" />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="password">{t("auth.password")}</Label>
-              <Input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder={t("auth.enterPassword")}
-                autoFocus
-                autoComplete="current-password"
-              />
-            </div>
-            <div className="flex items-start gap-2">
-              <Checkbox
-                id="agree-terms"
-                checked={agreed}
-                onCheckedChange={(v) => setAgreed(v === true)}
-                className="mt-0.5"
-              />
-              <Label htmlFor="agree-terms" className="text-sm font-normal leading-relaxed text-muted-foreground">
-                {t("auth.agreePrefix")}
-                <button
-                  type="button"
-                  onClick={() => setTermsOpen(true)}
-                  className="mx-0.5 font-medium text-primary underline-offset-4 hover:underline"
+          {enterprise !== "off" ? (
+            <div className="flex flex-col gap-4">
+              {enterprise === "down" ? (
+                <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                  企业登录暂不可用
+                </p>
+              ) : (
+                <Button
+                  className="w-full"
+                  onClick={() => {
+                    window.location.href = switchReader
+                      ? "/api/enterprise/login?prefer=demo-reader-a"
+                      : "/api/enterprise/login";
+                  }}
                 >
-                  {t("auth.termsLink")}
-                </button>
-              </Label>
+                  使用企业账号登录
+                </Button>
+              )}
+              {error && <p className="text-sm text-destructive">{error}</p>}
             </div>
-            {error && <p className="text-sm text-destructive">{t(error, { defaultValue: error })}</p>}
-            <Button type="submit" className="w-full" disabled={loading || !password || !agreed}>
-              {loading ? t("auth.signingIn") : t("auth.login")}
-            </Button>
-          </form>
+          ) : (
+            <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="username">{t("auth.username")}</Label>
+                <Input id="username" value="ARTEX" readOnly className="bg-muted text-muted-foreground" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="password">{t("auth.password")}</Label>
+                <Input
+                  id="password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder={t("auth.enterPassword")}
+                  autoFocus
+                  autoComplete="current-password"
+                />
+              </div>
+              <div className="flex items-start gap-2">
+                <Checkbox
+                  id="agree-terms"
+                  checked={agreed}
+                  onCheckedChange={(v) => setAgreed(v === true)}
+                  className="mt-0.5"
+                />
+                <Label htmlFor="agree-terms" className="text-sm font-normal leading-relaxed text-muted-foreground">
+                  {t("auth.agreePrefix")}
+                  <button
+                    type="button"
+                    onClick={() => setTermsOpen(true)}
+                    className="mx-0.5 font-medium text-primary underline-offset-4 hover:underline"
+                  >
+                    {t("auth.termsLink")}
+                  </button>
+                </Label>
+              </div>
+              {error && <p className="text-sm text-destructive">{t(error, { defaultValue: error })}</p>}
+              <Button type="submit" className="w-full" disabled={loading || !password || !agreed}>
+                {loading ? t("auth.signingIn") : t("auth.login")}
+              </Button>
+            </form>
+          )}
         </div>
       </div>
 

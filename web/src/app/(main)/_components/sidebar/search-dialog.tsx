@@ -39,9 +39,21 @@ function groupBy(items: SearchItem[]) {
   }));
 }
 
+function enterpriseSearchItems(): SearchItem[] {
+  const links = [...document.querySelectorAll<HTMLAnchorElement>('[data-sidebar="sidebar"] a[href]')];
+  const seen = new Set<string>();
+  return links.flatMap((link) => {
+    const url = link.getAttribute("href") ?? "";
+    const label = (link.textContent ?? "").replace(/\s+/g, " ").trim();
+    if (!url.startsWith("/enterprise") || !label || seen.has(url)) return [];
+    seen.add(url);
+    return [{ id: url, group: "当前可以进入的页面", label, url }];
+  });
+}
+
 export function SearchDialog() {
   const { t } = useTranslation();
-  const searchItems: SearchItem[] = getSidebarItems(t)
+  const globalItems: SearchItem[] = getSidebarItems(t)
     .flatMap((group) =>
       group.items.flatMap((item) =>
         item.subItems
@@ -50,7 +62,12 @@ export function SearchDialog() {
       ),
     )
     .filter((item) => !item.disabled && !item.url.includes("coming-soon"));
+  const [enterprise, setEnterprise] = React.useState(false);
   const [open, setOpen] = React.useState(false);
+  React.useEffect(() => {
+    setEnterprise(document.cookie.includes("artex_enterprise=1"));
+  }, []);
+  const searchItems = enterprise ? enterpriseSearchItems() : globalItems;
   const [query, setQuery] = React.useState("");
   const router = useRouter();
 

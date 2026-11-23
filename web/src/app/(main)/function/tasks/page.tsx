@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 import {
   DndContext,
@@ -125,6 +126,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { WorkbenchBanner, useWorkbench } from "@/components/enterprise/workbench";
 import { taskError } from "@/i18n/task-runtime";
 import { useLiveTranslation } from "@/i18n/use-live-translation";
 import { api, type ScheduleInput } from "@/lib/api";
@@ -353,6 +355,12 @@ function compareTasks(left: Task, right: Task, field: TaskSortField, direction: 
 }
 
 export default function TasksPage() {
+  const bench = useWorkbench();
+  const router = useRouter();
+  React.useEffect(() => {
+    if (bench?.post === "leader") router.replace("/enterprise/conclusions");
+    if (bench?.post === "reviewer") router.replace("/enterprise/todos");
+  }, [bench, router]);
   const { t: translate, liveT } = useLiveTranslation();
   const [activeTab, setActiveTab] = React.useState("current");
   const [tasks, setTasks] = React.useState<Task[]>([]);
@@ -954,6 +962,7 @@ export default function TasksPage() {
 
   return (
     <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
+      <WorkbenchBanner bench={bench} />
       <TabsList className="mx-4 lg:mx-6">
         <TabsTrigger value="current">{translate("taskUI.currentTasks")}</TabsTrigger>
         <TabsTrigger value="archived">{translate("taskUI.archived")}</TabsTrigger>

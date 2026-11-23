@@ -47,6 +47,7 @@ export function EgressIpProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   React.useEffect(() => {
+    if (document.cookie.includes("artex_enterprise=1")) return;
     let cancelled = false;
     api
       .settings()

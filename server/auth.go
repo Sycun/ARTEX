@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"log"
@@ -120,13 +121,41 @@ func extractToken(r *http.Request) string {
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" || p == "/api/basic-auth/check" {
+		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" || p == "/api/basic-auth/check" || s.enterprisePublic(p) {
 			h.ServeHTTP(w, r)
 			return
 		}
 		tok := extractToken(r)
 		if tok == "" {
 			writeProductError(w, 401, "unauthorized", "未授权", nil)
+			return
+		}
+		if s.entMode {
+			if sid, ok := s.enterpriseSessionID(tok); ok {
+				actor, err := s.ent.TouchSession(r.Context(), sid)
+				if err != nil {
+					writeEnt(w, err)
+					return
+				}
+				if actor.Gate() != "ready" && !enterpriseLimited(r) {
+					if actor.Gate() == "disabled" {
+						writeProductError(w, 403, "account_disabled", "账号已停用。请由企业目录恢复账号。页面上的联系人是平台管理员林衡。", nil)
+					} else {
+						writeProductError(w, 403, "pending_bind", "目录身份尚未核验，还不能进入项目。", nil)
+					}
+					return
+				}
+				if !enterpriseAllows(p) && !s.allowEnterpriseWorkbench(w, r, actor) {
+					return
+				}
+				h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey{}, actor)))
+				return
+			}
+			if verifyJWT(tok, s.jwtKey) {
+				writeProductError(w, 401, "enterprise_sso", "请使用企业账号登录。共享密码登录已关闭。", nil)
+				return
+			}
+			writeProductError(w, 401, "token_expired", "token 无效或已过期", nil)
 			return
 		}
 		if !verifyJWT(tok, s.jwtKey) {
@@ -262,6 +291,10 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/auth/login — validates username/password and returns a JWT.
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
+	if s.entMode {
+		writeProductError(w, 403, "enterprise_sso", "企业账号登录已开启，密码登录已关闭。请使用企业账号登录。", nil)
+		return
+	}
 	pg := s.pg(w)
 	if pg == nil {
 		return

@@ -526,6 +526,24 @@ func (s *Server) caseReviewRuns(w http.ResponseWriter, r *http.Request) {
 		caseHTTPError(w, err)
 		return
 	}
+	if actor, ok := currentActor(r); ok {
+		visible, err := s.ent.VisibleTaskIDs(r.Context(), actor)
+		if err != nil {
+			writeEnt(w, err)
+			return
+		}
+		allow := map[string]bool{}
+		for _, id := range visible {
+			allow[strconv.FormatInt(id, 10)] = true
+		}
+		scoped := items[:0]
+		for _, item := range items {
+			if allow[fmt.Sprint(item["task_id"])] {
+				scoped = append(scoped, item)
+			}
+		}
+		items = scoped
+	}
 	writeJSON(w, 200, items)
 }
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -22,6 +23,13 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
 	}
+	if actor, ok := currentActor(r); ok {
+		id, _ := strconv.ParseInt(taskID, 10, 64)
+		if _, err := s.ent.TaskAccess(r.Context(), actor, id, true); err != nil {
+			writeEnt(w, err)
+			return
+		}
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxTaskMetadataRequestSize)
 	var request struct {
 		Name              *string `json:"name"`
@@ -36,6 +44,10 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 		} else {
 			writeErr(w, http.StatusBadRequest, err.Error())
 		}
+		return
+	}
+	if _, ok := currentActor(r); ok && request.ShareGlobalAssets != nil {
+		writeProductError(w, http.StatusForbidden, "read_only", "企业会话不能改全局资产共享", nil)
 		return
 	}
 	if request.Name == nil && request.Pinned == nil && request.Remark == nil && request.ShareGlobalAssets == nil {

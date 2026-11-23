@@ -35,10 +35,19 @@ export const auth = {
     try {
       const parts = token.split(".");
       if (parts.length !== 3) return null;
-      // base64url → base64
-      const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
-      const username: string = payload.sub ?? "ARTEX";
-      return { id: "1", name: username, username, email: "", avatar: "", role: "operator" };
+      const binary = atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"));
+      const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+      const payload = JSON.parse(new TextDecoder().decode(bytes));
+      const display = typeof payload.name === "string" ? payload.name.trim() : "";
+      const username: string = display || (payload.ent ? "企业账号" : (payload.sub ?? "ARTEX"));
+      return {
+        id: "1",
+        name: username,
+        username,
+        email: "",
+        avatar: "",
+        role: payload.ent ? "enterprise" : "operator",
+      };
     } catch {
       return null;
     }

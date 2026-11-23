@@ -7,6 +7,8 @@ import { ArrowDownIcon, ArrowUpIcon, ArrowUpRightIcon, ChevronRightIcon, SearchI
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { FindingReport } from "@/components/enterprise/finding-report";
+import { useWorkbench } from "@/components/enterprise/workbench";
 import { FindingCaseList } from "@/components/finding-case-list";
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
@@ -48,12 +50,15 @@ function Row({
   f,
   contextTaskId,
   onStatus,
+  canCompose,
 }: {
   f: Finding;
   contextTaskId: string;
   onStatus: (f: Finding, next: FindingStatus) => void;
+  canCompose: boolean;
 }) {
   const { ui } = useUITranslation();
+  const bench = useWorkbench();
 
   const { t } = useTranslation();
   const [open, setOpen] = React.useState(false);
@@ -100,7 +105,7 @@ function Row({
             {f.assets.length > 2 && <span className="text-xs text-muted-foreground">+{f.assets.length - 2}</span>}
           </div>
         )}
-        {f.finding_id && !f.inherited ? (
+        {f.finding_id && !f.inherited && bench?.can_edit !== false ? (
           <Select value={f.status} onValueChange={(v) => onStatus(f, v as FindingStatus)}>
             <SelectTrigger size="sm" className="h-7 w-28 shrink-0 border-none px-1 shadow-none focus-visible:ring-0">
               <StatusBadge domain="finding" value={f.status} dot />
@@ -136,8 +141,11 @@ function Row({
         <div className="bg-muted/30 px-4 pb-4 pl-11">
           <div className="mb-1 text-xs font-medium text-muted-foreground">{ui("screen.c13ed981c63391")}</div>
           <pre className="overflow-auto rounded-md border bg-background p-3 font-mono text-xs whitespace-pre-wrap">
-            {f.evidence}
+            {f.evidence || "没有可展示的证据正文。"}
           </pre>
+          {canCompose && f.finding_id && (
+            <FindingReport findingID={f.finding_id} title={findingLabel(f, ui)} />
+          )}
         </div>
       )}
     </div>
@@ -146,6 +154,7 @@ function Row({
 
 export function FindingsTab({ taskId }: { taskId: string }) {
   const { ui, liveUI } = useUITranslation();
+  const bench = useWorkbench();
 
   const { t } = useTranslation();
   const [findings, setFindings] = React.useState<Finding[]>([]);
@@ -343,7 +352,7 @@ export function FindingsTab({ taskId }: { taskId: string }) {
               </span>
             </div>
             {items.map((f) => (
-              <Row key={f.id} f={f} contextTaskId={taskId} onStatus={onStatus} />
+              <Row key={f.id} f={f} contextTaskId={taskId} onStatus={onStatus} canCompose={bench?.can_edit === true} />
             ))}
             {items.length === 0 && (
               <p className="px-4 py-8 text-center text-sm text-muted-foreground">

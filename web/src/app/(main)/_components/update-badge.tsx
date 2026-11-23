@@ -24,6 +24,7 @@ export function UpdateBadge() {
   const [latest, setLatest] = React.useState("");
 
   React.useEffect(() => {
+    if (document.cookie.includes("artex_enterprise=1")) return;
     let alive = true;
     api
       .checkUpdate()
