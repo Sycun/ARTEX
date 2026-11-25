@@ -8,7 +8,7 @@ import { useParams, useSearchParams } from "next/navigation";
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { auth } from "@/lib/auth";
+import { apiFetch } from "@/lib/api";
 import { currentProject, EntError, ent, projectPath, sha256 } from "@/lib/enterprise-api";
 
 type Version = {
@@ -285,10 +285,7 @@ async function download(
   setFileText: (value: string) => void,
   setError: (value: string) => void,
 ) {
-  const token = auth.getToken();
-  const response = await fetch(`/api/enterprise/reports/${reportID}/versions/${versionID}/download`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
-  });
+  const response = await apiFetch(`/api/enterprise/reports/${reportID}/versions/${versionID}/download`);
   if (!response.ok) {
     const data = (await response.json().catch(() => ({}))) as { message?: string };
     setError(data.message || "找不到可下载的签发文件");

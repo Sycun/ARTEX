@@ -414,13 +414,18 @@ func TestBasicAuthCORS(t *testing.T) {
 	for _, tc := range []struct {
 		origin      string
 		credentials bool
+		enterprise  bool
 	}{
-		{"http://127.0.0.1:3000", true}, {"https://evil.test", false}, {"http://127.0.0.1.evil.test:3000", false},
+		{origin: "http://127.0.0.1:3000", credentials: true},
+		{origin: "http://127.0.0.1:3000", enterprise: true},
+		{origin: "https://evil.test"},
+		{origin: "http://127.0.0.1.evil.test:3000"},
 	} {
 		r := httptest.NewRequest("OPTIONS", "http://127.0.0.1:8787/api/settings/basic-auth", nil)
 		r.Header.Set("Origin", tc.origin)
 		w := httptest.NewRecorder()
-		cors(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("preflight reached handler") })).ServeHTTP(w, r)
+		s := &Server{entMode: tc.enterprise}
+		s.cors(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("preflight reached handler") })).ServeHTTP(w, r)
 		if w.Code != 204 || (w.Header().Get("Access-Control-Allow-Credentials") == "true") != tc.credentials {
 			t.Fatalf("unexpected CORS for %s: %v", tc.origin, w.Header())
 		}

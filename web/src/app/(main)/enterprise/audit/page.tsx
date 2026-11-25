@@ -7,7 +7,7 @@ import { useParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
-import { auth } from "@/lib/auth";
+import { apiFetch } from "@/lib/api";
 import { currentProject, ent, type Me, projectPath, sha256 } from "@/lib/enterprise-api";
 
 type Event = {
@@ -69,10 +69,7 @@ export default function AuditPage() {
       setError("尚无签发版，现在没有可下载的文件。");
       return;
     }
-    const token = auth.getToken();
-    const response = await fetch(`/api/enterprise/reports/${reportID}/versions/${versionID}/download`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
+    const response = await apiFetch(`/api/enterprise/reports/${reportID}/versions/${versionID}/download`);
     if (!response.ok) {
       setError("找不到可下载的签发文件");
       return;

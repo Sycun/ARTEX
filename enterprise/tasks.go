@@ -92,12 +92,21 @@ func (s *Service) ListTasks(ctx context.Context, a Actor, projectID string, q Ta
 		return TaskList{}, err
 	}
 	rows, err := s.DB.QueryContext(ctx, `
-		SELECT t.id, t.name, t.status, t.completed_at, pt.sample_key,
-		       (SELECT count(*) FROM findings f
-		         JOIN ent_project_findings p ON p.finding_id=f.id AND p.project_id=pt.project_id
-		         WHERE f.task_id=t.id)
-		FROM ent_project_tasks pt JOIN tasks t ON t.id=pt.task_id
-		`+where+` ORDER BY t.completed_at DESC NULLS LAST, t.id DESC LIMIT $4 OFFSET $5`,
+		WITH page_tasks AS (
+			SELECT t.id, t.name, t.status, t.completed_at, pt.sample_key
+			FROM ent_project_tasks pt JOIN tasks t ON t.id=pt.task_id
+			`+where+`
+			ORDER BY t.completed_at DESC NULLS LAST, t.id DESC LIMIT $4 OFFSET $5
+		), finding_counts AS (
+			SELECT f.task_id, count(*) AS total
+			FROM page_tasks t
+			JOIN findings f ON f.task_id=t.id
+			JOIN ent_project_findings p ON p.finding_id=f.id AND p.project_id=$1
+			GROUP BY f.task_id
+		)
+		SELECT t.id, t.name, t.status, t.completed_at, t.sample_key, COALESCE(f.total, 0)
+		FROM page_tasks t LEFT JOIN finding_counts f ON f.task_id=t.id
+		ORDER BY t.completed_at DESC NULLS LAST, t.id DESC`,
 		append(args, size, (page-1)*size)...)
 	if err != nil {
 		return TaskList{}, err

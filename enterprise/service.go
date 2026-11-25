@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	IdleTimeout     = 30 * time.Minute
-	AbsoluteTimeout = 8 * time.Hour
+	IdleTimeout          = 30 * time.Minute
+	AbsoluteTimeout      = 8 * time.Hour
+	sessionTouchInterval = 2 * time.Minute
 
 	UserAdmin    = "usr-admin"
 	UserOwnerA   = "usr-owner-a"
@@ -241,10 +242,10 @@ func (s *Service) TouchSession(ctx context.Context, sessionID string) (Actor, er
 	var userID string
 	var project sql.NullString
 	var revoked sql.NullTime
-	var abs, idle time.Time
+	var abs, idle, lastSeen time.Time
 	err := s.DB.QueryRowContext(ctx, `
-		SELECT user_id, revoked_at, absolute_expires, idle_expires, project_id
-		FROM ent_sessions WHERE id=$1`, sessionID).Scan(&userID, &revoked, &abs, &idle, &project)
+		SELECT user_id, revoked_at, absolute_expires, idle_expires, project_id, last_seen
+		FROM ent_sessions WHERE id=$1`, sessionID).Scan(&userID, &revoked, &abs, &idle, &project, &lastSeen)
 	if errors.Is(err, sql.ErrNoRows) || revoked.Valid {
 		return Actor{}, fail(401, "session_ended", "登录已失效，请重新使用企业账号登录", nil)
 	}
@@ -261,9 +262,13 @@ func (s *Service) TouchSession(ctx context.Context, sessionID string) (Actor, er
 	if err != nil {
 		return Actor{}, err
 	}
-	idleTo := now.Add(IdleTimeout)
-	if _, err := s.DB.ExecContext(ctx, `UPDATE ent_sessions SET last_seen=$2, idle_expires=$3 WHERE id=$1`, sessionID, now, idleTo); err != nil {
-		return Actor{}, err
+	if now.Sub(lastSeen) >= sessionTouchInterval {
+		if _, err := s.DB.ExecContext(ctx, `
+			UPDATE ent_sessions SET last_seen=$2, idle_expires=$3
+			WHERE id=$1 AND revoked_at IS NULL AND last_seen <= $4`,
+			sessionID, now, now.Add(IdleTimeout), now.Add(-sessionTouchInterval)); err != nil {
+			return Actor{}, err
+		}
 	}
 	return Actor{User: u, SessionID: sessionID, SessionProject: project.String}, nil
 }

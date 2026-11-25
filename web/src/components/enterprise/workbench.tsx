@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 
 import { auth } from "@/lib/auth";
+import { ent } from "@/lib/enterprise-api";
 
 export type Workbench = {
   active: boolean;
@@ -21,13 +22,9 @@ export type Workbench = {
 export function useWorkbench(): Workbench | null {
   const [bench, setBench] = useState<Workbench | null>(null);
   useEffect(() => {
-    if (!document.cookie.includes("artex_enterprise=1")) return;
-    const token = auth.getToken();
-    fetch("/api/enterprise/workbench", {
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((value: Workbench | null) => setBench(value))
+    if (!auth.hasEnterpriseSession()) return;
+    ent<Workbench>("/workbench")
+      .then(setBench)
       .catch(() => setBench(null));
   }, []);
   return bench;

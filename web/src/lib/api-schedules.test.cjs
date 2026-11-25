@@ -22,6 +22,7 @@ vm.runInNewContext(
     URLSearchParams,
     process: { env: {} },
     require: (id) => {
+      if (id === "@/lib/auth") return { auth: { getToken: () => null, hasEnterpriseSession: () => false } };
       if (id === "@/lib/mock/enabled") return { MOCK: true };
       if (id === "@/lib/mock/handler") return { mockHandle };
       throw new Error(`Unexpected import: ${id}`);

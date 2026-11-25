@@ -18,6 +18,7 @@ function client(payload) {
     process: { env: {} },
     URLSearchParams,
     require: (id) => {
+      if (id === "@/lib/auth") return { auth: { getToken: () => null, hasEnterpriseSession: () => false } };
       if (id === "@/lib/mock/enabled") return { MOCK: false };
       if (id === "@/lib/mock/handler") return { mockHandle: () => assert.fail("unexpected demo request") };
       throw new Error(`Unexpected runtime import: ${id}`);

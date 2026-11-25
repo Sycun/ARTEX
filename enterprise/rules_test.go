@@ -1,7 +1,11 @@
 package enterprise
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +13,203 @@ import (
 
 	"github.com/Autumn-27/artex/db"
 )
+
+func TestOriginalApprovalAndRevocation(t *testing.T) {
+	svc := testService(t)
+	ctx := t.Context()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	svc.Clock = func() time.Time { return now }
+	sample, err := svc.ImportSample(ctx, svc.as(t, UserAdmin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, applicant, reviewer := svc.as(t, UserOwnerA), svc.as(t, UserAnalyst), svc.as(t, UserReviewer)
+	for _, user := range []Actor{applicant, reviewer} {
+		if err := svc.AddMember(ctx, owner, sample.ProjectAID, MemberInput{UserID: user.ID, Role: "member", Duties: []string{"review"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := svc.AddMember(ctx, owner, sample.ProjectAID, MemberInput{UserID: UserMemberB, Role: "member"}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := svc.OpenReport(ctx, applicant, sample.FindingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const originalID = "orig-demo-ns-001"
+	want, err := os.ReadFile(filepath.Join(svc.Restricted, "demo-ns-001-login.png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(t *testing.T) EvidenceRequest {
+		t.Helper()
+		r, err := svc.RequestOriginal(ctx, applicant, report.ID, "核对演示发现")
+		if err != nil || r.Status != "pending" {
+			t.Fatalf("request = %+v, err = %v", r, err)
+		}
+		return r
+	}
+	assertDenied := func(t *testing.T, requestID string, actor Actor) {
+		t.Helper()
+		body, err := svc.ReadOriginal(ctx, actor, originalID)
+		var failure *Fail
+		if len(body) != 0 || !errors.As(err, &failure) || failure.Status != 404 {
+			t.Fatalf("original read returned %d bytes, err = %v", len(body), err)
+		}
+		view, err := svc.GetEvidence(ctx, actor, requestID)
+		if err != nil || view.Previewable || view.OriginalID != "" {
+			t.Fatalf("evidence view = %+v, err = %v", view, err)
+		}
+	}
+	assertAllowed := func(t *testing.T, requestID string) {
+		t.Helper()
+		view, err := svc.GetEvidence(ctx, applicant, requestID)
+		if err != nil || !view.Previewable || view.OriginalID != originalID || view.OriginalFilename != "login-error.png" {
+			t.Fatalf("evidence view = %+v, err = %v", view, err)
+		}
+		body, err := svc.ReadOriginal(ctx, applicant, originalID)
+		if err != nil || !bytes.Equal(body, want) {
+			t.Fatalf("original bytes match = %v, err = %v", bytes.Equal(body, want), err)
+		}
+	}
+	approve := func(t *testing.T, actor Actor, requestID string, in OriginalApproval) EvidenceRequest {
+		t.Helper()
+		view, err := svc.ApproveOriginal(ctx, actor, requestID, in)
+		if err != nil || view.Status != "approved" || !view.CanRevoke || view.Previewable {
+			t.Fatalf("approval = %+v, err = %v", view, err)
+		}
+		return view
+	}
+	both := OriginalApproval{Actions: []string{ViewOriginal, ViewCredential}}
+
+	first := request(t)
+	for _, tc := range []struct {
+		actor Actor
+		code  string
+	}{
+		{applicant, "self_approval"},
+		{svc.as(t, UserMemberB), "not_reviewer"},
+	} {
+		_, err := svc.ApproveOriginal(ctx, tc.actor, first.ID, both)
+		var failure *Fail
+		if !errors.As(err, &failure) || failure.Code != tc.code {
+			t.Fatalf("approval by %s: %v", tc.actor.ID, err)
+		}
+	}
+	if view, err := svc.GetEvidence(ctx, applicant, first.ID); err != nil || view.CanApprove || view.Status != "pending" || len(view.Grants) != 0 {
+		t.Fatalf("request after denied approvals = %+v, err = %v", view, err)
+	}
+	tooLong := OriginalApproval{Actions: both.Actions, ExpiresAt: now.Add(originalGrantTTL + time.Second)}
+	if _, err := svc.ApproveOriginal(ctx, reviewer, first.ID, tooLong); err == nil {
+		t.Fatal("approval accepted an expiry over one workday")
+	}
+	for _, handler := range []Actor{owner, reviewer} {
+		items, err := svc.Todos(ctx, handler)
+		if err != nil || len(items) != 1 || items[0].SubjectID != first.ID {
+			t.Fatalf("todos for %s = %+v, err = %v", handler.ID, items, err)
+		}
+	}
+	partial := approve(t, owner, first.ID, OriginalApproval{Actions: []string{ViewOriginal}})
+	if len(partial.Grants) != 1 || !partial.Grants[0].ExpiresAt.Equal(now.Add(originalGrantTTL)) {
+		t.Fatalf("default grant = %+v", partial.Grants)
+	}
+	for _, handler := range []Actor{owner, reviewer} {
+		if items, err := svc.Todos(ctx, handler); err != nil || len(items) != 0 {
+			t.Fatalf("approval left open todos for %s: %+v, err = %v", handler.ID, items, err)
+		}
+	}
+	assertDenied(t, first.ID, applicant)
+	assertDenied(t, first.ID, owner)
+	// Retrying the decision must not add actions to the approved request.
+	if retry := approve(t, reviewer, first.ID, both); len(retry.Grants) != 1 {
+		t.Fatalf("retry added grants: %+v", retry.Grants)
+	}
+
+	second := request(t)
+	expires := now.Add(time.Hour)
+	approve(t, reviewer, second.ID, OriginalApproval{Actions: both.Actions, ExpiresAt: expires})
+	assertAllowed(t, second.ID)
+	var reads, approvals int
+	if err := svc.DB.QueryRowContext(ctx, `SELECT
+		count(*) FILTER (WHERE action='original_read' AND subject_id=$1 AND content_hash=$2),
+		count(*) FILTER (WHERE action='original_approved') FROM ent_audit`, originalID, Hash(want)).Scan(&reads, &approvals); err != nil || reads != 1 || approvals != 2 {
+		t.Fatalf("audited reads = %d, approvals = %d, err = %v", reads, approvals, err)
+	}
+	now = expires
+	assertDenied(t, second.ID, applicant)
+	if view, err := svc.GetEvidence(ctx, applicant, second.ID); err != nil || len(view.Grants) != 2 || view.Grants[0].Status != "expired" || view.Grants[1].Status != "expired" {
+		t.Fatalf("expired grants = %+v, err = %v", view.Grants, err)
+	}
+
+	for _, tc := range []struct {
+		name, invalidate, restore string
+		args                      []any
+	}{
+		{"removed membership", `DELETE FROM ent_members WHERE project_id=$1 AND user_id=$2`,
+			`INSERT INTO ent_members (project_id,user_id,role) VALUES ($1,$2,'member')`, []any{sample.ProjectAID, applicant.ID}},
+		{"read-only role", `UPDATE ent_members SET role='reader' WHERE project_id=$1 AND user_id=$2`,
+			`UPDATE ent_members SET role='member' WHERE project_id=$1 AND user_id=$2`, []any{sample.ProjectAID, applicant.ID}},
+		{"read-only post", `UPDATE ent_members SET post='reader' WHERE project_id=$1 AND user_id=$2`,
+			`UPDATE ent_members SET post='' WHERE project_id=$1 AND user_id=$2`, []any{sample.ProjectAID, applicant.ID}},
+		{"disabled account", `UPDATE ent_users SET directory_status='disabled' WHERE id=$1`,
+			`UPDATE ent_users SET directory_status='verified' WHERE id=$1`, []any{applicant.ID}},
+		{"archived project", `UPDATE ent_projects SET status='archived' WHERE id=$1`,
+			`UPDATE ent_projects SET status='active' WHERE id=$1`, []any{sample.ProjectAID}},
+		{"explicit revocation", "", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := request(t)
+			approve(t, reviewer, r.ID, both)
+			assertAllowed(t, r.ID)
+			if tc.invalidate != "" {
+				if _, err := svc.DB.ExecContext(ctx, tc.invalidate, tc.args...); err != nil {
+					t.Fatal(err)
+				}
+				assertDenied(t, r.ID, applicant)
+				if _, err := svc.DB.ExecContext(ctx, tc.restore, tc.args...); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := svc.RevokeOriginal(ctx, owner, r.ID); err != nil {
+				t.Fatal(err)
+			}
+			assertDenied(t, r.ID, applicant)
+			if view, err := svc.GetEvidence(ctx, applicant, r.ID); err != nil || len(view.Grants) != 2 || view.Grants[0].Status != "revoked" || view.Grants[1].Status != "revoked" {
+				t.Fatalf("revoked grants = %+v, err = %v", view.Grants, err)
+			}
+		})
+	}
+
+	var plainFinding int64
+	if err := svc.DB.QueryRowContext(ctx, `INSERT INTO findings (name, severity, status)
+		VALUES ('无凭据的发现','low','pending') RETURNING id`).Scan(&plainFinding); err != nil {
+		t.Fatal(err)
+	}
+	plainBytes := []byte("普通核验记录")
+	plainPath := filepath.Join(svc.Restricted, "verification.txt")
+	if err := os.WriteFile(plainPath, plainBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.DB.ExecContext(ctx, `INSERT INTO ent_project_findings (project_id, finding_id) VALUES ($1,$2)`, sample.ProjectAID, plainFinding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.DB.ExecContext(ctx, `INSERT INTO ent_originals (id, project_id, finding_id, filename, sha256, storage_path, contains_credentials)
+		VALUES ('orig-plain',$1,$2,'verification.txt',$3,$4,false)`, sample.ProjectAID, plainFinding, Hash(plainBytes), plainPath); err != nil {
+		t.Fatal(err)
+	}
+	plainReport, err := svc.OpenReport(ctx, applicant, plainFinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := svc.RequestOriginal(ctx, applicant, plainReport.ID, "核对普通记录")
+	if err != nil || plain.RequiresCredential {
+		t.Fatalf("ordinary original request = %+v, err = %v", plain, err)
+	}
+	approve(t, reviewer, plain.ID, OriginalApproval{Actions: []string{ViewOriginal}})
+	if body, err := svc.ReadOriginal(ctx, applicant, "orig-plain"); err != nil || !bytes.Equal(body, plainBytes) {
+		t.Fatalf("ordinary original bytes match = %v, err = %v", bytes.Equal(body, plainBytes), err)
+	}
+	assertDenied(t, first.ID, applicant)
+}
 
 func testService(t *testing.T) *Service {
 	t.Helper()

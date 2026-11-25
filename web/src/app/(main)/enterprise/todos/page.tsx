@@ -5,9 +5,17 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 
+import { OriginalApproval } from "@/components/enterprise/original-approval";
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
-import { currentProject, ent, projectPath, setProject } from "@/lib/enterprise-api";
+import {
+  currentProject,
+  ent,
+  getOriginalRequest,
+  type OriginalRequest,
+  projectPath,
+  setProject,
+} from "@/lib/enterprise-api";
 
 type Todo = {
   id: string;
@@ -66,9 +74,13 @@ export default function TodosPage() {
             <p className="text-sm text-muted-foreground">{item.preview}</p>
             {item.kind === "join_request" && <JoinCard id={item.subject_id} onDecide={decide} />}
             {item.kind === "original_request" && (
-              <Button asChild size="sm">
-                <Link href={`/enterprise/evidence?id=${item.subject_id}`}>打开原件申请</Link>
-              </Button>
+              <OriginalRequestCard
+                id={item.subject_id}
+                onApproved={async (request) => {
+                  setMessage(`原件申请${request.status_label}。`);
+                  await load();
+                }}
+              />
             )}
             {item.report_id && item.kind !== "original_request" && (
               <Button asChild size="sm">
@@ -91,6 +103,44 @@ export default function TodosPage() {
       </div>
       {!currentProject() && <p className="text-sm text-muted-foreground">处理加入请求不会签发报告。</p>}
     </Page>
+  );
+}
+
+function OriginalRequestCard({
+  id,
+  onApproved,
+}: {
+  id: string;
+  onApproved: (request: OriginalRequest) => Promise<void>;
+}) {
+  const [request, setRequest] = useState<OriginalRequest | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const controller = new AbortController();
+    void getOriginalRequest(id, controller.signal)
+      .then(setRequest)
+      .catch((reason: Error) => {
+        if (!controller.signal.aborted) setError(reason.message);
+      });
+    return () => controller.abort();
+  }, [id]);
+  return (
+    <div className="space-y-2 text-sm">
+      {error && <p role="alert">{error}</p>}
+      {request?.purpose && <p>用途：{request.purpose}</p>}
+      {request?.can_approve && (
+        <OriginalApproval
+          request={request}
+          onApproved={async (approval) => {
+            setRequest(approval);
+            await onApproved(approval);
+          }}
+        />
+      )}
+      <Button asChild size="sm" variant="outline">
+        <Link href={`/enterprise/evidence?id=${id}`}>打开原件申请</Link>
+      </Button>
+    </div>
   );
 }
 

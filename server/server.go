@@ -56,7 +56,7 @@ type Server struct {
 
 	entMode      bool
 	ent          *enterprise.Service
-	demo         *demoIDP
+	oidc         OIDCProvider
 	publicOrigin string
 
 	// mcpStoreOverride replaces the PostgreSQL-backed MCP server store in tests.
@@ -1170,7 +1170,7 @@ func (s *Server) Handler() http.Handler {
 	// /api/* goes through CORS + JWT; everything else is served by the embedded
 	// frontend (no JWT required; the optional Basic Auth gate wraps both). With the
 	// no-embed build the webui handler just 404s (run `next dev` separately).
-	api := cors(s.requireAuth(mux))
+	api := s.cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
 	root.Handle("/", s.webuiHandler())
@@ -3453,7 +3453,7 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering
 
@@ -4618,7 +4618,7 @@ func (s *Server) gc(w http.ResponseWriter, r *http.Request) {
 
 // --- utils ---
 
-func cors(next http.Handler) http.Handler {
+func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		// Next dev and the Go SSE endpoint use different ports on the same
@@ -4629,7 +4629,7 @@ func cors(next http.Handler) http.Handler {
 		if hostErr != nil {
 			host = r.Host
 		}
-		if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() == host &&
+		if !s.entMode && err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Hostname() == host &&
 			(host == "localhost" || host == "127.0.0.1" || host == "::1") {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")

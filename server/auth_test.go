@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -80,5 +81,87 @@ func TestValidatePassword(t *testing.T) {
 				t.Fatalf("validatePassword(%q)=%q, wantErr=%v", tc.pw, got, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestEnterpriseRequestOrigin(t *testing.T) {
+	s := &Server{entMode: true, publicOrigin: "https://artex.example"}
+	handler := s.requireAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for _, tc := range []struct {
+		name, method, origin, referer string
+		want                          int
+	}{
+		{"same origin", "POST", "https://ARTEX.example:443", "", 204},
+		{"same referer", "PATCH", "", "https://artex.example/enterprise?tab=report", 204},
+		{"origin takes precedence", "POST", "https://artex.example", "https://other.example", 204},
+		{"foreign origin takes precedence", "POST", "https://other.example", "https://artex.example", 403},
+		{"foreign referer", "DELETE", "", "https://other.example/artex.example", 403},
+		{"missing headers", "POST", "", "", 403},
+		{"opaque origin", "POST", "null", "https://artex.example", 403},
+		{"different port", "POST", "https://artex.example:444", "", 403},
+		{"different scheme", "POST", "http://artex.example", "", 403},
+		{"different subdomain", "POST", "https://other.artex.example", "", 403},
+		{"origin with path", "POST", "https://artex.example/path", "", 403},
+		{"origin with credentials", "POST", "https://other@artex.example", "", 403},
+		{"GET navigation", "GET", "null", "", 204},
+		{"HEAD navigation", "HEAD", "", "", 204},
+		{"OPTIONS preflight", "OPTIONS", "", "", 204},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, "http://behind-proxy/api/auth/status", nil)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.referer != "" {
+				req.Header.Set("Referer", tc.referer)
+			}
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("got %d, want %d: %s", w.Code, tc.want, w.Body)
+			}
+		})
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/status", nil)
+	req.Header.Add("Origin", "https://artex.example")
+	req.Header.Add("Origin", "https://other.example")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("multiple Origin headers: got %d", w.Code)
+	}
+}
+
+func TestExtractTokenSources(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/api/exploration/activity/stream?token=query", nil)
+	enterprise := &Server{entMode: true}
+	standalone := &Server{}
+	if got := standalone.extractToken(r); got != "query" {
+		t.Fatalf("standalone query token = %q", got)
+	}
+	if got := enterprise.extractToken(r); got != "" {
+		t.Fatalf("enterprise accepted a query token")
+	}
+	r.AddCookie(&http.Cookie{Name: "artex_token", Value: "cookie"})
+	if got := enterprise.extractToken(r); got != "cookie" {
+		t.Fatalf("enterprise cookie token = %q", got)
+	}
+	r.Header.Set("Authorization", "Bearer header")
+	if got := enterprise.extractToken(r); got != "header" {
+		t.Fatalf("enterprise header token = %q", got)
+	}
+}
+
+func TestTLSMakesEnterpriseCookieSecure(t *testing.T) {
+	s := &Server{publicOrigin: "http://artex.example"}
+	r := httptest.NewRequest(http.MethodGet, "https://artex.example"+callbackPath, nil)
+	w := httptest.NewRecorder()
+	s.setEnterpriseCookies(w, r, "session", 600)
+	cookie := responseCookie(t, w.Result(), "artex_token")
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("TLS session flags: Secure=%v HttpOnly=%v SameSite=%v", cookie.Secure, cookie.HttpOnly, cookie.SameSite)
 	}
 }

@@ -9,27 +9,35 @@ const compiled = ts.transpileModule(fs.readFileSync(path.join(__dirname, "api.ts
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText;
 
-function client(fetch) {
+const compiledAuth = ts.transpileModule(fs.readFileSync(path.join(__dirname, "auth.ts"), "utf8"), {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+}).outputText;
+
+function client(fetch, { enterprise = false } = {}) {
   const exports = {};
   const state = { token: "original-admin-token", reloads: 0, requests: [], streams: [] };
   const location = { href: "http://localhost/function/tasks/?page=2", hostname: "localhost", reload: () => state.reloads++ };
-  const document = { cookie: "artex_token=original-admin-token" };
+  const document = { cookie: enterprise ? "artex_enterprise=1" : "artex_token=original-admin-token" };
   class EventSource {
     constructor(url, options) { this.url = url; this.options = options; this.listeners = {}; state.streams.push(this); }
     addEventListener(name, listener) { this.listeners[name] = listener; }
   }
-  vm.runInNewContext(compiled, {
+  const context = vm.createContext({
     exports, URL, URLSearchParams, FormData, EventSource,
-    process: { env: { NODE_ENV: "production" } },
+    process: { env: { NODE_ENV: "production", NEXT_PUBLIC_SSE_BASE: "http://external.example" } },
     window: { location }, document,
     localStorage: { getItem: () => state.token, removeItem: () => { state.token = null; } },
     require: (id) => {
+      if (id === "@/lib/auth") return auth;
       if (id === "@/lib/mock/enabled") return { MOCK: false };
       if (id === "@/lib/mock/handler") return { mockHandle: () => assert.fail("unexpected mock request") };
       throw new Error(`Unexpected import: ${id}`);
     },
     fetch: async (...args) => { state.requests.push(args); return fetch(...args); },
   });
+  const auth = {};
+  vm.runInContext(`(function (exports) { ${compiledAuth}\n})`, context)(auth);
+  vm.runInContext(compiled, context);
   return { ...exports, state, location, document };
 }
 
@@ -151,4 +159,20 @@ test("a fresh document resumes API requests with the original admin token", asyn
   assert.equal((await c.api.version()).version, "test");
   assert.equal(c.state.requests[0][1].headers.Authorization, "Bearer original-admin-token");
   assert.equal(c.state.reloads, 0);
+});
+
+test("enterprise requests use the same-origin session with a legacy token still in storage", async () => {
+  const c = client(async () => new Response('{"version":"test"}'), { enterprise: true });
+  assert.equal((await c.api.version()).version, "test");
+  assert.equal(c.state.requests[0][1].headers.Authorization, undefined);
+  const stream = c.openSSE("/api/exploration/activity/stream?task=1");
+  assert.equal(stream.url, "/api/exploration/activity/stream?task=1");
+});
+
+test("enterprise expiry only clears token storage and opens login", async () => {
+  const c = client(async () => new Response('{"error":"expired"}', { status: 401 }), { enterprise: true });
+  await assert.rejects(c.http("/version"), /expired/);
+  assert.equal(c.state.token, null);
+  assert.equal(c.document.cookie, "artex_enterprise=1");
+  assert.equal(c.location.href, "/login");
 });

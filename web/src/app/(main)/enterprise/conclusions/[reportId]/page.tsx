@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
+import { apiFetch } from "@/lib/api";
 import { ent, sha256 } from "@/lib/enterprise-api";
 
 type Finding = { id: number; title: string; severity: string; status: string; status_label: string };
@@ -48,13 +49,7 @@ export default function ConclusionDetailPage() {
   async function download(item: Item) {
     setDownloadNote("");
     setError("");
-    const token = document.cookie
-      .split("; ")
-      .find((part) => part.startsWith("artex_token="))
-      ?.slice("artex_token=".length);
-    const response = await fetch(`/api/enterprise/reports/${item.report_id}/versions/${item.version_id}/download`, {
-      headers: token ? { Authorization: `Bearer ${decodeURIComponent(token)}` } : {},
-    });
+    const response = await apiFetch(`/api/enterprise/reports/${item.report_id}/versions/${item.version_id}/download`);
     if (!response.ok) {
       setError("没有下载到签发文件");
       return;

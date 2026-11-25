@@ -9,13 +9,17 @@ const compiled = ts.transpileModule(fs.readFileSync(path.join(__dirname, "api.ts
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText;
 
+const compiledAuth = ts.transpileModule(fs.readFileSync(path.join(__dirname, "auth.ts"), "utf8"), {
+  compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+}).outputText;
+
 function client(response) {
   response.headers ??= new Headers();
   const exports = {};
   const location = { href: "/setup" };
   const removed = [];
   const document = { cookie: "" };
-  vm.runInNewContext(compiled, {
+  const context = vm.createContext({
     exports,
     Error,
     process: { env: {} },
@@ -24,12 +28,16 @@ function client(response) {
     document,
     localStorage: { getItem: () => "test-token", removeItem: (key) => removed.push(key) },
     require: (id) => {
+      if (id === "@/lib/auth") return auth;
       if (id === "@/lib/mock/enabled") return { MOCK: false };
       if (id === "@/lib/mock/handler") return { mockHandle: () => assert.fail("unexpected mock request") };
       throw new Error(`Unexpected runtime import: ${id}`);
     },
     fetch: async () => response,
   });
+  const auth = {};
+  vm.runInContext(`(function (exports) { ${compiledAuth}\n})`, context)(auth);
+  vm.runInContext(compiled, context);
   return { ...exports, location, removed, document };
 }
 

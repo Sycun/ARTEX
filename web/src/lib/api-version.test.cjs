@@ -16,8 +16,8 @@ function client(fetch) {
     process: { env: {} },
     URLSearchParams,
     window: {},
-    localStorage: { getItem: () => "test-admin-token" },
     require: (id) => {
+      if (id === "@/lib/auth") return { auth: { getToken: () => "test-admin-token", hasEnterpriseSession: () => false } };
       if (id === "@/lib/mock/enabled") return { MOCK: false };
       if (id === "@/lib/mock/handler") return { mockHandle: () => assert.fail("unexpected demo request") };
       throw new Error(`Unexpected runtime import: ${id}`);

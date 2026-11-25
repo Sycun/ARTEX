@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
+import { ent, EntError } from "@/lib/enterprise-api";
 
 export default function LoginPage() {
   const { t } = useTranslation();
@@ -47,17 +48,22 @@ export default function LoginPage() {
   useEffect(() => {
     const query = new URLSearchParams(window.location.search);
     const down = query.get("idp") === "down";
-    setSwitchReader(query.get("switch") === "reader");
     fetch("/api/enterprise/status")
       .then((response) => (response.ok ? response.json() : { enterprise: false }))
-      .then((status: { enterprise?: boolean; idp_available?: boolean }) => {
+      .then(async (status: { enterprise?: boolean; idp_available?: boolean; idp?: string }) => {
         if (status.enterprise) {
-          setEnterprise(!status.idp_available || down ? "down" : "ready");
-          const token = auth.getToken();
-          if (token && status.idp_available && !down) {
-            auth.setToken(token);
-            window.location.replace("/enterprise/landing");
-            return;
+          auth.clearStoredToken();
+          setSwitchReader(status.idp === "demo" && query.get("switch") === "reader");
+          setEnterprise(status.idp_available ? "ready" : "down");
+          if (down && status.idp_available) setError("企业身份源暂不可用，请重试。");
+          if (!down && auth.hasEnterpriseSession()) {
+            try {
+              await ent("/me");
+              window.location.replace("/enterprise/landing");
+              return;
+            } catch (reason) {
+              if (!(reason instanceof EntError && reason.status === 401)) throw reason;
+            }
           }
           setChecking(false);
           return;
@@ -131,7 +137,7 @@ export default function LoginPage() {
             </h2>
             <p className="mx-auto max-w-xl text-muted-foreground">
               {enterprise === "down"
-                ? "企业登录暂不可用。没有建立新会话。请等演示身份源恢复后再试。"
+                ? "企业登录暂不可用，请等身份源恢复后再试。"
                 : enterprise === "ready"
                   ? switchReader
                     ? "下一步会打开企业登录。请选择梁阅，身份是项目 A 只读审核。口令使用下一页已经填好的虚构口令。这是重新登录，不会沿用平台管理员的权限。"
@@ -157,7 +163,7 @@ export default function LoginPage() {
                   使用企业账号登录
                 </Button>
               )}
-              {error && <p className="text-sm text-destructive">{error}</p>}
+              {error && <p className="text-sm text-destructive">{t(error)}</p>}
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -722,31 +721,45 @@ func (s *Service) taskInProject(ctx context.Context, projectID string, taskID in
 }
 
 func (s *Service) ReadOriginal(ctx context.Context, a Actor, originalID string) ([]byte, error) {
-	var projectID, path string
-	if err := s.DB.QueryRowContext(ctx, `SELECT project_id, storage_path FROM ent_originals WHERE id=$1`, originalID).Scan(&projectID, &path); err != nil {
-		return nil, fail(404, "not_found", "找不到", nil)
-	}
-	if _, err := s.requireMember(ctx, projectID, a.ID); err != nil {
-		return nil, fail(404, "not_found", "找不到", nil)
-	}
-	var view, cred int
-	err := s.DB.QueryRowContext(ctx, `
-		SELECT
-			count(*) FILTER (WHERE action='view_original' AND revoked_at IS NULL AND expires_at>$2),
-			count(*) FILTER (WHERE action='view_credential' AND revoked_at IS NULL AND expires_at>$2)
-		FROM ent_original_grants WHERE original_id=$1 AND user_id=$3`, originalID, s.now(), a.ID).Scan(&view, &cred)
+	var body []byte
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var projectID, path, hash string
+		var requiresCredential bool
+		err := tx.QueryRowContext(ctx, `SELECT project_id, storage_path, sha256, contains_credentials
+			FROM ent_originals WHERE id=$1 FOR SHARE`, originalID).Scan(&projectID, &path, &hash, &requiresCredential)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fail(404, "not_found", "找不到", nil)
+		}
+		if err != nil {
+			return err
+		}
+		acc, err := originalMember(ctx, tx, projectID, a.ID)
+		if err != nil {
+			return err
+		}
+		if !canHoldOriginal(acc) {
+			return fail(404, "not_found", "找不到", nil)
+		}
+		grants, err := loadOriginalGrants(ctx, tx, originalID, a.ID, "", s.now())
+		if err != nil {
+			return err
+		}
+		if !hasOriginalGrants(grants, requiresCredential, s.now()) {
+			return fail(404, "not_found", "找不到可读取的原件", nil)
+		}
+		body, err = os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if Hash(body) != hash {
+			return fail(500, "hash_mismatch", "原件与记录的哈希不一致，已停止读取", nil)
+		}
+		return s.audit(ctx, tx, projectID, a.ID, "original_read", "读取受限原件", "读取受限原件", "original", originalID, hash, nil)
+	})
 	if err != nil {
 		return nil, err
 	}
-	if view == 0 || cred == 0 {
-		return nil, fail(404, "not_found", "找不到画面。查看这张截图需要同时具备「查看原件」和「查看凭据」，只批准一项仍然看不到。", nil)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fail(404, "not_found", "找不到", nil)
-	}
-	defer f.Close()
-	return io.ReadAll(f)
+	return body, nil
 }
 
 type Summary struct {

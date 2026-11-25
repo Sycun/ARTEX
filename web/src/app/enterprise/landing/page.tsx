@@ -1,27 +1,24 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { auth } from "@/lib/auth";
+import { ent, EntError } from "@/lib/enterprise-api";
 
 export default function LandingPage() {
+  const [error, setError] = useState("");
   useEffect(() => {
-    const token = document.cookie
-      .split("; ")
-      .find((item) => item.startsWith("artex_token="))
-      ?.slice("artex_token=".length);
-    if (!token) {
-      window.location.replace("/login");
-      return;
-    }
-    auth.setToken(decodeURIComponent(token));
-    const headers = { Authorization: `Bearer ${decodeURIComponent(token)}` };
-    fetch("/api/enterprise/entry", { headers })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((entry: { href?: string } | null) => {
-        window.location.replace(entry?.href || "/enterprise");
-      })
-      .catch(() => window.location.replace("/enterprise"));
+    auth.clearStoredToken();
+    ent<{ href: string }>("/entry")
+      .then((entry) => window.location.replace(entry.href))
+      .catch((reason: Error) => {
+        if (reason instanceof EntError && (reason.status === 401 || reason.status === 403)) {
+          window.location.replace(reason.status === 401 ? "/login" : "/enterprise");
+          return;
+        }
+        setError(reason.message);
+      });
   }, []);
+  if (error) return <p role="alert" className="p-8 text-sm text-destructive">{error}</p>;
   return <p className="p-8 text-sm text-muted-foreground">正在按岗位进入…</p>;
 }

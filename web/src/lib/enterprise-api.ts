@@ -1,3 +1,6 @@
+import { toast } from "sonner";
+
+import { apiFetch } from "@/lib/api";
 import { auth } from "@/lib/auth";
 
 export class EntError extends Error {
@@ -13,10 +16,8 @@ export class EntError extends Error {
 
 export async function ent<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
-  const token = auth.getToken();
-  if (token) headers.set("Authorization", `Bearer ${token}`);
   if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  const response = await fetch(`/api/enterprise${path}`, { ...init, headers });
+  const response = await apiFetch(`/api/enterprise${path}`, { cache: "no-store", ...init, headers, credentials: "same-origin" });
   const text = await response.text();
   const data = text ? (JSON.parse(text) as Record<string, unknown>) : {};
   if (!response.ok) throw new EntError(response.status, data);
@@ -44,6 +45,41 @@ export type Receipt = {
   reused?: boolean;
   structured_reason?: string;
 };
+
+export type OriginalAction = "view_original" | "view_credential";
+
+export type OriginalRequest = {
+  id: string;
+  report_id: string;
+  status: "pending" | "approved" | "rejected";
+  status_label: string;
+  purpose?: string;
+  reason?: string;
+  credential_notice?: string;
+  previewable: boolean;
+  original_id?: string;
+  original_filename?: string;
+  requires_credential: boolean;
+  can_approve: boolean;
+  can_reject: boolean;
+  can_revoke: boolean;
+  grants?: { action: OriginalAction; expires_at: string; status: "active" | "expired" | "revoked" }[];
+};
+
+export function getOriginalRequest(id: string, signal?: AbortSignal) {
+  return ent<OriginalRequest>(`/original-requests/${encodeURIComponent(id)}`, { signal });
+}
+
+export function approveOriginal(id: string, actions: OriginalAction[]) {
+  return ent<OriginalRequest>(`/original-requests/${encodeURIComponent(id)}/approve`, {
+    method: "POST",
+    body: JSON.stringify({ actions }),
+  });
+}
+
+export function originalDownloadPath(id: string) {
+  return `/api/enterprise/originals/${encodeURIComponent(id)}`;
+}
 
 export type Me = {
   gate: "ready" | "pending_bind" | "disabled";
@@ -78,18 +114,16 @@ export function projectPath(projectId: string, suffix = "") {
 }
 
 export async function leaveEnterprise(next = "/login") {
-  const token = auth.getToken();
   try {
-    await fetch("/api/enterprise/logout", {
-      method: "POST",
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
-    });
-  } catch {
-    // 退出请求失败时仍清掉本机会话，避免停在半登录状态。
+    await ent("/logout", { method: "POST" });
+  } catch (error) {
+    if (!(error instanceof EntError && error.status === 401)) {
+      toast.error(error instanceof Error ? error.message : "退出企业账号失败");
+      return;
+    }
   }
-  auth.clearToken();
+  auth.clearStoredToken();
   clearProject();
-  document.cookie = "artex_enterprise=; path=/; max-age=0";
   window.location.href = next;
 }
 

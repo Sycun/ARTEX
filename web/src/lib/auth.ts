@@ -11,8 +11,12 @@ export interface CurrentUser {
 }
 
 export const auth = {
+  hasEnterpriseSession(): boolean {
+    return typeof document !== "undefined" && document.cookie.split("; ").includes("artex_enterprise=1");
+  },
+
   getToken(): string | null {
-    if (typeof window === "undefined") return null;
+    if (typeof window === "undefined" || auth.hasEnterpriseSession()) return null;
     // Mock demo：无真实登录，返回一个假 token 让路由守卫放行、直接进主界面。
     return localStorage.getItem(TOKEN_KEY) ?? (process.env.NEXT_PUBLIC_MOCK === "1" ? "mock-demo" : null);
   },
@@ -24,8 +28,12 @@ export const auth = {
   },
 
   clearToken(): void {
-    localStorage.removeItem(TOKEN_KEY);
+    auth.clearStoredToken();
     document.cookie = `${TOKEN_KEY}=; path=/; max-age=0`;
+  },
+
+  clearStoredToken(): void {
+    localStorage.removeItem(TOKEN_KEY);
   },
 
   // 从 JWT payload 的 sub 字段解析当前用户，仅用于展示，不做签名验证。
@@ -38,15 +46,14 @@ export const auth = {
       const binary = atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"));
       const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
       const payload = JSON.parse(new TextDecoder().decode(bytes));
-      const display = typeof payload.name === "string" ? payload.name.trim() : "";
-      const username: string = display || (payload.ent ? "企业账号" : (payload.sub ?? "ARTEX"));
+      const username: string = payload.sub ?? "ARTEX";
       return {
         id: "1",
         name: username,
         username,
         email: "",
         avatar: "",
-        role: payload.ent ? "enterprise" : "operator",
+        role: "operator",
       };
     } catch {
       return null;

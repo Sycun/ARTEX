@@ -2,9 +2,105 @@ package enterprise
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestTouchSessionThrottlesWrites(t *testing.T) {
+	svc := testService(t)
+	ctx := t.Context()
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := start
+	svc.Clock = func() time.Time { return now }
+	actor := svc.mustSession(t, UserAnalyst)
+
+	var previousXmin string
+	if err := svc.DB.QueryRowContext(ctx, `
+		SELECT xmin::text FROM ent_sessions WHERE id=$1`, actor.SessionID).Scan(&previousXmin); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		elapsed, lastWrite time.Duration
+		written            bool
+	}{
+		{30 * time.Second, 0, false},
+		{119 * time.Second, 0, false},
+		{2 * time.Minute, 2 * time.Minute, true},
+		{3 * time.Minute, 2 * time.Minute, false},
+		{5 * time.Minute, 5 * time.Minute, true},
+		{5 * time.Minute, 5 * time.Minute, false},
+	} {
+		now = start.Add(step.elapsed)
+		got, err := svc.TouchSession(ctx, actor.SessionID)
+		if err != nil || got.ID != actor.ID || got.SessionID != actor.SessionID {
+			t.Fatalf("touch at %s: actor=%+v err=%v", step.elapsed, got, err)
+		}
+		var xmin string
+		var lastSeen, idle, absolute time.Time
+		if err := svc.DB.QueryRowContext(ctx, `
+			SELECT xmin::text, last_seen, idle_expires, absolute_expires
+			FROM ent_sessions WHERE id=$1`, actor.SessionID).Scan(&xmin, &lastSeen, &idle, &absolute); err != nil {
+			t.Fatal(err)
+		}
+		wantLastSeen := start.Add(step.lastWrite)
+		if (xmin != previousXmin) != step.written || !lastSeen.Equal(wantLastSeen) ||
+			!idle.Equal(wantLastSeen.Add(IdleTimeout)) || !absolute.Equal(start.Add(AbsoluteTimeout)) {
+			t.Fatalf("touch at %s: xmin=%s previous=%s want write=%t last_seen=%v idle=%v absolute=%v",
+				step.elapsed, xmin, previousXmin, step.written, lastSeen, idle, absolute)
+		}
+		previousXmin = xmin
+	}
+}
+
+func TestTouchSessionChecksCurrentAccess(t *testing.T) {
+	svc := testService(t)
+	ctx := t.Context()
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := start
+	svc.Clock = func() time.Time { return now }
+
+	for _, tc := range []struct {
+		elapsed time.Duration
+		code    string
+	}{
+		{IdleTimeout + time.Second, "session_idle"},
+		{AbsoluteTimeout + time.Second, "session_absolute"},
+		{time.Minute, "session_ended"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			now = start
+			actor := svc.mustSession(t, UserAnalyst)
+			now = start.Add(tc.elapsed)
+			if tc.code == "session_ended" {
+				if err := svc.Logout(ctx, actor.SessionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := svc.TouchSession(ctx, actor.SessionID)
+			var denied *Fail
+			if !errors.As(err, &denied) || denied.Status != 401 || denied.Code != tc.code {
+				t.Fatalf("touch at %s: got %v, want %s", tc.elapsed, err, tc.code)
+			}
+		})
+	}
+
+	now = start
+	actor := svc.mustSession(t, UserAnalyst)
+	got, err := svc.TouchSession(ctx, actor.SessionID)
+	if err != nil || got.Gate() != "ready" {
+		t.Fatalf("touch before disabling: actor=%+v err=%v", got, err)
+	}
+	if _, err := svc.DB.ExecContext(ctx, `UPDATE ent_users SET directory_status='disabled' WHERE id=$1`, actor.ID); err != nil {
+		t.Fatal(err)
+	}
+	now = start.Add(time.Minute)
+	got, err = svc.TouchSession(ctx, actor.SessionID)
+	if err != nil || got.Gate() != "disabled" {
+		t.Fatalf("touch after disabling: actor=%+v err=%v", got, err)
+	}
+}
 
 func TestDeskConnectsEmployeeReviewAndLeader(t *testing.T) {
 	svc := testService(t)

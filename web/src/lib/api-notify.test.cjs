@@ -23,6 +23,7 @@ function client(mock, payload) {
     process: { env: {} },
     URLSearchParams,
     require: (id) => {
+      if (id === "@/lib/auth") return { auth: { getToken: () => null, hasEnterpriseSession: () => false } };
       if (id === "@/lib/mock/enabled") return { MOCK: mock };
       if (id === "@/lib/mock/handler") return { mockHandle };
       throw new Error(`Unexpected runtime import: ${id}`);

@@ -55,17 +55,17 @@ export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const token = request.cookies.get("artex_token")?.value;
   const enterprise = request.cookies.get("artex_enterprise")?.value === "1";
-  const home = enterprise ? "/enterprise/landing" : "/function/tasks";
   const isAuthPage = AUTH_PAGES.some((p) => pathname === p || pathname.startsWith(`${p}/`));
+  const isLoginPage = pathname === "/login" || pathname.startsWith("/login/");
 
   // 未登录 → 跳转登录页
   if (!token && !isAuthPage) {
     return finish(NextResponse.redirect(new URL("/login", request.url)));
   }
 
-  // 已登录时访问登录/初始化页 → 跳转主界面
-  if (token && isAuthPage) {
-    return finish(NextResponse.redirect(new URL(home, request.url)));
+  // 企业登录页向后端验证会话，已撤销的 Cookie 也能回到登录页。
+  if (token && isAuthPage && (!enterprise || !isLoginPage)) {
+    return finish(NextResponse.redirect(new URL(enterprise ? "/login" : "/function/tasks", request.url)));
   }
 
   return finish(NextResponse.next());

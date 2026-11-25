@@ -4,6 +4,7 @@
 // are passed through and formatted at the call site.
 
 import type { ChatMention } from "@/lib/chat-mentions";
+import { auth } from "@/lib/auth";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle, mockTaskFileURL } from "@/lib/mock/handler";
 import type {
@@ -140,10 +141,7 @@ export function downloadFilename(contentDisposition: string, fallback: string): 
   return (legacy?.[1] ?? legacy?.[2] ?? fallback).trim() || fallback;
 }
 
-function getToken(): string | null {
-  if (typeof window === "undefined") return null;
-  return localStorage.getItem("artex_token");
-}
+const getToken = auth.getToken;
 
 let basicAuthReloading = false;
 let basicAuthProbe: Promise<void> | null = null;
@@ -224,6 +222,7 @@ export class ApiError extends Error {
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   if (MOCK) return mockHandle<T>(init?.method ?? "GET", path, init?.body ?? null);
+  const enterprise = auth.hasEnterpriseSession();
   const token = getToken();
   const r = await apiFetch(`/api${path}`, {
     ...init,
@@ -251,8 +250,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
     if (r.status === 401 && typeof window !== "undefined") {
-      localStorage.removeItem("artex_token");
-      document.cookie = "artex_token=; path=/; max-age=0";
+      if (enterprise) auth.clearStoredToken();
+      else auth.clearToken();
       window.location.href = "/login";
     }
     throw new ApiError(message, code, params);
@@ -261,22 +260,6 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   return r.json();
 }
 
-// sseUrl builds a URL for Server-Sent Events streams.
-//
-// Production (static export / Docker): the Go backend serves the web UI *and* the
-// SSE streams on the same port, so we default to a same-origin (relative) URL.
-// This is what makes reverse-proxy deploys work: a page loaded from
-// https://<domain>/ connects to https://<domain>/api/..., which the proxy forwards
-// to the backend — no need to expose :8787 publicly. Hardcoding :8787 here used to
-// break exactly that (https://<domain>:8787/... is unreachable when only 443 is open).
-//
-// Dev (next dev): SSE must NOT go through the Next.js `/api` rewrite — that proxy
-// buffers the streamed response, so event frames never reach the browser (the
-// EventSource opens but receives 0 messages). So in dev only we connect straight
-// to the Go backend on :8787, whose CORS is open.
-//
-// Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# ARTEX 渗透测试报告 — Acme Corp
@@ -301,6 +284,8 @@ function mockReport(_task?: string): string {
 }
 
 export function sseUrl(path: string): string {
+  if (auth.hasEnterpriseSession()) return path;
+  // Standalone dev can still stream directly from the Go backend.
   const base =
     process.env.NEXT_PUBLIC_SSE_BASE ??
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
@@ -308,7 +293,7 @@ export function sseUrl(path: string): string {
       : "");
   const token = getToken();
   const sep = path.includes("?") ? "&" : "?";
-  return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
+  return base && token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
 }
 
 export function openSSE(path: string): EventSource {

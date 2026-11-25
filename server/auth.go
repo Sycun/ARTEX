@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,37 +96,77 @@ func signJWT(key []byte) (string, error) {
 
 // verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
 func verifyJWT(tokenStr string, key []byte) bool {
-	t, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
+	claims := jwt.MapClaims{}
+	t, err := jwt.ParseWithClaims(tokenStr, claims, func(*jwt.Token) (any, error) {
 		return key, nil
-	})
-	return err == nil && t.Valid
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithSubject("ARTEX"), jwt.WithExpirationRequired())
+	return err == nil && t.Valid && claims["ent"] == nil
 }
 
-// extractToken reads the JWT from Authorization: Bearer header,
-// artex_token cookie, or ?token= query param (for SSE connections).
-func extractToken(r *http.Request) string {
+// extractToken also accepts legacy SSE query tokens in standalone mode.
+func (s *Server) extractToken(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
 	if c, err := r.Cookie("artex_token"); err == nil && c.Value != "" {
 		return c.Value
 	}
+	if s.entMode {
+		return ""
+	}
 	return r.URL.Query().Get("token")
+}
+
+func (s *Server) enterpriseSameOrigin(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	values := r.Header.Values("Origin")
+	if len(values) == 0 {
+		return len(r.Header.Values("Referer")) == 1 && sameHTTPOrigin(r.Referer(), s.origin(), false)
+	}
+	return len(values) == 1 && sameHTTPOrigin(values[0], s.origin(), true)
+}
+
+func sameHTTPOrigin(source, target string, originHeader bool) bool {
+	got, err := url.Parse(source)
+	if err != nil || got.Hostname() == "" || got.User != nil || strings.Contains(source, "#") {
+		return false
+	}
+	if originHeader && (got.Path != "" || got.RawQuery != "" || got.ForceQuery) {
+		return false
+	}
+	want, err := url.Parse(target)
+	if err != nil || got.Scheme != want.Scheme || !strings.EqualFold(got.Hostname(), want.Hostname()) {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if u.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	return port(got) == port(want)
 }
 
 // requireAuth wraps h with JWT validation.
 // /api/auth/*, /api/health and the Basic Auth gate check are exempt.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.entMode && !s.enterpriseSameOrigin(r) {
+			writeProductError(w, http.StatusForbidden, "invalid_origin", "请求来源与企业访问地址不一致", nil)
+			return
+		}
 		p := r.URL.Path
 		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" || p == "/api/basic-auth/check" || s.enterprisePublic(p) {
 			h.ServeHTTP(w, r)
 			return
 		}
-		tok := extractToken(r)
+		tok := s.extractToken(r)
 		if tok == "" {
 			writeProductError(w, 401, "unauthorized", "未授权", nil)
 			return
@@ -243,7 +284,7 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	if !verifyJWT(extractToken(r), s.jwtKey) {
+	if !verifyJWT(s.extractToken(r), s.jwtKey) {
 		writeProductError(w, 401, "unauthorized", "未授权", nil)
 		return
 	}

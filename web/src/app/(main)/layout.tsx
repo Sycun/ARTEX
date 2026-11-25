@@ -5,8 +5,10 @@ import * as React from "react";
 
 import { AppSidebar } from "@/app/(main)/_components/sidebar/app-sidebar";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
-import { auth } from "@/lib/auth";
+import { CurrentUserContext, fallbackCurrentUser } from "@/hooks/use-current-user";
+import { auth, type CurrentUser } from "@/lib/auth";
 import { getClientCookie } from "@/lib/cookie.client";
+import { ent, EntError, type Me } from "@/lib/enterprise-api";
 import {
   SIDEBAR_COLLAPSIBLE_VALUES,
   SIDEBAR_VARIANT_VALUES,
@@ -29,13 +31,24 @@ function readPref<T extends string>(key: string, allowed: readonly T[], fallback
 }
 
 export default function Layout({ children }: Readonly<{ children: ReactNode }>) {
-  // Client-side auth gate — replaces the Next proxy/middleware that static export
-  // disables. No token → bounce to /login; render nothing until confirmed so no
-  // protected UI (or its API calls) flashes for a logged-out visitor.
-  const [authed, setAuthed] = React.useState(false);
+  const [user, setUser] = React.useState<CurrentUser | null>(null);
+  const [error, setError] = React.useState("");
   React.useEffect(() => {
+    if (auth.hasEnterpriseSession()) {
+      auth.clearStoredToken();
+      ent<Me>("/me")
+        .then((me) => setUser({ id: me.user_id, name: me.name, username: me.name, email: "", avatar: "", role: "enterprise" }))
+        .catch((reason: Error) => {
+          if (reason instanceof EntError && reason.status === 401) {
+            window.location.replace("/login");
+          } else {
+            setError(reason.message);
+          }
+        });
+      return;
+    }
     if (auth.getToken()) {
-      setAuthed(true);
+      setUser(auth.getCurrentUser() ?? fallbackCurrentUser);
     } else {
       // 客户端守卫认为未登录时，必须同时清掉 cookie：否则 proxy.ts 仅凭
       // “cookie 存在”就把我们从 /login 又重定向回主界面，与本守卫来回弹跳
@@ -57,30 +70,33 @@ export default function Layout({ children }: Readonly<{ children: ReactNode }>) 
     PREFERENCE_DEFAULTS.sidebar_collapsible,
   );
 
-  if (!authed) return null;
+  if (error) return <p role="alert" className="p-8 text-destructive">{error}</p>;
+  if (!user) return null;
 
   return (
-    <SidebarProvider
-      defaultOpen={defaultOpen}
-      style={
-        {
-          "--sidebar-width": "calc(var(--spacing) * 68)",
-        } as React.CSSProperties
-      }
-    >
-      <AppSidebar variant={variant} collapsible={collapsible} />
-      <SidebarInset
-        className={cn(
-          "[html[data-content-layout=centered]_&>*]:mx-auto",
-          "[html[data-content-layout=centered]_&>*]:w-full",
-          "[html[data-content-layout=centered]_&>*]:max-w-screen-2xl",
-          "peer-data-[variant=inset]:border",
-          "[--dashboard-header-height:--spacing(12)]",
-          "min-w-0 overflow-x-hidden",
-        )}
+    <CurrentUserContext.Provider value={user}>
+      <SidebarProvider
+        defaultOpen={defaultOpen}
+        style={
+          {
+            "--sidebar-width": "calc(var(--spacing) * 68)",
+          } as React.CSSProperties
+        }
       >
-        <MainContent>{children}</MainContent>
-      </SidebarInset>
-    </SidebarProvider>
+        <AppSidebar variant={variant} collapsible={collapsible} />
+        <SidebarInset
+          className={cn(
+            "[html[data-content-layout=centered]_&>*]:mx-auto",
+            "[html[data-content-layout=centered]_&>*]:w-full",
+            "[html[data-content-layout=centered]_&>*]:max-w-screen-2xl",
+            "peer-data-[variant=inset]:border",
+            "[--dashboard-header-height:--spacing(12)]",
+            "min-w-0 overflow-x-hidden",
+          )}
+        >
+          <MainContent>{children}</MainContent>
+        </SidebarInset>
+      </SidebarProvider>
+    </CurrentUserContext.Provider>
   );
 }

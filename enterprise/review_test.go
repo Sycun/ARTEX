@@ -2,9 +2,111 @@ package enterprise
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Autumn-27/artex/db"
 )
+
+func TestListTasksPaginationFiltersAndFindingCounts(t *testing.T) {
+	svc := testService(t)
+	ctx := t.Context()
+	store := &db.DB{DB: svc.DB}
+	if _, err := store.ExecContext(ctx, `
+		INSERT INTO ent_projects (id, code, name, status)
+		VALUES ('list-a','LIST-A','任务项目 A','active'), ('list-b','LIST-B','任务项目 B','active')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, `
+		INSERT INTO ent_members (project_id, user_id, role) VALUES ('list-a',$1,'reader')`, UserReader); err != nil {
+		t.Fatal(err)
+	}
+
+	addTask := func(project, name, description, goal, status string, completedAt *time.Time) int64 {
+		t.Helper()
+		task, err := store.CreateTaskWithOptions(description, goal, db.TaskCreateOptions{Name: name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if _, err := store.DeleteTaskCascade(task.ID, false, true); err != nil {
+				t.Error(err)
+			}
+		})
+		if _, err := store.ExecContext(ctx, `UPDATE tasks SET status=$2, completed_at=$3 WHERE id=$1`,
+			task.ID, status, completedAt); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ExecContext(ctx, `
+			INSERT INTO ent_project_tasks (project_id, task_id) VALUES ($1,$2)`, project, task.ID); err != nil {
+			t.Fatal(err)
+		}
+		return task.ID
+	}
+	addFinding := func(taskID int64, projects ...string) {
+		t.Helper()
+		if _, err := store.ExecContext(ctx, `
+			WITH finding AS (INSERT INTO findings (task_id) VALUES ($1) RETURNING id)
+			INSERT INTO ent_project_findings (project_id, finding_id)
+			SELECT project_id, finding.id
+			FROM finding CROSS JOIN unnest($2::text[]) AS projects(project_id)`, taskID, projects); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	earlier := latest.Add(-time.Hour)
+	olderTask := addTask("list-a", "旧任务", "Portal description", "无关目标", "done", &earlier)
+	namedTask := addTask("list-a", "Portal login", "无关描述", "无关目标", "done", &latest)
+	tiedTask := addTask("list-a", "同时间任务", "无关描述", "Portal goal", "done", &latest)
+	runningTask := addTask("list-a", "", "Portal scan", "无关目标", "running", nil)
+	foreignTask := addTask("list-b", "Portal external", "无关描述", "无关目标", "done", &latest)
+	addFinding(olderTask, "list-a")
+	addFinding(namedTask, "list-a", "list-b")
+	addFinding(namedTask, "list-a")
+	addFinding(namedTask, "list-b")
+	addFinding(namedTask)
+	addFinding(runningTask, "list-a")
+	addFinding(foreignTask, "list-b")
+
+	type row struct {
+		id       int64
+		findings int
+	}
+	reader := svc.as(t, UserReader)
+	for _, tc := range []struct {
+		name              string
+		query             TaskQuery
+		total, page, size int
+		want              []row
+	}{
+		{"default order", TaskQuery{}, 4, 1, 20, []row{{tiedTask, 0}, {namedTask, 2}, {olderTask, 1}, {runningTask, 1}}},
+		{"first filtered page", TaskQuery{Text: "  PORTAL ", Status: "done", Page: 1, PageSize: 2}, 3, 1, 2, []row{{tiedTask, 0}, {namedTask, 2}}},
+		{"second filtered page", TaskQuery{Text: "portal", Status: "done", Page: 2, PageSize: 2}, 3, 2, 2, []row{{olderTask, 1}}},
+		{"past last page", TaskQuery{Text: "portal", Status: "done", Page: 3, PageSize: 2}, 3, 3, 2, nil},
+		{"status only", TaskQuery{Status: "running", PageSize: 100}, 1, 1, 50, []row{{runningTask, 1}}},
+		{"no match", TaskQuery{Text: "external"}, 0, 1, 20, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			list, err := svc.ListTasks(ctx, reader, "list-a", tc.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if list.ProjectID != "list-a" || list.ProjectName != "任务项目 A" || list.Total != tc.total ||
+				list.Page != tc.page || list.PageSize != tc.size || list.Items == nil {
+				t.Fatalf("unexpected task list: %+v", list)
+			}
+			got := make([]row, 0, len(list.Items))
+			for _, item := range list.Items {
+				got = append(got, row{item.ID, item.Findings})
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestReviewPackStaysSeparateFromDemoSample(t *testing.T) {
 	svc := testService(t)

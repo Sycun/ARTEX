@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"html/template"
@@ -29,28 +31,33 @@ func (s *Server) bootEnterprise() {
 	if err != nil {
 		log.Fatalf("[enterprise] %v", err)
 	}
-	if err := svc.Seed(context.Background()); err != nil {
-		log.Fatalf("[enterprise] seed: %v", err)
-	}
-	pack, err := svc.EnsureReviewPack(context.Background())
-	if err != nil {
-		log.Fatalf("[enterprise] review pack: %v", err)
-	}
-	log.Printf("[enterprise] review pack ready project=%s task=%d reused=%v", pack.ProjectID, pack.TaskID, pack.Reused)
-	if err := svc.EnsureWorkRoster(context.Background()); err != nil {
-		log.Fatalf("[enterprise] work roster: %v", err)
-	}
 	s.ent = svc
 	s.entMode = true
-	if origin := strings.TrimRight(os.Getenv("ARTEX_PUBLIC_ORIGIN"), "/"); origin != "" {
-		s.publicOrigin = origin
-	} else {
-		s.publicOrigin = "http://127.0.0.1:5173"
+	s.publicOrigin = strings.TrimRight(os.Getenv("ARTEX_PUBLIC_ORIGIN"), "/")
+	if !sameHTTPOrigin(s.origin(), s.origin(), true) || (!strings.HasPrefix(s.origin(), "http://") && !strings.HasPrefix(s.origin(), "https://")) {
+		log.Fatal("[enterprise] ARTEX_PUBLIC_ORIGIN 必须是 HTTP(S) origin")
 	}
 	if os.Getenv("ARTEX_DEMO_IDP") == "1" {
-		s.demo = newDemoIDP()
+		if err := svc.Seed(s.ctx); err != nil {
+			log.Fatalf("[enterprise] seed: %v", err)
+		}
+		pack, err := svc.EnsureReviewPack(s.ctx)
+		if err != nil {
+			log.Fatalf("[enterprise] review pack: %v", err)
+		}
+		log.Printf("[enterprise] review pack ready project=%s task=%d reused=%v", pack.ProjectID, pack.TaskID, pack.Reused)
+		if err := svc.EnsureWorkRoster(s.ctx); err != nil {
+			log.Fatalf("[enterprise] work roster: %v", err)
+		}
+		s.oidc = newDemoIDP(s.origin(), s.jwtKey)
+	} else if issuer := os.Getenv("ARTEX_OIDC_ISSUER"); issuer != "" {
+		p, err := newStandardOIDC(issuer, os.Getenv("ARTEX_OIDC_CLIENT_ID"), os.Getenv("ARTEX_OIDC_CLIENT_SECRET"))
+		if err != nil {
+			log.Fatalf("[enterprise] %v", err)
+		}
+		s.oidc = p
 	}
-	log.Printf("[enterprise] 企业模式已开启，演示身份源=%v，数据目录=%s", s.demo != nil, s.dataDir)
+	log.Printf("[enterprise] 企业模式已开启，身份源=%T，数据目录=%s", s.oidc, s.dataDir)
 }
 
 func (s *Server) origin() string {
@@ -65,7 +72,8 @@ func (s *Server) enterprisePublic(path string) bool {
 	case "/api/enterprise/status", "/api/enterprise/login", "/api/enterprise/callback":
 		return true
 	}
-	return strings.HasPrefix(path, "/api/demo-idp/")
+	_, demo := s.oidc.(*demoIDP)
+	return demo && strings.HasPrefix(path, "/api/demo-idp/")
 }
 
 func enterpriseLimited(r *http.Request) bool {
@@ -87,17 +95,19 @@ func enterpriseAllows(path string) bool {
 }
 
 func (s *Server) enterpriseSessionID(token string) (string, bool) {
-	parsed, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
+	parsed, err := jwt.Parse(token, func(*jwt.Token) (any, error) {
 		return s.jwtKey, nil
-	})
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
 	if err != nil || !parsed.Valid {
 		return "", false
 	}
 	claims, ok := parsed.Claims.(jwt.MapClaims)
 	if !ok || claims["ent"] != true {
+		return "", false
+	}
+	issuer, _ := claims["iss"].(string)
+	_, demo := s.oidc.(*demoIDP)
+	if s.oidc == nil || (issuer != s.oidc.Issuer() && !(demo && issuer == "")) {
 		return "", false
 	}
 	sid, _ := claims["sid"].(string)
@@ -107,6 +117,7 @@ func (s *Server) enterpriseSessionID(token string) (string, bool) {
 func (s *Server) signEnterprise(user enterprise.User, sessionID string, exp time.Time) (string, error) {
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub":  user.ID,
+		"iss":  s.oidc.Issuer(),
 		"sid":  sessionID,
 		"ent":  true,
 		"name": user.Name,
@@ -198,28 +209,37 @@ func (s *Server) registerEnterprise(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/enterprise/reports/{id}/versions/{vid}/download", s.enterpriseDownload)
 	mux.HandleFunc("POST /api/enterprise/reports/{id}/original-requests", s.enterpriseRequestOriginal)
 	mux.HandleFunc("GET /api/enterprise/original-requests/{id}", s.enterpriseEvidence)
+	mux.HandleFunc("POST /api/enterprise/original-requests/{id}/approve", s.enterpriseApproveOriginal)
 	mux.HandleFunc("POST /api/enterprise/original-requests/{id}/reject", s.enterpriseRejectOriginal)
+	mux.HandleFunc("POST /api/enterprise/original-requests/{id}/revoke", s.enterpriseRevokeOriginal)
 	mux.HandleFunc("GET /api/enterprise/originals/{id}", s.enterpriseOriginalBytes)
 	mux.HandleFunc("POST /api/enterprise/delegations", s.enterpriseDelegate)
 	mux.HandleFunc("POST /api/enterprise/audit-delegations", s.enterpriseAuditDelegate)
-	mux.HandleFunc("GET /api/demo-idp/authorize", s.demoAuthorize)
-	mux.HandleFunc("POST /api/demo-idp/login", s.demoLogin)
-	mux.HandleFunc("POST /api/demo-idp/token", s.demoToken)
-	mux.HandleFunc("GET /api/demo-idp/.well-known/openid-configuration", s.demoDiscovery)
+	if _, demo := s.oidc.(*demoIDP); demo {
+		mux.HandleFunc("GET /api/demo-idp/authorize", s.demoAuthorize)
+		mux.HandleFunc("POST /api/demo-idp/login", s.demoLogin)
+		mux.HandleFunc("POST /api/demo-idp/token", s.demoToken)
+		mux.HandleFunc("GET /api/demo-idp/.well-known/openid-configuration", s.demoDiscovery)
+	}
 }
 
 func (s *Server) enterpriseStatus(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{
 		"enterprise":     s.entMode,
-		"idp_available":  s.demo != nil,
+		"idp_available":  s.oidc != nil,
 		"password_login": !s.entMode,
 	}
-	if s.demo != nil {
+	switch s.oidc.(type) {
+	case *demoIDP:
 		body["idp"] = "demo"
 		body["idp_note"] = "当前接的是本机演示身份源，不是企业的真实身份源。真实 IdP 还没有配置。"
-	} else if s.entMode {
-		body["idp"] = "unconfigured"
-		body["idp_note"] = "企业模式已打开，但没有接上身份源。真实 IdP 还没有配置。"
+	case *standardOIDC:
+		body["idp"] = "oidc"
+	case nil:
+		if s.entMode {
+			body["idp"] = "unconfigured"
+			body["idp_note"] = "企业模式已打开，但没有接上身份源。真实 IdP 还没有配置。"
+		}
 	}
 	writeJSON(w, 200, body)
 }
@@ -311,9 +331,10 @@ func (s *Server) enterpriseLogout(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_ = s.ent.Logout(r.Context(), actor.SessionID)
-	http.SetCookie(w, &http.Cookie{Name: "artex_token", Value: "", Path: "/", MaxAge: -1})
-	http.SetCookie(w, &http.Cookie{Name: "artex_enterprise", Value: "", Path: "/", MaxAge: -1})
+	if writeEnt(w, s.ent.Logout(r.Context(), actor.SessionID)) {
+		return
+	}
+	s.setEnterpriseCookies(w, r, "", -1)
 	writeJSON(w, 200, map[string]any{"ok": true, "message": "已退出。可以重新使用企业账号登录。"})
 }
 
@@ -748,11 +769,29 @@ func (s *Server) enterpriseRequestOriginal(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) enterpriseEvidence(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	actor, ok := s.wantEnt(w, r)
 	if !ok {
 		return
 	}
 	out, err := s.ent.GetEvidence(r.Context(), actor, r.PathValue("id"))
+	if writeEnt(w, err) {
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) enterpriseApproveOriginal(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.wantEnt(w, r)
+	if !ok {
+		return
+	}
+	var req enterprise.OriginalApproval
+	if err := decode(r, &req); err != nil {
+		writeProductError(w, 400, "invalid_request", "请填写授权动作及有效期", nil)
+		return
+	}
+	out, err := s.ent.ApproveOriginal(r.Context(), actor, r.PathValue("id"), req)
 	if writeEnt(w, err) {
 		return
 	}
@@ -778,7 +817,20 @@ func (s *Server) enterpriseRejectOriginal(w http.ResponseWriter, r *http.Request
 	writeJSON(w, 200, out)
 }
 
+func (s *Server) enterpriseRevokeOriginal(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.wantEnt(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.ent.RevokeOriginal(r.Context(), actor, r.PathValue("id"))
+	if writeEnt(w, err) {
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
 func (s *Server) enterpriseOriginalBytes(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	actor, ok := s.wantEnt(w, r)
 	if !ok {
 		return
@@ -787,9 +839,12 @@ func (s *Server) enterpriseOriginalBytes(w http.ResponseWriter, r *http.Request)
 	if writeEnt(w, err) {
 		return
 	}
-	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment")
 	w.WriteHeader(200)
-	_, _ = w.Write(body)
+	if _, err := w.Write(body); err != nil {
+		log.Printf("[enterprise] write original %s: %v", r.PathValue("id"), err)
+	}
 }
 
 func (s *Server) enterpriseDelegate(w http.ResponseWriter, r *http.Request) {
@@ -853,31 +908,13 @@ func demoAccounts() []demoAccount {
 	}
 }
 
-type demoIDP struct {
-	mu     sync.Mutex
-	states map[string]demoState
-	codes  map[string]demoCode
-}
+const (
+	loginStateTTL = 10 * time.Minute
+	callbackPath  = "/api/enterprise/callback"
+)
 
-type demoState struct {
-	verifier string
-	nonce    string
-	redirect string
-	prefer   string
-	exp      time.Time
-}
-
-type demoCode struct {
-	sub       string
-	name      string
-	nonce     string
-	challenge string
-	redirect  string
-	exp       time.Time
-}
-
-func newDemoIDP() *demoIDP {
-	return &demoIDP{states: map[string]demoState{}, codes: map[string]demoCode{}}
+type loginState struct {
+	state, nonce, verifier, redirectURI, prefer string
 }
 
 func (s *Server) enterpriseLogin(w http.ResponseWriter, r *http.Request) {
@@ -885,158 +922,241 @@ func (s *Server) enterpriseLogin(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 404, "not_found", "找不到", nil)
 		return
 	}
-	if s.demo == nil {
+	if s.oidc == nil {
 		http.Redirect(w, r, s.origin()+"/login?idp=down", http.StatusFound)
 		return
 	}
-	verifier := randomURL(32)
-	sum := sha256.Sum256([]byte(verifier))
-	state := randomURL(18)
-	nonce := randomURL(18)
-	redirect := s.origin() + "/api/enterprise/callback"
-	s.demo.mu.Lock()
-	prefer := r.URL.Query().Get("prefer")
-	if prefer != enterprise.ReaderLogin {
-		prefer = ""
+	w.Header().Set("Cache-Control", "no-store")
+	login := loginState{
+		state: randomURL(18), nonce: randomURL(18), verifier: randomURL(32),
+		redirectURI: s.origin() + callbackPath,
 	}
-	s.demo.states[state] = demoState{verifier: verifier, nonce: nonce, redirect: redirect, prefer: prefer, exp: time.Now().Add(10 * time.Minute)}
-	s.demo.mu.Unlock()
-	q := url.Values{}
-	q.Set("client_id", "artex")
-	q.Set("response_type", "code")
-	q.Set("redirect_uri", redirect)
-	q.Set("state", state)
-	q.Set("nonce", nonce)
-	q.Set("code_challenge", base64.RawURLEncoding.EncodeToString(sum[:]))
-	q.Set("code_challenge_method", "S256")
-	http.Redirect(w, r, s.origin()+"/api/demo-idp/authorize?"+q.Encode(), http.StatusFound)
+	if r.URL.Query().Get("prefer") == enterprise.ReaderLogin {
+		login.prefer = enterprise.ReaderLogin
+	}
+	location, err := s.oidc.AuthorizationURL(r.Context(), login)
+	if err != nil {
+		log.Printf("[enterprise] OIDC authorization: %v", err)
+		http.Redirect(w, r, s.origin()+"/login?idp=down", http.StatusFound)
+		return
+	}
+	_, err = s.ent.DB.ExecContext(r.Context(), `
+		WITH expired AS (DELETE FROM ent_login_states WHERE expires_at <= now())
+		INSERT INTO ent_login_states (state, nonce, code_verifier, redirect_uri, prefer, expires_at)
+		VALUES ($1,$2,$3,$4,$5,now() + $6::integer * interval '1 second')`,
+		login.state, login.nonce, login.verifier, login.redirectURI, login.prefer, int(loginStateTTL.Seconds()))
+	if writeEnt(w, err) {
+		return
+	}
+	http.SetCookie(w, s.loginStateCookie(r, login.state, int(loginStateTTL.Seconds())))
+	http.Redirect(w, r, location, http.StatusFound)
+}
+
+func (s *Server) secureEnterpriseCookie(r *http.Request) bool {
+	return r.TLS != nil || strings.HasPrefix(s.origin(), "https://")
+}
+
+func (s *Server) setEnterpriseCookies(w http.ResponseWriter, r *http.Request, token string, maxAge int) {
+	cookie := http.Cookie{Path: "/", MaxAge: maxAge, SameSite: http.SameSiteLaxMode, Secure: s.secureEnterpriseCookie(r)}
+	cookie.Name, cookie.Value, cookie.HttpOnly = "artex_token", token, true
+	http.SetCookie(w, &cookie)
+	cookie.Name, cookie.Value, cookie.HttpOnly = "artex_enterprise", "1", false
+	if maxAge < 0 {
+		cookie.Value = ""
+	}
+	http.SetCookie(w, &cookie)
+}
+
+func (s *Server) loginStateCookie(r *http.Request, state string, maxAge int) *http.Cookie {
+	mac := hmac.New(sha256.New, s.jwtKey)
+	mac.Write([]byte("artex-oidc-state:" + s.oidc.Issuer() + ":" + state))
+	cookie := &http.Cookie{
+		Name: "artex_login_" + state, Value: base64.RawURLEncoding.EncodeToString(mac.Sum(nil)),
+		Path: callbackPath, MaxAge: maxAge, HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		Secure: s.secureEnterpriseCookie(r),
+	}
+	if cookie.Secure {
+		cookie.Name = "__Host-" + cookie.Name
+		cookie.Path = "/"
+	}
+	if maxAge < 0 {
+		cookie.Value = ""
+	}
+	return cookie
 }
 
 func (s *Server) enterpriseCallback(w http.ResponseWriter, r *http.Request) {
-	if s.demo == nil || !s.entMode {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if s.oidc == nil || !s.entMode {
 		http.Redirect(w, r, s.origin()+"/login?idp=down", http.StatusFound)
 		return
 	}
-	state := r.URL.Query().Get("state")
-	code := r.URL.Query().Get("code")
-	s.demo.mu.Lock()
-	saved, ok := s.demo.states[state]
-	if ok {
-		delete(s.demo.states, state)
-	}
-	s.demo.mu.Unlock()
-	if !ok || time.Now().After(saved.exp) {
-		http.Error(w, "登录状态已过期，请回到登录页重新使用企业账号登录。", http.StatusBadRequest)
+	query := r.URL.Query()
+	login := loginState{state: query.Get("state")}
+	expected := s.loginStateCookie(r, login.state, 0)
+	cookie, err := r.Cookie(expected.Name)
+	if login.state == "" || err != nil || !hmac.Equal([]byte(cookie.Value), []byte(expected.Value)) {
+		http.Error(w, "登录状态无效，请回到登录页重新使用企业账号登录。", http.StatusBadRequest)
 		return
 	}
-	token, err := s.demo.exchange(code, saved.verifier, s.jwtKey, s.origin()+"/api/demo-idp")
-	if err != nil {
+	http.SetCookie(w, s.loginStateCookie(r, login.state, -1))
+	var active bool
+	err = s.ent.DB.QueryRowContext(r.Context(), `
+		DELETE FROM ent_login_states WHERE state=$1
+		RETURNING nonce, code_verifier, redirect_uri, prefer, expires_at > now()`, login.state).
+		Scan(&login.nonce, &login.verifier, &login.redirectURI, &login.prefer, &active)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "登录状态已过期或已使用，请回到登录页重新使用企业账号登录。", http.StatusBadRequest)
+		return
+	}
+	if writeEnt(w, err) {
+		return
+	}
+	if !active || query.Get("code") == "" || query.Get("error") != "" {
 		http.Error(w, "企业登录没有完成，请回到登录页重试。", http.StatusBadRequest)
 		return
 	}
-	parsed, err := jwt.Parse(token, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return s.jwtKey, nil
-	})
-	if err != nil || !parsed.Valid {
-		http.Error(w, "身份令牌没有通过校验，请重新登录。", http.StatusBadRequest)
-		return
-	}
-	claims := parsed.Claims.(jwt.MapClaims)
-	if claims["nonce"] != saved.nonce || claims["aud"] != "artex" || claims["iss"] != s.origin()+"/api/demo-idp" {
-		http.Error(w, "身份令牌和这次登录对不上，请重新登录。", http.StatusBadRequest)
-		return
-	}
-	sub, _ := claims["sub"].(string)
-	user, err := s.ent.BindLogin(r.Context(), s.origin()+"/api/demo-idp", sub)
+
+	sub, err := s.oidc.Exchange(r.Context(), query.Get("code"), login)
 	if err != nil {
-		http.Error(w, "没有完成身份绑定，请稍后重试。", http.StatusBadRequest)
+		log.Printf("[enterprise] OIDC exchange: %v", err)
+		http.Error(w, "企业登录没有完成，请回到登录页重试。", http.StatusBadRequest)
+		return
+	}
+	if _, demo := s.oidc.(*demoIDP); !demo {
+		for _, account := range demoAccounts() {
+			if sub == account.Sub {
+				http.Error(w, "该企业身份不可用于登录。", http.StatusForbidden)
+				return
+			}
+		}
+	}
+	user, err := s.ent.BindLogin(r.Context(), s.oidc.Issuer(), sub)
+	if writeEnt(w, err) {
 		return
 	}
 	sessionID, exp, err := s.ent.StartSession(r.Context(), user.ID)
-	if err != nil {
-		http.Error(w, "没有建立会话，请稍后重试。", http.StatusBadRequest)
+	if writeEnt(w, err) {
 		return
 	}
 	signed, err := s.signEnterprise(user, sessionID, exp)
-	if err != nil {
-		http.Error(w, "没有建立会话，请稍后重试。", http.StatusBadRequest)
+	if writeEnt(w, err) {
 		return
 	}
-	maxAge := int(time.Until(exp).Seconds())
-	http.SetCookie(w, &http.Cookie{Name: "artex_token", Value: signed, Path: "/", MaxAge: maxAge, SameSite: http.SameSiteLaxMode})
-	http.SetCookie(w, &http.Cookie{Name: "artex_enterprise", Value: "1", Path: "/", MaxAge: maxAge, SameSite: http.SameSiteLaxMode})
+	s.setEnterpriseCookies(w, r, signed, int(time.Until(exp).Seconds()))
 	http.Redirect(w, r, s.origin()+"/enterprise/landing", http.StatusFound)
 }
 
-func (s *Server) demoAuthorize(w http.ResponseWriter, r *http.Request) {
-	if s.demo == nil {
-		http.Error(w, "企业登录暂不可用", http.StatusServiceUnavailable)
-		return
+type demoIDP struct {
+	issuer string
+	key    []byte
+	mu     sync.Mutex
+	codes  map[string]demoCode
+}
+
+type demoCode struct {
+	sub, nonce, challenge, redirectURI string
+	exp                                time.Time
+}
+
+func newDemoIDP(origin string, key []byte) *demoIDP {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte("artex-demo-idp"))
+	return &demoIDP{issuer: origin + "/api/demo-idp", key: mac.Sum(nil), codes: map[string]demoCode{}}
+}
+
+func (p *demoIDP) Issuer() string { return p.issuer }
+
+func (p *demoIDP) AuthorizationURL(_ context.Context, login loginState) (string, error) {
+	return authorizationURL(p.issuer+"/authorize", "artex", login)
+}
+
+func (p *demoIDP) Exchange(_ context.Context, code string, login loginState) (string, error) {
+	token, err := p.exchangeCode(code, login.verifier, login.redirectURI)
+	if err != nil {
+		return "", err
 	}
-	state := r.URL.Query().Get("state")
-	s.demo.mu.Lock()
-	saved, ok := s.demo.states[state]
-	s.demo.mu.Unlock()
-	if !ok {
-		http.Error(w, "登录请求已失效，请回到 ARTEX 重新开始。", http.StatusBadRequest)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = demoLoginPage.Execute(w, map[string]any{
-		"State":    state,
-		"Accounts": demoAccounts(),
-		"Password": enterprise.DemoLoginPassword,
-		"Prefer":   saved.prefer,
+	return verifyOIDCToken(token, p.issuer, "artex", login.nonce, []string{"HS256"}, func(*jwt.Token) (any, error) {
+		return p.key, nil
 	})
 }
 
-func (s *Server) demoLogin(w http.ResponseWriter, r *http.Request) {
-	if s.demo == nil {
-		http.Error(w, "企业登录暂不可用", http.StatusServiceUnavailable)
+func (s *Server) readDemoLogin(ctx context.Context, state string) (loginState, error) {
+	login := loginState{state: state}
+	err := s.ent.DB.QueryRowContext(ctx, `
+		SELECT nonce, code_verifier, redirect_uri, prefer FROM ent_login_states
+		WHERE state=$1 AND expires_at > now()`, state).
+		Scan(&login.nonce, &login.verifier, &login.redirectURI, &login.prefer)
+	return login, err
+}
+
+func (s *Server) demoAuthorize(w http.ResponseWriter, r *http.Request) {
+	login, err := s.readDemoLogin(r.Context(), r.URL.Query().Get("state"))
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "登录请求已失效，请回到 ARTEX 重新开始。", http.StatusBadRequest)
 		return
 	}
+	if writeEnt(w, err) {
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if err := demoLoginPage.Execute(w, map[string]any{
+		"State":    login.state,
+		"Accounts": demoAccounts(),
+		"Password": enterprise.DemoLoginPassword,
+		"Prefer":   login.prefer,
+	}); err != nil {
+		log.Printf("[enterprise] render demo login: %v", err)
+	}
+}
+
+func (s *Server) demoLogin(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "登录表单无法读取", http.StatusBadRequest)
 		return
 	}
-	state := r.FormValue("state")
-	sub := r.FormValue("account")
-	if subtleDiff(r.FormValue("password"), enterprise.DemoLoginPassword) {
+	sub := r.PostForm.Get("account")
+	if !hmac.Equal([]byte(r.PostForm.Get("password")), []byte(enterprise.DemoLoginPassword)) {
 		http.Error(w, "演示口令不正确。请使用登录页上写明的虚构口令。", http.StatusUnauthorized)
 		return
 	}
-	var name string
 	found := false
 	for _, account := range demoAccounts() {
 		if account.Sub == sub {
-			name = account.Name
 			found = true
+			break
 		}
 	}
 	if !found {
 		http.Error(w, "没有这个演示账号。", http.StatusBadRequest)
 		return
 	}
-	s.demo.mu.Lock()
-	saved, ok := s.demo.states[state]
-	s.demo.mu.Unlock()
-	if !ok || time.Now().After(saved.exp) {
+	login, err := s.readDemoLogin(r.Context(), r.PostForm.Get("state"))
+	if errors.Is(err, sql.ErrNoRows) {
 		http.Error(w, "登录请求已失效，请回到 ARTEX 重新开始。", http.StatusBadRequest)
 		return
 	}
-	sum := sha256.Sum256([]byte(saved.verifier))
-	code := randomURL(24)
-	s.demo.mu.Lock()
-	s.demo.codes[code] = demoCode{
-		sub: sub, name: name, nonce: saved.nonce,
-		challenge: base64.RawURLEncoding.EncodeToString(sum[:]),
-		redirect:  saved.redirect, exp: time.Now().Add(5 * time.Minute),
+	if writeEnt(w, err) {
+		return
 	}
-	s.demo.mu.Unlock()
-	http.Redirect(w, r, saved.redirect+"?code="+url.QueryEscape(code)+"&state="+url.QueryEscape(state), http.StatusFound)
+	demo := s.oidc.(*demoIDP)
+	code := randomURL(24)
+	now := time.Now()
+	demo.mu.Lock()
+	for id, grant := range demo.codes {
+		if !now.Before(grant.exp) {
+			delete(demo.codes, id)
+		}
+	}
+	demo.codes[code] = demoCode{
+		sub: sub, nonce: login.nonce, challenge: pkceChallenge(login.verifier),
+		redirectURI: login.redirectURI, exp: now.Add(5 * time.Minute),
+	}
+	demo.mu.Unlock()
+	q := url.Values{"code": {code}, "state": {login.state}}
+	http.Redirect(w, r, login.redirectURI+"?"+q.Encode(), http.StatusFound)
 }
 
 func (s *Server) demoToken(w http.ResponseWriter, r *http.Request) {
@@ -1044,7 +1164,8 @@ func (s *Server) demoToken(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 400, "invalid_request", "令牌请求无法读取", nil)
 		return
 	}
-	token, err := s.demo.exchange(r.FormValue("code"), r.FormValue("code_verifier"), s.jwtKey, s.origin()+"/api/demo-idp")
+	demo := s.oidc.(*demoIDP)
+	token, err := demo.exchangeCode(r.PostForm.Get("code"), r.PostForm.Get("code_verifier"), r.PostForm.Get("redirect_uri"))
 	if err != nil {
 		writeProductError(w, 400, "invalid_grant", "授权码无效或已使用", nil)
 		return
@@ -1052,38 +1173,23 @@ func (s *Server) demoToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id_token": token, "token_type": "Bearer"})
 }
 
-func (p *demoIDP) exchange(code, verifier string, key []byte, issuer string) (string, error) {
-	if p == nil {
-		return "", errors.New("idp down")
-	}
-	sum := sha256.Sum256([]byte(verifier))
-	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+func (p *demoIDP) exchangeCode(code, verifier, redirectURI string) (string, error) {
 	p.mu.Lock()
 	grant, ok := p.codes[code]
-	if ok {
-		delete(p.codes, code)
-	}
+	delete(p.codes, code)
 	p.mu.Unlock()
-	if !ok || time.Now().After(grant.exp) || grant.challenge != challenge {
-		return "", errors.New("invalid code")
+	if !ok || !time.Now().Before(grant.exp) || grant.challenge != pkceChallenge(verifier) || grant.redirectURI != redirectURI {
+		return "", errors.New("invalid demo authorization code")
 	}
+	now := time.Now()
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":   issuer,
-		"sub":   grant.sub,
-		"aud":   "artex",
-		"nonce": grant.nonce,
-		"name":  grant.name,
-		"exp":   time.Now().Add(5 * time.Minute).Unix(),
-		"iat":   time.Now().Unix(),
-	}).SignedString(key)
+		"iss": p.issuer, "sub": grant.sub, "aud": "artex", "nonce": grant.nonce,
+		"exp": now.Add(5 * time.Minute).Unix(), "iat": now.Unix(),
+	}).SignedString(p.key)
 }
 
 func (s *Server) demoDiscovery(w http.ResponseWriter, r *http.Request) {
-	if s.demo == nil {
-		writeProductError(w, 503, "idp_down", "企业登录暂不可用", nil)
-		return
-	}
-	issuer := s.origin() + "/api/demo-idp"
+	issuer := s.oidc.Issuer()
 	writeJSON(w, 200, map[string]any{
 		"issuer":                                issuer,
 		"authorization_endpoint":                issuer + "/authorize",
@@ -1096,19 +1202,8 @@ func (s *Server) demoDiscovery(w http.ResponseWriter, r *http.Request) {
 
 func randomURL(n int) string {
 	buf := make([]byte, n)
-	_, _ = rand.Read(buf)
+	rand.Read(buf)
 	return base64.RawURLEncoding.EncodeToString(buf)
-}
-
-func subtleDiff(got, want string) bool {
-	if len(got) != len(want) {
-		return true
-	}
-	var diff byte
-	for i := range got {
-		diff |= got[i] ^ want[i]
-	}
-	return diff != 0
 }
 
 var demoLoginPage = template.Must(template.New("idp").Parse(`<!doctype html>

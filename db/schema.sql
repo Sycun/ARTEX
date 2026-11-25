@@ -1732,6 +1732,18 @@ CREATE TABLE IF NOT EXISTS ent_sessions (
     idle_expires TIMESTAMPTZ NOT NULL,
     revoked_at TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_ent_sessions_user_expiry
+    ON ent_sessions(user_id, revoked_at, idle_expires);
+
+CREATE TABLE IF NOT EXISTS ent_login_states (
+    state TEXT PRIMARY KEY,
+    nonce TEXT NOT NULL,
+    code_verifier TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    prefer TEXT NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ent_login_states_expiry ON ent_login_states(expires_at);
 
 CREATE TABLE IF NOT EXISTS ent_init_grants (
     id TEXT PRIMARY KEY,
@@ -1753,9 +1765,11 @@ CREATE TABLE IF NOT EXISTS ent_members (
     project_id TEXT NOT NULL REFERENCES ent_projects(id),
     user_id TEXT NOT NULL REFERENCES ent_users(id),
     role TEXT NOT NULL CHECK (role IN ('owner','member','reader')),
+    post TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (project_id, user_id)
 );
+ALTER TABLE ent_members ADD COLUMN IF NOT EXISTS post TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS ent_duties (
     id TEXT PRIMARY KEY,
@@ -1808,8 +1822,12 @@ CREATE TABLE IF NOT EXISTS ent_originals (
     filename TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     storage_path TEXT NOT NULL,
+    contains_credentials BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE ent_originals ADD COLUMN IF NOT EXISTS contains_credentials BOOLEAN NOT NULL DEFAULT true;
+CREATE INDEX IF NOT EXISTS idx_ent_originals_finding_project
+    ON ent_originals(finding_id, project_id);
 
 CREATE TABLE IF NOT EXISTS ent_asset_obs (
     id TEXT PRIMARY KEY,
@@ -1905,6 +1923,59 @@ CREATE TABLE IF NOT EXISTS ent_original_grants (
     expires_at TIMESTAMPTZ NOT NULL,
     revoked_at TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_ent_original_grants_active
+    ON ent_original_grants(original_id, user_id, expires_at) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_ent_original_grants_request
+    ON ent_original_grants(request_id);
+
+CREATE OR REPLACE FUNCTION ent_revoke_original_grants() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE target_project TEXT; target_user TEXT;
+BEGIN
+    CASE TG_TABLE_NAME
+    WHEN 'ent_members' THEN
+        target_project := OLD.project_id;
+        target_user := OLD.user_id;
+        IF TG_OP = 'UPDATE' THEN
+            IF NOT ((OLD.role = 'owner' AND NEW.role <> 'owner')
+                OR (OLD.role = 'member' AND NEW.role IN ('reader', 'leader'))
+                OR (OLD.post NOT IN ('reader', 'leader') AND NEW.post IN ('reader', 'leader'))) THEN
+                RETURN NULL;
+            END IF;
+        END IF;
+    WHEN 'ent_duties' THEN
+        SELECT project_id, user_id INTO target_project, target_user FROM ent_members
+        WHERE project_id = NEW.project_id AND user_id = NEW.user_id AND post = ''
+        FOR NO KEY UPDATE;
+        IF NOT FOUND THEN RETURN NULL; END IF;
+    WHEN 'ent_users' THEN
+        target_user := OLD.id;
+    WHEN 'ent_projects' THEN
+        target_project := OLD.id;
+    END CASE;
+
+    UPDATE ent_original_grants g SET revoked_at = statement_timestamp()
+    FROM ent_originals o
+    WHERE g.original_id = o.id AND g.revoked_at IS NULL
+        AND (target_project IS NULL OR o.project_id = target_project)
+        AND (target_user IS NULL OR g.user_id = target_user);
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_ent_original_grants_member ON ent_members;
+CREATE TRIGGER trg_ent_original_grants_member AFTER DELETE OR UPDATE OF role, post ON ent_members
+    FOR EACH ROW EXECUTE FUNCTION ent_revoke_original_grants();
+DROP TRIGGER IF EXISTS trg_ent_original_grants_lead ON ent_duties;
+CREATE TRIGGER trg_ent_original_grants_lead AFTER INSERT OR UPDATE OF duty ON ent_duties
+    FOR EACH ROW WHEN (NEW.duty = 'lead') EXECUTE FUNCTION ent_revoke_original_grants();
+DROP TRIGGER IF EXISTS trg_ent_original_grants_user ON ent_users;
+CREATE TRIGGER trg_ent_original_grants_user AFTER UPDATE OF directory_status, employment ON ent_users
+    FOR EACH ROW WHEN (OLD.directory_status = 'verified' AND OLD.employment = 'active'
+        AND (NEW.directory_status <> 'verified' OR NEW.employment <> 'active'))
+    EXECUTE FUNCTION ent_revoke_original_grants();
+DROP TRIGGER IF EXISTS trg_ent_original_grants_project ON ent_projects;
+CREATE TRIGGER trg_ent_original_grants_project AFTER UPDATE OF status ON ent_projects
+    FOR EACH ROW WHEN (OLD.status = 'active' AND NEW.status = 'archived')
+    EXECUTE FUNCTION ent_revoke_original_grants();
 
 CREATE TABLE IF NOT EXISTS ent_evidence_requests (
     id TEXT PRIMARY KEY,
@@ -1924,6 +1995,8 @@ CREATE TABLE IF NOT EXISTS ent_evidence_requests (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     decided_at TIMESTAMPTZ
 );
+CREATE INDEX IF NOT EXISTS idx_ent_evidence_requests_project_status_created
+    ON ent_evidence_requests(project_id, status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS ent_todos (
     id TEXT PRIMARY KEY,
@@ -1938,6 +2011,10 @@ CREATE TABLE IF NOT EXISTS ent_todos (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_ent_todo_open
     ON ent_todos(kind, assignee_id, subject_id) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_ent_todos_open_assignee_created
+    ON ent_todos(assignee_id, created_at DESC) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_ent_todos_open_subject_kind
+    ON ent_todos(subject_id, kind) WHERE status = 'open';
 
 CREATE TABLE IF NOT EXISTS ent_audit (
     id TEXT PRIMARY KEY,
@@ -1952,6 +2029,11 @@ CREATE TABLE IF NOT EXISTS ent_audit (
     content_hash TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS idx_ent_audit_project_created
+    ON ent_audit(project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ent_audit_report_decision
+    ON ent_audit(subject_id, created_at DESC)
+    WHERE action IN ('report_issued','report_returned','report_withdrawn');
 
 CREATE TABLE IF NOT EXISTS ent_notifications (
     id TEXT PRIMARY KEY,

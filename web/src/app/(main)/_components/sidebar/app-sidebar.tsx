@@ -96,8 +96,7 @@ function useEnterpriseNav(post: string): { enterpriseOn: boolean; items: NavGrou
   const [enterpriseOn, setEnterpriseOn] = useState(false);
   const [items, setItems] = useState<NavGroup[] | null>(null);
   useEffect(() => {
-    const token = auth.getToken();
-    const on = Boolean(token) && document.cookie.includes("artex_enterprise=1");
+    const on = auth.hasEnterpriseSession();
     setEnterpriseOn(on);
     if (!on) {
       setItems(null);

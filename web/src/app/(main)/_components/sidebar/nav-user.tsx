@@ -35,7 +35,7 @@ export function NavUser({
   const [pwOpen, setPwOpen] = React.useState(false);
   const [enterprise, setEnterprise] = React.useState(false);
   React.useEffect(() => {
-    setEnterprise(document.cookie.includes("artex_enterprise=1"));
+    setEnterprise(auth.hasEnterpriseSession());
   }, []);
 
   function handleLogout() {
