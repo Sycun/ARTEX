@@ -72,13 +72,13 @@ func markdownText(s string, maxRunes int) string {
 // 出现了 `\(1\)` 这种可见的反斜杠。
 func markdownTitle(m Message) string {
 	if m.Batch {
-		return fmt.Sprintf("漏洞汇总 · 共 %d 条", len(m.Items))
+		return m.batchTitle(len(m.Items))
 	}
 	if len(m.Items) == 0 {
 		return "漏洞通知"
 	}
 	it := m.Items[0]
-	return fmt.Sprintf("[%s] %s", SeverityLabel(it.Severity), OneLine(it.Title(), 0))
+	return fmt.Sprintf("[%s] %s", it.label(), OneLine(it.Title(), 0))
 }
 
 // markdownBody 渲染消息正文，返回正文与**实际写入的条目数**。
@@ -129,11 +129,7 @@ func markdownBody(m Message, maxBytes int) (string, int) {
 // 而后面那些从未发出的条目在界面上完全不存在。
 func markdownBatchIntro(m Message, items []Item, total int) string {
 	var b strings.Builder
-	if m.WindowMinutes > 0 {
-		fmt.Fprintf(&b, "**近 %d 分钟新增 %d 个漏洞**", m.WindowMinutes, total)
-	} else {
-		fmt.Fprintf(&b, "**新增 %d 个漏洞**", total)
-	}
+	fmt.Fprintf(&b, "**%s**", m.batchIntro(total))
 	if extra := total - len(items); extra > 0 {
 		fmt.Fprintf(&b, "（本条显示前 %d 条，其余 %d 条将在下一条消息继续）", len(items), extra)
 	}
@@ -165,7 +161,7 @@ func markdownBatchIntro(m Message, items []Item, total int) string {
 // 单行化 + 转义。回链是管理员配置的 public_base_url 拼出来的，不是不可信内容，
 // 且必须是可点的链接，所以原样输出。
 func writeItem(b *strings.Builder, it Item, prefix string, single bool) {
-	line := fmt.Sprintf("%s**%s · %s**", prefix, SeverityLabel(it.Severity), markdownText(it.Title(), 0))
+	line := fmt.Sprintf("%s**%s · %s**", prefix, it.label(), markdownText(it.Title(), 0))
 	if !single {
 		// 汇总模式：单行呈现，资产与摘要压缩后跟在后面。
 		var extras []string

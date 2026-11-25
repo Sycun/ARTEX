@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
@@ -378,8 +377,22 @@ func (s *Service) Download(ctx context.Context, a Actor, versionID string) (Down
 	}
 	var file []byte
 	var hash, filename string
-	if err := s.DB.QueryRowContext(ctx, `SELECT file_bytes, file_hash, filename FROM ent_issues WHERE version_id=$1`, versionID).Scan(&file, &hash, &filename); err != nil {
+	var key sql.NullString
+	err = s.DB.QueryRowContext(ctx, `
+		SELECT blob_key, CASE WHEN NULLIF(blob_key, '') IS NULL THEN file_bytes END, file_hash, filename
+		FROM ent_issues WHERE version_id=$1`, versionID).
+		Scan(&key, &file, &hash, &filename)
+	if errors.Is(err, sql.ErrNoRows) {
 		return Download{}, fail(404, "not_found", "找不到", nil)
+	}
+	if err != nil {
+		return Download{}, err
+	}
+	if key.Valid && key.String != "" {
+		file, err = s.blobs.Get(ctx, key.String)
+		if err != nil {
+			return Download{}, err
+		}
 	}
 	if Hash(file) != hash {
 		return Download{}, fail(500, "hash_mismatch", "签发文件和记录的哈希不一致，已停止下载", nil)
@@ -747,7 +760,7 @@ func (s *Service) ReadOriginal(ctx context.Context, a Actor, originalID string) 
 		if !hasOriginalGrants(grants, requiresCredential, s.now()) {
 			return fail(404, "not_found", "找不到可读取的原件", nil)
 		}
-		body, err = os.ReadFile(path)
+		body, err = s.readOriginalBlob(ctx, path)
 		if err != nil {
 			return err
 		}

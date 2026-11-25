@@ -257,7 +257,7 @@ func (s *Service) Submit(ctx context.Context, a Actor, versionID, bodyHash strin
 			return err
 		}
 		out = ActionResult{OK: true, Status: "in_review", VersionID: v.ID, Message: "v" + fmt.Sprint(v.Number) + " 已冻结，正在等待复核"}
-		return s.notify(ctx, tx, "report_submitted", "有一份报告待复核。请登录后查看待办。")
+		return s.notify(ctx, tx, "report_submitted")
 	})
 	return out, err
 }
@@ -531,7 +531,7 @@ func (s *Service) Return(ctx context.Context, a Actor, versionID, bodyHash, reas
 		if err := s.audit(ctx, tx, v.ProjectID, a.ID, "report_returned", "报告已退回", "报告已退回", "version", v.ID, v.BodyHash, &v.Number); err != nil {
 			return err
 		}
-		if err := s.notify(ctx, tx, "report_returned", "有一份报告已退回。请登录后查看待办。"); err != nil {
+		if err := s.notify(ctx, tx, "report_returned"); err != nil {
 			return err
 		}
 		out = ActionResult{OK: true, Status: "returned", VersionID: v.ID, SuccessorID: nextID, Message: "已退回，并打开了下一版草稿", CredentialNotice: notice(text.Removed)}
@@ -649,11 +649,6 @@ func (s *Service) Issue(ctx context.Context, a Actor, versionID, bodyHash string
 		file := issuedMarkdown(projectName, v.Title, v.Number, v.Body)
 		hash := Hash(file)
 		filename := fmt.Sprintf("%s-v%d-脱敏报告.md", projectName, v.Number)
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO ent_issues (version_id, issuer_id, file_hash, file_bytes, filename) VALUES ($1,$2,$3,$4,$5)`,
-			v.ID, a.ID, hash, file, filename); err != nil {
-			return err
-		}
 		if err := s.closeTodos(ctx, tx, v.ID, "report_review"); err != nil {
 			return err
 		}
@@ -673,7 +668,10 @@ func (s *Service) Issue(ctx context.Context, a Actor, versionID, bodyHash string
 		if err := s.audit(ctx, tx, v.ProjectID, a.ID, "report_issued", "报告已签发", "报告已签发", "version", v.ID, hash, &v.Number); err != nil {
 			return err
 		}
-		if err := s.notify(ctx, tx, "report_issued", "有一份报告已签发。请登录后查看待办。"); err != nil {
+		if err := s.notify(ctx, tx, "report_issued"); err != nil {
+			return err
+		}
+		if err := s.writeIssue(ctx, tx, v.ID, a.ID, hash, filename, file, now); err != nil {
 			return err
 		}
 		out = ActionResult{OK: true, Status: "issued", VersionID: v.ID, FileHash: hash, Message: "已签发这个冻结版本", Next: "下载该签发版"}

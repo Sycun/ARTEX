@@ -181,6 +181,11 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		snapshot.DataCounts["traffic"] = trafficCount
 	}
 	archivePath := taskArchivePath(s.m.dir, job.ID, taskID)
+	packagePath := archivePath
+	if s.ent != nil {
+		archivePath = taskArchiveBlobKey(job)
+		packagePath = filepath.Join(fileStage.root, "package.tar.zst")
+	}
 	evidenceSnapshots, err := pgdb.ArchiveEvidenceSnapshots(snapshot)
 	if err != nil {
 		return err
@@ -189,16 +194,22 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		return err
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "compress", 50)
-	originalSize, compressedSize, checksum, err := writeTaskArchivePackage(archivePath, fileStage.payload, snapshot)
+	originalSize, compressedSize, checksum, err := writeTaskArchivePackage(packagePath, fileStage.payload, snapshot)
 	if err != nil {
 		return err
 	}
-	removePackage := true
 	defer func() {
-		if removePackage {
-			_ = os.Remove(archivePath)
+		if !committed && s.ent == nil {
+			if err := os.Remove(packagePath); !os.IsNotExist(err) {
+				runErr = errors.Join(runErr, err)
+			}
 		}
 	}()
+	if s.ent != nil {
+		if err := s.putTaskArchiveBlob(job, packagePath); err != nil {
+			return err
+		}
+	}
 	var trafficStage *traffic.HostDeleteStage
 	if s.m.traffic != nil && len(snapshot.ExclusiveHosts) > 0 {
 		_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "compact_traffic", 68)
@@ -217,7 +228,6 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		return err
 	}
 	committed = true
-	removePackage = false
 	if trafficStage != nil {
 		if err := trafficStage.Commit(); err != nil {
 			warning := "归档已完成，但独占流量热存储清理失败（归档包仍可恢复）：" + err.Error()
@@ -239,7 +249,8 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 }
 
 func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
-	if err := validateArchivePath(s.m.dir, job.ArchivePath); err != nil {
+	store, err := s.archiveStoreFor(job)
+	if err != nil {
 		return err
 	}
 	// A prior attempt may have committed PostgreSQL and files, then failed only
@@ -247,7 +258,7 @@ func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
 	if restored, err := s.m.pg.IsTaskArchiveRestored(job.ID); err != nil {
 		return err
 	} else if restored {
-		if err := os.Remove(job.ArchivePath); err != nil && !os.IsNotExist(err) {
+		if err := s.consumeTaskArchive(job); err != nil {
 			return err
 		}
 		if err := s.m.pg.CompleteTaskArchiveRestore(job.ID); err != nil {
@@ -266,7 +277,7 @@ func (s *Server) restoreTaskArchive(job *pgdb.TaskArchive) (runErr error) {
 		return err
 	}
 	defer func() { _ = os.RemoveAll(extracted) }()
-	if err := extractTaskArchivePackage(job.ArchivePath, job.SHA256, extracted); err != nil {
+	if err := s.extractTaskArchive(job, store, extracted); err != nil {
 		return err
 	}
 	manifestRaw, err := os.ReadFile(filepath.Join(extracted, "manifest.json"))
@@ -356,7 +367,7 @@ func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb
 		return err
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "consume_package", 95)
-	if err := os.Remove(job.ArchivePath); err != nil && !os.IsNotExist(err) {
+	if err := s.consumeTaskArchive(job); err != nil {
 		return err
 	}
 	if err := s.m.pg.CompleteTaskArchiveRestore(job.ID); err != nil {
@@ -393,10 +404,17 @@ func (s *Server) loadRestoredTask(taskID int64) {
 }
 
 func (s *Server) deleteTaskArchive(job *pgdb.TaskArchive) error {
-	if err := validateArchivePath(s.m.dir, job.ArchivePath); err != nil {
+	store, err := s.archiveStoreFor(job)
+	if err != nil {
 		return err
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "stage_package_delete", 35)
+	if store != nil {
+		if err := store.Delete(s.ctx, job.ArchivePath); err != nil {
+			return err
+		}
+		return s.m.pg.DeleteTaskArchiveStub(job.ID)
+	}
 	staged, moved, err := stageTaskArchivePackageDelete(job.ArchivePath, job.ID)
 	if err != nil {
 		return err

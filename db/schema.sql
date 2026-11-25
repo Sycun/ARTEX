@@ -1888,10 +1888,13 @@ CREATE TABLE IF NOT EXISTS ent_issues (
     version_id TEXT PRIMARY KEY REFERENCES ent_versions(id),
     issuer_id TEXT NOT NULL,
     file_hash TEXT NOT NULL,
-    file_bytes BYTEA NOT NULL,
+    file_bytes BYTEA,
+    blob_key TEXT,
     filename TEXT NOT NULL,
     issued_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE ent_issues ADD COLUMN IF NOT EXISTS blob_key TEXT;
+ALTER TABLE ent_issues ALTER COLUMN file_bytes DROP NOT NULL;
 
 CREATE TABLE IF NOT EXISTS ent_delegations (
     id TEXT PRIMARY KEY,
@@ -2039,8 +2042,12 @@ CREATE TABLE IF NOT EXISTS ent_notifications (
     id TEXT PRIMARY KEY,
     event_type TEXT NOT NULL,
     summary TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    outbound_pending BOOLEAN NOT NULL DEFAULT false
 );
+ALTER TABLE ent_notifications ADD COLUMN IF NOT EXISTS outbound_pending BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_ent_notifications_outbound_pending
+    ON ent_notifications(created_at, id) WHERE outbound_pending;
 
 CREATE TABLE IF NOT EXISTS ent_sample_loads (
     sample_key TEXT PRIMARY KEY,

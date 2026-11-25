@@ -130,7 +130,7 @@ func (s *Service) RequestOriginal(ctx context.Context, a Actor, reportID, purpos
 		if err := s.audit(ctx, tx, projectID, a.ID, "original_requested", "原件申请", "原件申请", "evidence", out.ID, "", nil); err != nil {
 			return err
 		}
-		return s.notify(ctx, tx, "original_requested", "有一张原件申请。请登录后查看待办。")
+		return s.notify(ctx, tx, "original_requested")
 	})
 	return out, err
 }
@@ -205,7 +205,7 @@ func (s *Service) ApproveOriginal(ctx context.Context, a Actor, requestID string
 		if err := s.audit(ctx, tx, r.projectID, a.ID, "original_approved", "原件申请已批准", "原件申请已批准", "evidence", r.ID, "", nil); err != nil {
 			return err
 		}
-		return s.notify(ctx, tx, "original_approved", "有一张原件申请已处理。请登录后查看。")
+		return s.notify(ctx, tx, "original_approved")
 	})
 	if err != nil {
 		return EvidenceRequest{}, err
@@ -280,7 +280,7 @@ func (s *Service) RejectOriginal(ctx context.Context, a Actor, requestID, reason
 		if err := s.audit(ctx, tx, r.projectID, a.ID, "original_rejected", "原件申请被拒绝", "原件申请被拒绝", "evidence", requestID, "", nil); err != nil {
 			return err
 		}
-		return s.notify(ctx, tx, "original_rejected", "有一张原件申请已处理。请登录后查看待办。")
+		return s.notify(ctx, tx, "original_rejected")
 	})
 	if err != nil {
 		return EvidenceRequest{}, err

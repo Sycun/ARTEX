@@ -97,7 +97,7 @@ func (s *Service) SubmitJoin(ctx context.Context, a Actor, code, purpose string)
 		if err := s.audit(ctx, tx, projectID.String, a.ID, "join_requested", "加入请求", "加入请求 "+rc.ReceiptNo, "join", rc.ID, "", nil); err != nil {
 			return fmt.Errorf("audit: %w", err)
 		}
-		if err := s.notify(ctx, tx, "join_requested", "有一张新的加入请求。请登录后查看待办。"); err != nil {
+		if err := s.notify(ctx, tx, "join_requested"); err != nil {
 			return fmt.Errorf("notify: %w", err)
 		}
 		return nil
@@ -251,7 +251,7 @@ func (s *Service) DecideJoin(ctx context.Context, a Actor, id, decision, role st
 			if err := s.audit(ctx, tx, projectID.String, a.ID, "join_rejected", "未获批准", "加入请求已拒绝", "join", id, "", nil); err != nil {
 				return err
 			}
-			return s.notify(ctx, tx, "join_rejected", "有一张加入请求已处理。请登录后查看待办。")
+			return s.notify(ctx, tx, "join_rejected")
 		}
 		var dir, employment string
 		if err := tx.QueryRowContext(ctx, `SELECT directory_status, employment FROM ent_users WHERE id=$1 FOR UPDATE`, applicant).Scan(&dir, &employment); err != nil {
@@ -280,7 +280,7 @@ func (s *Service) DecideJoin(ctx context.Context, a Actor, id, decision, role st
 			if err := s.audit(ctx, tx, projectID.String, a.ID, "member_added", "添加成员", "添加成员", "member", applicant, "", nil); err != nil {
 				return err
 			}
-			if err := s.notify(ctx, tx, "member_added", "有一张加入请求已处理。请登录后查看待办。"); err != nil {
+			if err := s.notify(ctx, tx, "member_added"); err != nil {
 				return err
 			}
 		}

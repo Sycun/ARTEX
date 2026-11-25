@@ -1,5 +1,10 @@
 package notify
 
+import (
+	"fmt"
+	"slices"
+)
+
 // Snapshot 是 notification_events.snapshot 这一 JSONB 列的契约。写方是 db 层的
 // 漏洞落库事务，读方是 server 层的投递引擎与过滤匹配。定义放在本包是因为它是
 // 「通知领域」的载荷：db 只负责序列化，不理解字段含义。
@@ -24,6 +29,7 @@ type Snapshot struct {
 
 // Item 是一条待推送的漏洞，供渠道渲染。
 type Item struct {
+	Kind      string
 	FindingID int64
 	Name      string
 	VulnClass string
@@ -41,6 +47,13 @@ type Item struct {
 
 // IsStatusChange 报告该条目是否为状态变更事件。
 func (i Item) IsStatusChange() bool { return i.FromStatus != "" || i.ToStatus != "" }
+
+func (i Item) label() string {
+	if IsEnterpriseEvent(i.Kind) {
+		return "企业工作台"
+	}
+	return SeverityLabel(i.Severity)
+}
 
 // Title 返回条目的展示标题：优先人工命名的 name，回退漏洞类型 vulnclass，
 // 两者都空时用一个占位符——绝不输出空标题。
@@ -66,4 +79,26 @@ type Message struct {
 	WindowMinutes int
 	// HomeURL 是平台面板地址（全局 public_base_url）；空则不带面板入口。
 	HomeURL string
+}
+
+func (m Message) hasEnterpriseEvents() bool {
+	return slices.ContainsFunc(m.Items, func(i Item) bool { return IsEnterpriseEvent(i.Kind) })
+}
+
+func (m Message) batchTitle(total int) string {
+	if m.hasEnterpriseEvents() {
+		return fmt.Sprintf("通知汇总 · 共 %d 条", total)
+	}
+	return fmt.Sprintf("漏洞汇总 · 共 %d 条", total)
+}
+
+func (m Message) batchIntro(total int) string {
+	period := ""
+	if m.WindowMinutes > 0 {
+		period = fmt.Sprintf("近 %d 分钟", m.WindowMinutes)
+	}
+	if m.hasEnterpriseEvents() {
+		return fmt.Sprintf("%s收到 %d 条通知", period, total)
+	}
+	return fmt.Sprintf("%s新增 %d 个漏洞", period, total)
 }

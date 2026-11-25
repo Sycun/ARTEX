@@ -438,7 +438,7 @@ func recoverTaskArchiveStages(dataDir string, pg *pgdb.DB) error {
 		if err := stage.rollback(); err != nil {
 			errs = append(errs, err)
 		}
-		if archive != nil && archive.ArchivePath != "" {
+		if archive != nil && archive.ArchivePath != "" && !strings.HasPrefix(archive.ArchivePath, archiveBlobPrefix) {
 			_ = os.Remove(archive.ArchivePath)
 		}
 	}
@@ -644,6 +644,10 @@ func extractTaskArchivePackage(path, expectedSHA, destination string) error {
 		return err
 	}
 	defer file.Close()
+	return extractTaskArchiveReader(file, expectedSHA, destination)
+}
+
+func extractTaskArchiveReader(file io.ReadSeeker, expectedSHA, destination string) error {
 	if expectedSHA != "" {
 		hasher := sha256.New()
 		if _, err := io.Copy(hasher, file); err != nil {

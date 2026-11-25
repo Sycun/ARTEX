@@ -132,12 +132,6 @@ func (s *Service) EnsureReviewPack(ctx context.Context) (ReviewPack, error) {
 		}
 		file := issuedMarkdown("门户整改", "历史审核样例：登录页错误说明", 1, body)
 		fileHash := Hash(file)
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO ent_issues (version_id, issuer_id, file_hash, file_bytes, filename, issued_at)
-			VALUES ($1,$2,$3,$4,$5,$6)`,
-			versionID, UserBiz, fileHash, file, "门户整改-v1-脱敏报告.md", completed); err != nil {
-			return err
-		}
 		if err := s.audit(ctx, tx, projectID, UserBiz, "review_sample_loaded", "历史审核样例已准备",
 			"DEMO-RV-001 已准备：一条已完成任务和一份已签发脱敏报告。它不是本轮 DEMO-NS-001 的签发。",
 			"sample", ReviewSampleKey, "", nil); err != nil {
@@ -159,7 +153,7 @@ func (s *Service) EnsureReviewPack(ctx context.Context) (ReviewPack, error) {
 			ProjectID: projectID, TaskID: taskID, FindingID: findingID,
 			ReportID: reportID, VersionID: versionID, FileHash: fileHash, Sample: ReviewSampleKey,
 		}
-		return nil
+		return s.writeIssue(ctx, tx, versionID, UserBiz, fileHash, "门户整改-v1-脱敏报告.md", file, completed)
 	})
 	return pack, err
 }

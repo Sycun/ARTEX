@@ -154,15 +154,15 @@ const telegramReservedRunes = 160
 // telegramBatchLine 渲染汇总里的一条（未转义，由调用方统一转义）。
 func telegramBatchLine(it Item, idx int) string {
 	if a := assetLine(it.Assets, maxAssetsShown); a != "" {
-		return fmt.Sprintf("%d. %s · %s — %s", idx, SeverityLabel(it.Severity), it.Title(), a)
+		return fmt.Sprintf("%d. %s · %s — %s", idx, it.label(), it.Title(), a)
 	}
-	return fmt.Sprintf("%d. %s · %s", idx, SeverityLabel(it.Severity), it.Title())
+	return fmt.Sprintf("%d. %s · %s", idx, it.label(), it.Title())
 }
 
 // telegramBatchTitle 渲染汇总消息的标题行。条数用的是**本条实际包含**的条数，
 // 而不是本批总数——否则读者会以为消息头写的数字就是全部。
 func telegramBatchTitle(m Message, items []Item, total int) string {
-	title := fmt.Sprintf("漏洞汇总 · 共 %d 条", total)
+	title := m.batchTitle(total)
 	if extra := total - len(items); extra > 0 {
 		title += fmt.Sprintf("（显示前 %d 条，其余 %d 条下一条继续）", len(items), extra)
 	}

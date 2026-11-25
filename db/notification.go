@@ -246,15 +246,26 @@ func RecordNotificationEventTx(ctx context.Context, tx *sql.Tx, kind string, fin
 	return true
 }
 
-// AddNotificationEvent 是 InsertNotificationEventTx 的独立事务版本，供不在
-// 既有事务里的调用点使用（如渠道的「发送测试消息」，它没有真实 finding）。
+// AddNotificationEvent 供不在既有事务里的调用点使用，例如渠道的「发送测试消息」。
 func (d *DB) AddNotificationEvent(ctx context.Context, kind string, findingID int64, snap notify.Snapshot) (int64, error) {
+	return insertNotificationEvent(ctx, d.DB, kind, findingID, snap)
+}
+
+// EnqueueNotificationEventTx writes an event in the enterprise relay transaction.
+func EnqueueNotificationEventTx(ctx context.Context, tx *sql.Tx, snap notify.Snapshot) error {
+	_, err := insertNotificationEvent(ctx, tx, snap.Kind, snap.FindingID, snap)
+	return err
+}
+
+func insertNotificationEvent(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, kind string, findingID int64, snap notify.Snapshot) (int64, error) {
 	raw, err := json.Marshal(snap)
 	if err != nil {
 		return 0, fmt.Errorf("序列化通知事件快照失败: %w", err)
 	}
 	var id int64
-	err = d.QueryRowContext(ctx, `INSERT INTO notification_events(kind,finding_id,snapshot) VALUES($1,$2,$3) RETURNING id`,
+	err = q.QueryRowContext(ctx, `INSERT INTO notification_events(kind,finding_id,snapshot) VALUES($1,$2,$3) RETURNING id`,
 		kind, findingID, string(raw)).Scan(&id)
 	return id, err
 }

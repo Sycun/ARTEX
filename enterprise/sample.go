@@ -11,8 +11,6 @@ import (
 	"hash/crc32"
 	"image"
 	"image/png"
-	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -110,14 +108,11 @@ func (s *Service) ImportSample(ctx context.Context, a Actor) (SampleResult, erro
 		if !bytes.Contains(shot, []byte(DemoSecret)) {
 			return fmt.Errorf("demo screenshot lost the fictional credential marker")
 		}
-		path := filepath.Join(s.Restricted, "demo-ns-001-login.png")
-		if err := os.WriteFile(path, shot, 0o600); err != nil {
-			return err
-		}
+		const originalKey = "demo-ns-001-login.png"
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO ent_originals (id, project_id, finding_id, filename, sha256, storage_path)
 			VALUES ($1,$2,$3,$4,$5,$6)`,
-			"orig-demo-ns-001", aID, findingID, "login-error.png", Hash(shot), path); err != nil {
+			"orig-demo-ns-001", aID, findingID, "login-error.png", Hash(shot), originalKey); err != nil {
 			return err
 		}
 		obs := []struct {
@@ -142,12 +137,6 @@ func (s *Service) ImportSample(ctx context.Context, a Actor) (SampleResult, erro
 		}
 		body := []byte("shared-body-demo")
 		traffic := []byte("traffic-body-demo")
-		if err := os.WriteFile(filepath.Join(s.Restricted, "h-body"), body, 0o600); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(s.Restricted, "h-traffic"), traffic, 0o600); err != nil {
-			return err
-		}
 		rows := []struct{ key, hash string }{
 			{"U-流量", Hash(traffic)},
 			{"U-快照", Hash(body)},
@@ -172,7 +161,16 @@ func (s *Service) ImportSample(ctx context.Context, a Actor) (SampleResult, erro
 			return err
 		}
 		result.FindingID = findingID
-		return s.audit(ctx, tx, "", a.ID, "sample_imported", "导入演示样例", "导入 DEMO-NS-001", "sample", SampleKey, "", nil)
+		if err := s.audit(ctx, tx, "", a.ID, "sample_imported", "导入演示样例", "导入 DEMO-NS-001", "sample", SampleKey, "", nil); err != nil {
+			return err
+		}
+		if err := s.blobs.Put(ctx, originalKey, shot); err != nil {
+			return err
+		}
+		if err := s.blobs.Put(ctx, "h-body", body); err != nil {
+			return err
+		}
+		return s.blobs.Put(ctx, "h-traffic", traffic)
 	})
 	if err != nil {
 		return SampleResult{}, err

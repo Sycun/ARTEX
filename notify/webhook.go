@@ -42,6 +42,11 @@ const webhookDefaultTemplate = `{
 {{- range $i, $it := .Items}}
 {{- if $i}},{{end}}
     {
+{{- if $it.EventType}}
+      "event_type": {{json $it.EventType}},
+      "name": {{json $it.Name}},
+      "summary": {{json $it.Summary}}
+{{- else}}
       "finding_id": {{$it.FindingID}},
       "name": {{json $it.Name}},
       "vulnclass": {{json $it.VulnClass}},
@@ -49,6 +54,7 @@ const webhookDefaultTemplate = `{
       "summary": {{json $it.Summary}},
       "assets": {{json $it.Assets}},
       "detail_url": {{json $it.DetailURL}}
+{{- end}}
     }
 {{- end}}
   ]
@@ -66,6 +72,7 @@ type webhookTemplateData struct {
 }
 
 type webhookItem struct {
+	EventType     string
 	FindingID     int64
 	Name          string
 	VulnClass     string
@@ -217,6 +224,9 @@ func newWebhookTemplateData(m Message) webhookTemplateData {
 		}
 		if it.IsStatusChange() {
 			wi.StatusLabel = StatusLabel(it.FromStatus) + " → " + StatusLabel(it.ToStatus)
+		}
+		if IsEnterpriseEvent(it.Kind) {
+			wi.EventType = it.Kind
 		}
 		d.Items = append(d.Items, wi)
 	}

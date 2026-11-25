@@ -52,11 +52,7 @@ func htmlBody(m Message, maxRunes int) string {
 // htmlBatchIntro 渲染汇总邮件开头：条数与级别分布。
 func htmlBatchIntro(m Message) string {
 	var b strings.Builder
-	if m.WindowMinutes > 0 {
-		fmt.Fprintf(&b, `<h2 style="font-size:16px;margin:0 0 4px;">近 %d 分钟新增 %d 个漏洞</h2>`, m.WindowMinutes, len(m.Items))
-	} else {
-		fmt.Fprintf(&b, `<h2 style="font-size:16px;margin:0 0 4px;">新增 %d 个漏洞</h2>`, len(m.Items))
-	}
+	fmt.Fprintf(&b, `<h2 style="font-size:16px;margin:0 0 4px;">%s</h2>`, m.batchIntro(len(m.Items)))
 	counts := map[string]int{}
 	for _, it := range m.Items {
 		counts[it.Severity]++
@@ -85,7 +81,7 @@ func htmlItem(it Item, full bool) string {
 		fmt.Fprintf(&b, `<div style="border-left:3px solid %s;padding:4px 0 4px 10px;margin-bottom:8px;">`, color)
 	}
 	fmt.Fprintf(&b, `<div style="font-weight:600;">%s &middot; %s</div>`,
-		htmlEscape(SeverityLabel(it.Severity)), htmlEscape(it.Title()))
+		htmlEscape(it.label()), htmlEscape(it.Title()))
 
 	if !full {
 		var extras []string

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Autumn-27/artex/storage"
 	"github.com/google/uuid"
 )
 
@@ -60,6 +61,8 @@ type Service struct {
 	DataDir    string
 	Restricted string
 	Clock      func() time.Time
+	blobs      storage.StreamBlobStore
+	localBlobs *storage.LocalFSStore
 }
 
 func New(sqlDB *sql.DB, dataDir string) (*Service, error) {
@@ -68,21 +71,62 @@ func New(sqlDB *sql.DB, dataDir string) (*Service, error) {
 		return nil, err
 	}
 	restricted := filepath.Join(filepath.Dir(abs), "restricted")
-	rel, err := filepath.Rel(abs, restricted)
+	if err := checkRestrictedDir(abs, restricted); err != nil {
+		return nil, err
+	}
+	local, err := storage.NewLocalFSStore(restricted)
 	if err != nil {
 		return nil, err
 	}
-	if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return nil, fmt.Errorf("restricted store %s is inside data directory %s", restricted, abs)
+	var blobs storage.StreamBlobStore = local
+	cfg := storage.S3Config{
+		Endpoint:  os.Getenv("ARTEX_S3_ENDPOINT"),
+		Bucket:    os.Getenv("ARTEX_S3_BUCKET"),
+		Region:    os.Getenv("ARTEX_S3_REGION"),
+		AccessKey: os.Getenv("ARTEX_S3_ACCESS_KEY"),
+		SecretKey: os.Getenv("ARTEX_S3_SECRET_KEY"),
 	}
-	if err := os.MkdirAll(restricted, 0o700); err != nil {
-		return nil, err
+	if cfg != (storage.S3Config{}) {
+		blobs, err = storage.NewS3Store(cfg)
+		if err != nil {
+			return nil, err
+		}
 	}
-	svc := &Service{DB: sqlDB, DataDir: abs, Restricted: restricted}
+	svc := &Service{DB: sqlDB, DataDir: abs, Restricted: restricted, blobs: blobs, localBlobs: local}
 	if err := svc.migrate(context.Background()); err != nil {
 		return nil, err
 	}
 	return svc, nil
+}
+
+func (s *Service) BlobStore() storage.StreamBlobStore {
+	return s.blobs
+}
+
+func checkRestrictedDir(dataDir, restricted string) error {
+	if dataDir == restricted {
+		return fmt.Errorf("restricted store %s is inside data directory %s", restricted, dataDir)
+	}
+	realData, err := filepath.EvalSymlinks(dataDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(restricted))
+	if err != nil {
+		return err
+	}
+	realRestricted := filepath.Join(parent, filepath.Base(restricted))
+	rel, err := filepath.Rel(realData, realRestricted)
+	if err != nil {
+		return err
+	}
+	if filepath.IsLocal(rel) {
+		return fmt.Errorf("restricted store %s is inside data directory %s", restricted, dataDir)
+	}
+	return nil
 }
 
 func (s *Service) now() time.Time {
@@ -441,11 +485,6 @@ func (s *Service) audit(ctx context.Context, tx *sql.Tx, projectID, actor, actio
 		INSERT INTO ent_audit (id, project_id, actor_id, action, structured_reason, summary, subject_type, subject_id, version_no, content_hash)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		uuid.NewString(), proj, actor, action, structured, summary, subjectType, subjectID, versionNo, contentHash)
-	return err
-}
-
-func (s *Service) notify(ctx context.Context, tx *sql.Tx, event, summary string) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO ent_notifications (id, event_type, summary) VALUES ($1,$2,$3)`, uuid.NewString(), event, summary)
 	return err
 }
 

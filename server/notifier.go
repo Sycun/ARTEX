@@ -122,6 +122,7 @@ func (n *Notifier) step(ctx context.Context) {
 	if !n.enabled() {
 		return
 	}
+	n.forwardEnterpriseNotifications(ctx)
 	if _, _, err := n.pg.FanOutPendingEvents(ctx, notifyFanOutPerTick); err != nil {
 		log.Printf("[notify] 分派事件失败: %v", err)
 		return
@@ -156,6 +157,14 @@ func (n *Notifier) step(ctx context.Context) {
 			continue
 		}
 		n.stepRealtime(ctx, ch, allow, baseURL)
+	}
+}
+
+func (n *Notifier) forwardEnterpriseNotifications(ctx context.Context) {
+	if n.s.ent != nil {
+		if err := n.s.ent.ForwardNotifications(ctx, notifyFanOutPerTick, db.EnqueueNotificationEventTx); err != nil {
+			log.Printf("[notify] 转发企业通知失败: %v", err)
+		}
 	}
 }
 
@@ -424,6 +433,9 @@ func (n *Notifier) renderBatch(ctx context.Context, deliveries []*db.Notificatio
 
 // itemFor 把事件快照渲染成待推送条目，顺带解析资产名与详情回链。
 func (n *Notifier) itemFor(ctx context.Context, snap notify.Snapshot, baseURL string) (notify.Item, error) {
+	if notify.IsEnterpriseEvent(snap.Kind) {
+		return notify.Item{Kind: snap.Kind, Name: snap.Name, Summary: snap.Summary}, nil
+	}
 	assets, err := n.pg.NotificationAssetNames(ctx, snap.AssetIDs)
 	if err != nil {
 		// 资产名解析失败不该阻止推送：读不到名字比收不到通知轻得多，

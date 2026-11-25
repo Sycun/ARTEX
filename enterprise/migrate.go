@@ -2,11 +2,16 @@ package enterprise
 
 import "context"
 
-// migrate 只追加企业岗位和会话里的当前项目。不改已有业务表里的数据。
+// migrate 更新企业版表结构并保留存量业务数据。
 func (s *Service) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, `
 		ALTER TABLE ent_members ADD COLUMN IF NOT EXISTS post TEXT NOT NULL DEFAULT '';
-		ALTER TABLE ent_sessions ADD COLUMN IF NOT EXISTS project_id TEXT`); err != nil {
+		ALTER TABLE ent_sessions ADD COLUMN IF NOT EXISTS project_id TEXT;
+		ALTER TABLE ent_issues ADD COLUMN IF NOT EXISTS blob_key TEXT;
+		ALTER TABLE ent_issues ALTER COLUMN file_bytes DROP NOT NULL;
+		ALTER TABLE ent_notifications ADD COLUMN IF NOT EXISTS outbound_pending BOOLEAN NOT NULL DEFAULT false;
+		CREATE INDEX IF NOT EXISTS idx_ent_notifications_outbound_pending
+		  ON ent_notifications(created_at, id) WHERE outbound_pending`); err != nil {
 		return err
 	}
 	if _, err := s.DB.ExecContext(ctx, `
