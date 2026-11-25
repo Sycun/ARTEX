@@ -70,7 +70,9 @@ type TaskDTO struct {
 	CompanyIDs         []int64            `json:"company_ids"`
 	CoverageEnabled    bool               `json:"coverage_enabled"` // 资产覆盖度功能开关(创建时定)
 	ShareGlobalAssets  bool               `json:"share_global_assets"`
-	WorkerCount        int                `json:"worker_count"` // 本任务 Worker 数;0=用全局默认
+	WorkerCount        int                `json:"worker_count"`        // 本任务 Worker 数;0=用全局默认
+	WorkerActualCount  int                `json:"worker_actual_count"` // live pool loops, including draining workers
+	WorkerTargetCount  int                `json:"worker_target_count"` // desired worker slots
 	Zone               string             `json:"zone"`
 
 	NoResultSeconds     int    `json:"no_result_seconds"`
@@ -171,7 +173,7 @@ func taskDTO(t *Task, status string) TaskDTO {
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
 		ShareGlobalAssets:  lifecycle.ShareGlobalAssets,
-		WorkerCount:        t.WorkerCount,
+		WorkerCount:        lifecycle.WorkerCount,
 		Zone:               lifecycle.Zone,
 
 		NoResultSeconds:     t.NoResultSeconds,
