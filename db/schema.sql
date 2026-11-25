@@ -295,6 +295,10 @@ CREATE TABLE IF NOT EXISTS task_constraints (
 );
 CREATE INDEX IF NOT EXISTS idx_task_constraints_exp ON task_constraints(exploration_id);
 
+-- Heap by default. When relkind='p', monthly RANGE children are
+-- <table>_yYYYYmMM on created_at (PK includes created_at). Ordinary
+-- tables skip partition maintenance; ConvertToMonthlyPartitions is the
+-- offline switch. See artex_ensure_month_partition at the bottom.
 CREATE TABLE IF NOT EXISTS activity (
     id                 BIGSERIAL PRIMARY KEY,
     exploration_id     BIGINT NOT NULL REFERENCES explorations(id) ON DELETE CASCADE,
@@ -2109,3 +2113,106 @@ CREATE INDEX IF NOT EXISTS idx_execution_jobs_status_lease
 CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_jobs_active_task
     ON execution_jobs(task_id)
     WHERE status IN ('queued','leased','running');
+
+-- llm_records is created here so a fresh database has the ledger before the
+-- process starts. created_at is the monthly partition key once the table is
+-- converted; ordinary installs leave it nullable and unpartitioned.
+CREATE TABLE IF NOT EXISTS llm_records (
+    id            BIGSERIAL PRIMARY KEY,
+    ts            TIMESTAMPTZ DEFAULT now(),
+    model         TEXT,
+    profile_name  TEXT,
+    session_id    TEXT,
+    task_id       TEXT,
+    worker        TEXT,
+    latency_ms    INTEGER,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    cache_read    INTEGER,
+    cache_write   INTEGER,
+    status        TEXT,
+    error         TEXT,
+    request_body  TEXT,
+    response_body TEXT,
+    raw_request   TEXT,
+    raw_response  TEXT,
+    created_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_llm_records_ts ON llm_records(ts);
+CREATE INDEX IF NOT EXISTS idx_llm_records_session ON llm_records(session_id);
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS task_id TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS worker TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS profile_name TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_request TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_response TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+
+-- Distributed traffic index. Bodies live in the blob store at
+-- traffic/blobs/<sha256>; this table keeps metadata, headers, and blob keys.
+CREATE TABLE IF NOT EXISTS traffic_exchanges (
+    id            TEXT PRIMARY KEY,
+    task_id       TEXT NOT NULL DEFAULT '',
+    project_id    TEXT NOT NULL DEFAULT '',
+    ts            TIMESTAMPTZ NOT NULL,
+    host          TEXT NOT NULL DEFAULT '',
+    method        TEXT NOT NULL DEFAULT '',
+    url_template  TEXT NOT NULL DEFAULT '',
+    url           TEXT NOT NULL DEFAULT '',
+    status        INTEGER NOT NULL DEFAULT 0,
+    content_type  TEXT NOT NULL DEFAULT '',
+    req_len       INTEGER NOT NULL DEFAULT 0,
+    resp_len      INTEGER NOT NULL DEFAULT 0,
+    req_head      TEXT NOT NULL DEFAULT '',
+    resp_head     TEXT NOT NULL DEFAULT '',
+    req_blob_key  TEXT NOT NULL DEFAULT '',
+    resp_blob_key TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_ts ON traffic_exchanges (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_host_ts ON traffic_exchanges (host, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_template ON traffic_exchanges (host, url_template);
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_status ON traffic_exchanges (status);
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_task_ts ON traffic_exchanges (task_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_project_ts ON traffic_exchanges (project_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_req_blob ON traffic_exchanges (req_blob_key) WHERE req_blob_key <> '';
+CREATE INDEX IF NOT EXISTS idx_traffic_ex_resp_blob ON traffic_exchanges (resp_blob_key) WHERE resp_blob_key <> '';
+
+-- Prebuild one monthly child of a partitioned ledger. tbl may be the live
+-- name or the offline swap name <table>_partnew. Ordinary tables return NULL.
+-- Child name is always <table>_yYYYYmMM in UTC.
+CREATE OR REPLACE FUNCTION artex_ensure_month_partition(tbl text, month_ts timestamptz)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    kind text;
+    base text;
+    part text;
+    start_ts timestamptz;
+    end_ts timestamptz;
+BEGIN
+    base := tbl;
+    IF right(tbl, 8) = '_partnew' THEN
+        base := left(tbl, length(tbl) - 8);
+    END IF;
+    IF base NOT IN ('activity', 'ent_audit', 'llm_records') THEN
+        RAISE EXCEPTION 'unsupported ledger table %', tbl;
+    END IF;
+    SELECT c.relkind::text INTO kind
+    FROM pg_class c
+    WHERE c.oid = to_regclass(tbl);
+    IF kind IS NULL THEN
+        RAISE EXCEPTION 'relation % not found', tbl;
+    END IF;
+    IF kind <> 'p' THEN
+        RETURN NULL;
+    END IF;
+    start_ts := (date_trunc('month', month_ts AT TIME ZONE 'UTC') AT TIME ZONE 'UTC');
+    end_ts := start_ts + interval '1 month';
+    part := base || '_y' || to_char(start_ts AT TIME ZONE 'UTC', 'YYYY') || 'm' || to_char(start_ts AT TIME ZONE 'UTC', 'MM');
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%s) TO (%s)',
+        part, tbl, quote_literal(start_ts), quote_literal(end_ts));
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (created_at)', part || '_created_at', part);
+    EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (id)', part || '_id', part);
+    RETURN part;
+END;
+$$;

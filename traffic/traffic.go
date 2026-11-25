@@ -172,6 +172,8 @@ type Traffic struct {
 	upstream        atomic.Pointer[url.URL]
 	upstreamMu      sync.RWMutex
 	upstreamFailure func(error)
+	// index replaces the sidecar SQLite index when set (PostgreSQL + BlobStore).
+	index IndexStore
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -406,6 +408,17 @@ func (t *Traffic) stopping() bool {
 }
 func (t *Traffic) DB() *sql.DB { return t.db }
 
+// UseIndex routes capture and lookup through store. Nil keeps the sidecar SQLite path.
+func (t *Traffic) UseIndex(index IndexStore) { t.index = index }
+
+// Store returns the active index. The default is the sidecar SQLite database.
+func (t *Traffic) Store() IndexStore {
+	if t.index != nil {
+		return t.index
+	}
+	return NewSQLiteStore(t.db, t.dir)
+}
+
 // sink is the go-mitmproxy addon that records completed exchanges.
 type sink struct {
 	mproxy.BaseAddon
@@ -478,6 +491,10 @@ func proxyCausedErr(err error) bool {
 // full-text index. Nothing is written to a per-request directory — only bodies
 // above maxInlineBody spill to the content-addressed blob store.
 func (t *Traffic) record(f *mproxy.Flow) {
+	if t.index != nil {
+		t.recordToIndex(f)
+		return
+	}
 	// The write lock covers blob + index writes, so DeleteHost (and its blob GC)
 	// can run under the same lock without racing a concurrent record.
 	t.wmu.Lock()
@@ -551,6 +568,57 @@ VALUES(?,?,?,?,?,?,?)`,
 	if err := tx.Commit(); err != nil {
 		log.Printf("[traffic] 记录 %s 失败（提交）：%v", url, err)
 	}
+}
+
+func (t *Traffic) recordToIndex(f *mproxy.Flow) {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	host := f.Request.URL.Hostname()
+	method := f.Request.Method
+	tmpl := db.TemplatePath(f.Request.URL.EscapedPath())
+	n := t.seq.Add(1)
+	now := time.Now()
+	id := fmt.Sprintf("%d-%04d", now.Unix(), n%10000)
+	ct := f.Response.Header.Get("Content-Type")
+	urlStr := f.Request.URL.String()
+	ex := ExchangeWrite{
+		ID: id, TS: now, Host: host, Method: method, URLTemplate: tmpl, URL: urlStr,
+		Status: f.Response.StatusCode, ContentType: ct,
+		ReqLen: len(f.Request.Body), RespLen: len(f.Response.Body),
+		ReqHead:  fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request)),
+		RespHead: fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header)),
+		ReqBody:  append([]byte(nil), f.Request.Body...),
+		RespBody: append([]byte(nil), f.Response.Body...),
+	}
+	if err := t.index.InsertExchange(context.Background(), ex); err != nil {
+		log.Printf("[traffic] 记录 %s 失败: %v", urlStr, err)
+	}
+}
+
+func (t *Traffic) pageIndex(f PageQuery, page, size int) ([]ExchangeMeta, int, error) {
+	rows, total, err := t.index.ListExchanges(context.Background(), ListQuery{
+		Host: f.Host, HostLike: true, Hosts: f.Hosts, Method: f.Method, Path: f.Path,
+		Query: f.Query, Body: f.Body, Status: f.Status,
+		RespMin: f.RespMin, RespMax: f.RespMax, Sort: f.Sort, Order: f.Order,
+		Page: page, Size: size,
+	})
+	return rows, total, err
+}
+
+func (t *Traffic) queryIndex(host, contains, bodyContains string, page, limit int) ([]ExchangeMeta, error) {
+	hostName, port, err := normalizeSearchHost(host)
+	if err != nil {
+		return nil, err
+	}
+	q := ListQuery{
+		Host: hostName, Contains: contains, Body: bodyContains,
+		Page: page, Size: limit, RespMin: -1, RespMax: -1,
+	}
+	if port != "" {
+		q.Authority = net.JoinHostPort(hostName, port)
+	}
+	rows, _, err := t.index.ListExchanges(context.Background(), q)
+	return rows, err
 }
 
 // storedBody is one body after the inline/spill decision: inline is what goes in
@@ -814,6 +882,10 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
+	if t.index != nil {
+		rows, _, err := t.index.ListExchanges(context.Background(), ListQuery{Host: host, Page: page, Size: size, RespMin: -1, RespMax: -1})
+		return rows, err
+	}
 	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges`
 	args := []any{}
 	if host != "" {
@@ -939,6 +1011,9 @@ func statusFilter(s string) (cond string, args []any, ok bool) {
 // Also returns the total number of rows matching the filter (for the UI's
 // pagination). Bodies are never included in the rows.
 func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
+	if t.index != nil {
+		return t.pageIndex(f, page, size)
+	}
 	if size <= 0 || size > 500 {
 		size = 100
 	}
@@ -1033,6 +1108,13 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 // path and are read from the legacy on-disk tree instead, so history stays
 // readable without being migrated.
 func (t *Traffic) Get(id string) (req, resp string, err error) {
+	if t.index != nil {
+		ex, err := t.index.GetExchange(context.Background(), id)
+		if err != nil {
+			return "", "", err
+		}
+		return ex.RequestText(), ex.ResponseText(), nil
+	}
 	var reqHead, respHead string
 	var reqBody, respBody []byte
 	var reqBlob, respBlob sql.NullString
@@ -1082,6 +1164,9 @@ type HostCount struct {
 // Hosts returns distinct recorded hosts with exchange counts, most recent
 // activity first — powers the page's target picker.
 func (t *Traffic) Hosts() ([]HostCount, error) {
+	if t.index != nil {
+		return t.index.HostStats(context.Background(), nil)
+	}
 	rows, err := t.db.Query(`SELECT host, COUNT(*) AS n, MAX(ts) AS last FROM exchanges GROUP BY host ORDER BY last DESC`)
 	if err != nil {
 		return nil, err
@@ -1102,6 +1187,9 @@ func (t *Traffic) Hosts() ([]HostCount, error) {
 // HostsForScope returns recorded hosts that belong to a task's normalized host
 // scope. It is used by the task HTTP history picker and never mutates traffic.
 func (t *Traffic) HostsForScope(scope []string) ([]HostCount, error) {
+	if t.index != nil {
+		return t.index.HostStats(context.Background(), scope)
+	}
 	cond, args := hostScopeClause(scope)
 	if cond == "" {
 		return []HostCount{}, nil
@@ -1125,6 +1213,10 @@ func (t *Traffic) HostsForScope(scope []string) ([]HostCount, error) {
 
 // Count returns total recorded exchanges.
 func (t *Traffic) Count() (int, error) {
+	if t.index != nil {
+		_, n, err := t.index.ListExchanges(context.Background(), ListQuery{Page: 0, Size: 1, RespMin: -1, RespMax: -1})
+		return n, err
+	}
 	var n int
 	err := t.db.QueryRow(`SELECT COUNT(*) FROM exchanges`).Scan(&n)
 	return n, err
@@ -1137,6 +1229,11 @@ func (t *Traffic) Count() (int, error) {
 // blobs are shared across hosts and so are garbage-collected afterwards rather
 // than deleted by host. Returns rows deleted.
 func (t *Traffic) DeleteHost(host string) (int64, error) {
+	if t.index != nil {
+		t.wmu.Lock()
+		defer t.wmu.Unlock()
+		return t.index.DeleteHost(context.Background(), host)
+	}
 	like := "%" + host + "%"
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
@@ -1190,6 +1287,12 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 // Returns the number of exchanges deleted and how many bytes of index the
 // compaction handed back.
 func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
+	if t.index != nil {
+		t.wmu.Lock()
+		defer t.wmu.Unlock()
+		deleted, err = t.index.DeleteAll(context.Background())
+		return deleted, 0, err
+	}
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	before := t.indexBytes()
@@ -1498,12 +1601,13 @@ func (t *Traffic) DeleteHostsExact(hosts []string) (int64, error) {
 // reference for a host that is mid-deletion. Rolling back is just a transaction
 // rollback now that nothing is moved on disk.
 type HostDeleteStage struct {
-	traffic  *Traffic
-	tx       *sql.Tx
-	stageDir string
-	moves    []stagedTrafficPath
-	deleted  int64
-	done     bool
+	traffic    *Traffic
+	tx         *sql.Tx
+	stageDir   string
+	moves      []stagedTrafficPath
+	deleted    int64
+	done       bool
+	indexHosts []string
 }
 
 // Deleted reports the number of exchange rows selected by this stage.
@@ -1574,6 +1678,14 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 			return fail(err)
 		}
 		stage.deleted += n
+	}
+	if t.index != nil && len(unique) > 0 {
+		_, n, err := t.index.ListExchanges(context.Background(), ListQuery{ExactHosts: unique, Page: 0, Size: 1, RespMin: -1, RespMax: -1})
+		if err != nil {
+			return fail(err)
+		}
+		stage.deleted += int64(n)
+		stage.indexHosts = append([]string(nil), unique...)
 	}
 
 	stage.stageDir, stage.moves, err = t.stageTreesForArchive(legacy, unique, archiveID, taskID)
@@ -1688,6 +1800,15 @@ func (t *Traffic) RecoverHostDeleteStages(archiveCommitted func(int64, int64) (b
 }
 
 func (t *Traffic) hostsHaveNoExchanges(hosts []string) (bool, error) {
+	if t.index != nil && len(hosts) > 0 {
+		_, n, err := t.index.ListExchanges(context.Background(), ListQuery{ExactHosts: hosts, Page: 0, Size: 1, RespMin: -1, RespMax: -1})
+		if err != nil {
+			return false, err
+		}
+		if n > 0 {
+			return false, nil
+		}
+	}
 	for _, host := range hosts {
 		var count int
 		if err := t.db.QueryRow(`SELECT count(*) FROM exchanges WHERE host=?`, host).Scan(&count); err != nil {
@@ -1701,6 +1822,11 @@ func (t *Traffic) hostsHaveNoExchanges(hosts []string) (bool, error) {
 }
 
 func (t *Traffic) deleteArchivedHosts(hosts []string) error {
+	if t.index != nil {
+		if _, err := t.index.DeleteHosts(context.Background(), hosts); err != nil {
+			return err
+		}
+	}
 	tx, err := t.db.Begin()
 	if err != nil {
 		return err
@@ -1773,6 +1899,11 @@ func (s *HostDeleteStage) Commit() error {
 	s.traffic.reapStage(s.stageDir)
 	s.traffic.reclaim()
 	var errs []error
+	if len(s.indexHosts) > 0 && s.traffic.index != nil {
+		if _, err := s.traffic.index.DeleteHosts(context.Background(), s.indexHosts); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if err := s.traffic.gcBlobs(); err != nil {
 		errs = append(errs, fmt.Errorf("回收流量 blob: %w", err))
 	}
@@ -2004,6 +2135,18 @@ func (t *Traffic) legacyBlobRefs(refs map[string]struct{}) error {
 // substring. Default page size is intentionally small (3) to keep tool results
 // lightweight and capped at 10; page is 0-based (page*limit offset).
 func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([]ExchangeMeta, error) {
+	if t.index != nil {
+		if limit <= 0 {
+			limit = 3
+		}
+		if limit > 10 {
+			limit = 10
+		}
+		if page < 0 {
+			page = 0
+		}
+		return t.queryIndex(host, contains, bodyContains, page, limit)
+	}
 	if limit <= 0 {
 		limit = 3
 	}

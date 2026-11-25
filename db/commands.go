@@ -172,7 +172,8 @@ CREATE TABLE IF NOT EXISTS llm_records (
     request_body  TEXT,
     response_body TEXT,
     raw_request   TEXT,
-    raw_response  TEXT
+    raw_response  TEXT,
+    created_at    TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_llm_records_ts ON llm_records(ts);
 CREATE INDEX IF NOT EXISTS idx_llm_records_session ON llm_records(session_id);
@@ -185,6 +186,7 @@ ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS worker TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS profile_name TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_request TEXT;
 ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS raw_response TEXT;
+ALTER TABLE llm_records ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
 `
 
 // EnsureLLMRecordsTable creates the llm_records table if it does not exist.

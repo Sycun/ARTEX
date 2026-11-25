@@ -573,6 +573,16 @@ func (m *Manager) Enrich() *enrich.Engine { return m.enrich }
 // NewManager connects to PostgreSQL and, if proxyAddr is non-empty, starts the
 // traffic-recording proxy. PostgreSQL is required (it is the single data source).
 func NewManager(dir, proxyAddr string) (*Manager, error) {
+	return newManager(dir, proxyAddr, "")
+}
+
+// NewManagerWithMode selects the traffic index from mode: api and worker use
+// PostgreSQL unless ARTEX_TRAFFIC_STORE says otherwise. all stays on SQLite.
+func NewManagerWithMode(dir, proxyAddr, mode string) (*Manager, error) {
+	return newManager(dir, proxyAddr, mode)
+}
+
+func newManager(dir, proxyAddr, mode string) (*Manager, error) {
 	// Resolve the data dir to an ABSOLUTE path up front. Every data path derives
 	// from it — notably the MITM CA cert, whose path is injected into worker shells
 	// (SSL_CERT_FILE/CURL_CA_BUNDLE) and read by WebFetch. A relative path (the
@@ -592,6 +602,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	log.Printf("[pg] 数据库配置来源: %s", source)
 	pg, err := pgdb.Open(dsn)
 	if err != nil {
+		return nil, err
+	}
+	backend, err := traffic.Backend(mode)
+	if err != nil {
+		pg.Close()
 		return nil, err
 	}
 	// A live segment cannot be trusted across a process restart: its end time
@@ -621,10 +636,27 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		log.Printf("[proxy] local forwarder disabled: %v", ferr)
 	}
 	if proxyAddr != "" {
+		var index traffic.IndexStore
+		if backend == "pg" {
+			blobs, blobErr := traffic.OpenBlobStore(filepath.Join(dir, "traffic-blobs"))
+			if blobErr != nil {
+				pg.Close()
+				return nil, blobErr
+			}
+			index, blobErr = traffic.NewPGStore(pg.DB, blobs)
+			if blobErr != nil {
+				pg.Close()
+				return nil, blobErr
+			}
+			log.Printf("[traffic] index store: postgres")
+		}
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
 		if err != nil {
 			log.Printf("[traffic] disabled: %v", err)
 		} else {
+			if index != nil {
+				tr.UseIndex(index)
+			}
 			err = tr.RecoverHostDeleteStages(func(_ int64, taskID int64) (bool, error) {
 				if taskID <= 0 {
 					return false, errors.New("归档流量暂存日志缺少任务 ID")

@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/traffic"
 )
 
 // Scheduler drives P3 triggers: on each tick it fires due interval triggers and
@@ -23,11 +26,12 @@ import (
 // + finding watermark + fired-goal set) so a restart resumes without double-firing.
 // Triggers only attach to CUSTOM agents.
 type Scheduler struct {
-	s         *Server
-	pg        *db.DB
-	tick      time.Duration
-	startedAt time.Time
-	wake      <-chan struct{}
+	s            *Server
+	pg           *db.DB
+	tick         time.Duration
+	startedAt    time.Time
+	wake         <-chan struct{}
+	partitionDay string
 }
 
 const (
@@ -214,6 +218,7 @@ func (sc *Scheduler) init() {
 		}
 		_ = sc.pg.SetSchedState(schedKeyLastTaskCreate, strconv.FormatInt(maxID, 10))
 	}
+	sc.maintainPartitions(true)
 }
 
 func (sc *Scheduler) reclaimExecution(ctx context.Context) error {
@@ -235,6 +240,7 @@ func (sc *Scheduler) reclaimExecution(ctx context.Context) error {
 }
 
 func (sc *Scheduler) step() {
+	sc.maintainPartitions(false)
 	sc.fireTaskSchedules()
 	triggers, err := sc.pg.ListEnabledTriggers()
 	if err != nil {
@@ -461,6 +467,54 @@ func trunc(s string, max int) string {
 		return s
 	}
 	return string(r[:max]) + fmt.Sprintf("…(已截断,共 %d 字)", len(r))
+}
+
+func (sc *Scheduler) maintainPartitions(startup bool) {
+	if sc == nil || sc.pg == nil {
+		return
+	}
+	today := time.Now().UTC().Format("2006-01-02")
+	if !startup && sc.partitionDay == today {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := sc.pg.EnsureMonthlyPartitions(ctx, time.Now().UTC(), 2); err != nil {
+		log.Printf("[scheduler] ensure monthly partitions: %v", err)
+		return
+	}
+	if days := partitionRetentionDays(); days > 0 {
+		if sc.s == nil || sc.s.dataDir == "" {
+			log.Printf("[scheduler] partition archive: data dir unset")
+			return
+		}
+		store, err := traffic.OpenBlobStore(filepath.Join(sc.s.dataDir, "cold"))
+		if err != nil {
+			log.Printf("[scheduler] partition archive store: %v", err)
+			return
+		}
+		cutoff := time.Now().UTC().AddDate(0, 0, -days)
+		for _, table := range []string{"activity", "ent_audit", "llm_records"} {
+			if _, err := sc.pg.ArchiveExpiredPartitions(ctx, store, table, cutoff); err != nil {
+				log.Printf("[scheduler] archive %s: %v", table, err)
+				return
+			}
+		}
+	}
+	sc.partitionDay = today
+}
+
+func partitionRetentionDays() int {
+	v := strings.TrimSpace(os.Getenv("ARTEX_PARTITION_RETENTION_DAYS"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Printf("[scheduler] ARTEX_PARTITION_RETENTION_DAYS=%q ignored", v)
+		return 0
+	}
+	return n
 }
 
 func (sc *Scheduler) mustState(key string) string {

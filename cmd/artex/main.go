@@ -187,7 +187,7 @@ func run() int {
 		defer shutdown(agent.AbortShutdown)
 	}
 
-	mgr, err := server.NewManager(cfg.DataDir, cfg.Proxy)
+	mgr, err := server.NewManagerWithMode(cfg.DataDir, cfg.Proxy, cfg.Mode)
 	if err != nil {
 		log.Fatalf("open stores: %v", err)
 	}
