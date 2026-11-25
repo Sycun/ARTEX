@@ -2,14 +2,19 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/enterprise"
 )
 
 const maxBatchControlIDs = 100
@@ -186,6 +191,9 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		out.Paused, out.Status = true, "paused"
 		s.requestConcurrencyReconcile()
 	case "resume":
+		if err := s.enforceProjectConcurrency(t.ID); err != nil {
+			return out, err
+		}
 		queued, err := s.admitTaskWhenScheduled(t, "resume", true, pauseCause == agent.AbortPausedBySchedule)
 		if err != nil {
 			return out, err
@@ -331,11 +339,63 @@ func (s *Server) controlTasksBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := s.applyTaskControl(t, req.Action)
 		if err != nil {
-			item.Error = err.Error()
+			var fail *enterprise.Fail
+			if errors.As(err, &fail) {
+				item.Error = fail.Code + ": " + fail.Message
+			} else {
+				item.Error = err.Error()
+			}
 		} else {
 			item.OK, item.Status, item.Queued = true, result.Status, result.Queued
 		}
 		items = append(items, item)
 	}
 	writeJSON(w, 200, map[string]any{"items": items})
+}
+
+func writeEnterpriseFail(w http.ResponseWriter, err error) bool {
+	var fail *enterprise.Fail
+	if !errors.As(err, &fail) {
+		return false
+	}
+	writeEnt(w, err)
+	return true
+}
+
+func (s *Server) enforceProjectConcurrency(taskID string) error {
+	if s.ent == nil || s.m == nil || s.m.pg == nil {
+		return nil
+	}
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return fmt.Errorf("task id %q is invalid", taskID)
+	}
+	var project string
+	err = s.m.pg.QueryRowContext(s.ctx, `SELECT project_id FROM ent_project_tasks WHERE task_id=$1 LIMIT 1`, id).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) || project == "" {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return s.ent.CheckProjectConcurrencyExcept(s.ctx, project, id)
+}
+
+func (s *Server) enforceProjectTokenBudget(ctx context.Context, taskID string) error {
+	if s.ent == nil || s.m == nil || s.m.pg == nil || taskID == "" {
+		return nil
+	}
+	id, err := strconv.ParseInt(taskID, 10, 64)
+	if err != nil || id <= 0 {
+		return nil
+	}
+	var project string
+	err = s.m.pg.QueryRowContext(ctx, `SELECT project_id FROM ent_project_tasks WHERE task_id=$1 LIMIT 1`, id).Scan(&project)
+	if errors.Is(err, sql.ErrNoRows) || project == "" {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return s.ent.CheckProjectTokenBudget(ctx, project, time.Now())
 }

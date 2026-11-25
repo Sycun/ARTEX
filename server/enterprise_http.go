@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"html/template"
 	"log"
@@ -83,7 +84,7 @@ func enterpriseLimited(r *http.Request) bool {
 }
 
 func enterpriseAllows(path string) bool {
-	if strings.HasPrefix(path, "/api/enterprise/") || strings.HasPrefix(path, "/api/demo-idp/") {
+	if strings.HasPrefix(path, "/api/enterprise/") || strings.HasPrefix(path, "/api/demo-idp/") || path == "/api/batches" || strings.HasPrefix(path, "/api/batches/") {
 		return true
 	}
 	switch path {
@@ -186,6 +187,8 @@ func (s *Server) registerEnterprise(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/enterprise/directory", s.enterpriseDirectory)
 	mux.HandleFunc("GET /api/enterprise/projects/{id}/members", s.enterpriseMembers)
 	mux.HandleFunc("POST /api/enterprise/projects/{id}/members", s.enterpriseAddMember)
+	mux.HandleFunc("GET /api/enterprise/projects/{id}/quota", s.enterpriseProjectQuota)
+	mux.HandleFunc("PUT /api/enterprise/projects/{id}/quota", s.enterpriseUpdateProjectQuota)
 	mux.HandleFunc("GET /api/enterprise/projects/{id}/summary", s.enterpriseSummary)
 	mux.HandleFunc("GET /api/enterprise/projects/{id}/home", s.enterpriseHome)
 	mux.HandleFunc("GET /api/enterprise/projects/{id}/tasks", s.enterpriseTasks)
@@ -1198,6 +1201,35 @@ func (s *Server) demoDiscovery(w http.ResponseWriter, r *http.Request) {
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"HS256"},
 	})
+}
+
+func (s *Server) enterpriseProjectQuota(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.wantEnt(w, r)
+	if !ok {
+		return
+	}
+	view, err := s.ent.GetProjectQuota(r.Context(), actor, r.PathValue("id"))
+	if writeEnt(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) enterpriseUpdateProjectQuota(w http.ResponseWriter, r *http.Request) {
+	actor, ok := s.wantEnt(w, r)
+	if !ok {
+		return
+	}
+	var in enterprise.ProjectQuotaInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	view, err := s.ent.UpdateProjectQuota(r.Context(), actor, r.PathValue("id"), in)
+	if writeEnt(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 func randomURL(n int) string {

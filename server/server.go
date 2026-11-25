@@ -888,6 +888,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/workers", s.listWorkers)
+	mux.HandleFunc("POST /api/batches", s.createBatch)
+	mux.HandleFunc("GET /api/batches/{id}", s.getBatch)
+	mux.HandleFunc("POST /api/batches/{id}/cancel", s.cancelBatch)
 	mux.HandleFunc("GET /api/version", s.version)
 	mux.HandleFunc("GET /api/stats", s.stats)
 	mux.HandleFunc("GET /api/system/metrics", s.systemMetrics)
@@ -1484,6 +1487,9 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.applyTaskControl(t, req.Action)
 	if err != nil {
+		if writeEnterpriseFail(w, err) {
+			return
+		}
 		writeErr(w, 409, err.Error())
 		return
 	}
@@ -1580,6 +1586,9 @@ func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
 		if rollbackErr := restoreRerunIntent(t, before); rollbackErr != nil {
 			err = fmt.Errorf("%w; restore intent %d after admission failure: %v", err, iid, rollbackErr)
 		}
+		if writeEnterpriseFail(w, err) {
+			return
+		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -1629,6 +1638,9 @@ func (s *Server) rerunBlocked(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(rollbackErrors) > 0 {
 				err = fmt.Errorf("%w; restore blocked intents after admission failure: %s", err, strings.Join(rollbackErrors, "; "))
+			}
+			if writeEnterpriseFail(w, err) {
+				return
 			}
 			writeErr(w, 500, err.Error())
 			return

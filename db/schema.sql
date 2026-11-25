@@ -1763,8 +1763,14 @@ CREATE TABLE IF NOT EXISTS ent_projects (
     code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('active','archived')),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    max_concurrent_tasks INT NOT NULL DEFAULT 0,
+    daily_token_limit BIGINT NOT NULL DEFAULT 0,
+    monthly_token_limit BIGINT NOT NULL DEFAULT 0
 );
+ALTER TABLE ent_projects ADD COLUMN IF NOT EXISTS max_concurrent_tasks INT NOT NULL DEFAULT 0;
+ALTER TABLE ent_projects ADD COLUMN IF NOT EXISTS daily_token_limit BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE ent_projects ADD COLUMN IF NOT EXISTS monthly_token_limit BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS ent_members (
     project_id TEXT NOT NULL REFERENCES ent_projects(id),
@@ -2113,6 +2119,46 @@ CREATE INDEX IF NOT EXISTS idx_execution_jobs_status_lease
 CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_jobs_active_task
     ON execution_jobs(task_id)
     WHERE status IN ('queued','leased','running');
+
+-- Fan-out shards are claimed by workers with the same SKIP LOCKED lease as
+-- execution_jobs. mode=all drains them in-process; it still does not read
+-- execution_jobs.
+CREATE TABLE IF NOT EXISTS batch_jobs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    kind TEXT NOT NULL,
+    zone TEXT NOT NULL DEFAULT 'default',
+    status TEXT NOT NULL CHECK (status IN ('queued','running','reducing','done','failed','canceled')),
+    shard_size INT NOT NULL,
+    total_targets INT NOT NULL,
+    total_shards INT NOT NULL,
+    completed_shards INT NOT NULL DEFAULT 0,
+    failed_shards INT NOT NULL DEFAULT 0,
+    reduced_summary JSONB NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS batch_shards (
+    id BIGSERIAL PRIMARY KEY,
+    batch_id TEXT NOT NULL REFERENCES batch_jobs(id) ON DELETE CASCADE,
+    shard_index INT NOT NULL,
+    zone TEXT NOT NULL DEFAULT 'default',
+    targets JSONB NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','canceled')),
+    lease_owner TEXT,
+    lease_until TIMESTAMPTZ,
+    attempt INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 3,
+    result JSONB NOT NULL DEFAULT '{}',
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_batch_shards_zone_status_id
+    ON batch_shards(zone, status, id);
+CREATE INDEX IF NOT EXISTS idx_batch_shards_batch_shard
+    ON batch_shards(batch_id, shard_index);
 
 -- llm_records is created here so a fresh database has the ledger before the
 -- process starts. created_at is the monthly partition key once the table is

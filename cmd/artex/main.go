@@ -226,6 +226,13 @@ func run() int {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	if cfg.Mode == "all" {
+		go func() {
+			if err := srv.RunLocalBatches(srvCtx); err != nil && srvCtx.Err() == nil {
+				log.Printf("[batch] %v", err)
+			}
+		}()
+	}
 	go func() {
 		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d, mode=%s)", version, cfg.Addr, cfg.DataDir, mgr.Workers(), cfg.Mode)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

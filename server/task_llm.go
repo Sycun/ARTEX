@@ -237,6 +237,11 @@ func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 }
 
 func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	if err := r.s.enforceProjectTokenBudget(ctx, r.taskID); err != nil {
+		return func(yield func(llm.StreamEvent, error) bool) {
+			yield(llm.StreamEvent{}, err)
+		}
+	}
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
 	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
 }
@@ -247,6 +252,9 @@ func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) 
 // duplicated model output or tool execution (the "committed" bookkeeping the
 // streaming path needs is unnecessary here).
 func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	if err := r.s.enforceProjectTokenBudget(ctx, r.taskID); err != nil {
+		return llm.Message{}, "", llm.Usage{}, err
+	}
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
 	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
 }

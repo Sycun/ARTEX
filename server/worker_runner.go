@@ -44,6 +44,7 @@ type WorkerRunner struct {
 	heartbeatEvery time.Duration
 	claimWait      time.Duration
 	exec           func(context.Context, db.ExecutionJob) error
+	batches        *BatchRunner
 
 	active   atomic.Int32
 	draining atomic.Bool
@@ -87,6 +88,13 @@ func (s *Server) RunWorker(stop context.Context) error {
 		heartbeatEvery: workerHeartbeatEvery,
 		claimWait:      workerClaimWait,
 		exec:           s.executeClaimedJob,
+		batches: &BatchRunner{
+			db:       s.m.pg,
+			id:       s.workerID,
+			zone:     zone,
+			leaseTTL: executionLeaseTTL,
+			exec:     s.executeBatchShard,
+		},
 	}
 	return runner.Run(stop)
 }
@@ -239,6 +247,29 @@ func (w *WorkerRunner) claimLoop(stop context.Context, heartErr <-chan error) er
 			return err
 		}
 		if job == nil {
+			if w.batches != nil {
+				shard, err := w.batches.db.ClaimBatchShard(stop, w.id, w.zone, w.leaseTTL)
+				if err != nil {
+					<-slots
+					if stop.Err() != nil {
+						return nil
+					}
+					return err
+				}
+				if shard != nil {
+					wg.Add(1)
+					w.active.Add(1)
+					go func(shard db.BatchShard) {
+						defer wg.Done()
+						defer w.active.Add(-1)
+						defer func() { <-slots }()
+						if err := w.batches.finish(shard); err != nil {
+							log.Printf("[batch] shard %d batch %s: %v", shard.ID, shard.BatchID, err)
+						}
+					}(*shard)
+					continue
+				}
+			}
 			<-slots
 			if !waitClaim(stop, w.claimWait) {
 				return nil

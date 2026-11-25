@@ -99,6 +99,9 @@ func (sc *Scheduler) Run(ctx context.Context) {
 					log.Printf("[scheduler] execution reclaim: %v", err)
 				}
 			}
+			if err := sc.reclaimBatches(ctx); err != nil {
+				log.Printf("[scheduler] batch reclaim: %v", err)
+			}
 			sc.step()
 		}
 	}
@@ -235,6 +238,17 @@ func (sc *Scheduler) reclaimExecution(ctx context.Context) error {
 	}
 	if n > 0 {
 		log.Printf("[scheduler] marked %d stale workers offline", n)
+	}
+	return nil
+}
+
+func (sc *Scheduler) reclaimBatches(ctx context.Context) error {
+	requeued, failed, err := sc.pg.ReclaimExpiredBatchShards(ctx)
+	if err != nil {
+		return err
+	}
+	if requeued > 0 || failed > 0 {
+		log.Printf("[scheduler] batch reclaim requeued=%d failed=%d", requeued, failed)
 	}
 	return nil
 }

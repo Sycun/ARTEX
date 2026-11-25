@@ -5,6 +5,9 @@ import "context"
 // migrate 更新企业版表结构并保留存量业务数据。
 func (s *Service) migrate(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, `
+		ALTER TABLE ent_projects ADD COLUMN IF NOT EXISTS max_concurrent_tasks INT NOT NULL DEFAULT 0;
+		ALTER TABLE ent_projects ADD COLUMN IF NOT EXISTS daily_token_limit BIGINT NOT NULL DEFAULT 0;
+		ALTER TABLE ent_projects ADD COLUMN IF NOT EXISTS monthly_token_limit BIGINT NOT NULL DEFAULT 0;
 		ALTER TABLE ent_members ADD COLUMN IF NOT EXISTS post TEXT NOT NULL DEFAULT '';
 		ALTER TABLE ent_sessions ADD COLUMN IF NOT EXISTS project_id TEXT;
 		ALTER TABLE ent_issues ADD COLUMN IF NOT EXISTS blob_key TEXT;

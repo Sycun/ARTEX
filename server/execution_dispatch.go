@@ -27,6 +27,9 @@ func (s *Server) enqueueTaskExecution(t *Task) error {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
+	if err := s.enforceProjectConcurrency(t.ID); err != nil {
+		return err
+	}
 	if _, err := s.m.pg.EnqueueExecutionJob(s.ctx, taskID, project.String, row.Zone); err != nil {
 		return err
 	}

@@ -227,6 +227,10 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 		return false, nil
 	}
 
+	if err := s.enforceProjectConcurrency(t.ID); err != nil {
+		return false, err
+	}
+
 	// Preserve the original first-run mode across repeated admissions. Legacy
 	// queued rows have an empty queue_mode, so infer bootstrap from their graph.
 	if wasQueued {
