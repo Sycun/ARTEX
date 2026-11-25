@@ -42,16 +42,20 @@ var BuildVersion = "dev"
 // Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
-	scheduleMu       sync.Mutex
-	schedulerWake    chan struct{}
-	stopControlPlane func()
-	m                *Manager
-	engine           *Engine
-	ctx              context.Context
-	dataDir          string
-	metricsMu        sync.Mutex
-	lastCPUUse       uint64
-	lastCPUAt        time.Time
+	scheduleMu        sync.Mutex
+	schedulerWake     chan struct{}
+	stopControlPlane  func()
+	m                 *Manager
+	engine            *Engine
+	ctx               context.Context
+	mode              string
+	workerID          string
+	workerZone        string
+	workerConcurrency int
+	dataDir           string
+	metricsMu         sync.Mutex
+	lastCPUUse        uint64
+	lastCPUAt         time.Time
 
 	skillDir  string // root directory for skill subdirectories
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -180,17 +184,29 @@ type triggeredRun struct {
 }
 
 func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
+	return NewRuntime(ctx, m, skillDir, dataDir, keyDir, Runtime{})
+}
+
+func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, rt Runtime) *Server {
+	mode := rt.Mode
+	if mode == "" {
+		mode = ModeAll
+	}
 	key, err := loadOrCreateJWTKey(keyDir, dataDir)
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
 	planeCtx, stop := context.WithCancel(ctx)
-	events, err := configuredEventBus(planeCtx, os.Getenv("ARTEX_EVENT_BUS"), m.pgDSN, m.pg)
+	busMode := os.Getenv("ARTEX_EVENT_BUS")
+	if busMode == "" && (mode == ModeAPI || mode == ModeWorker) {
+		busMode = "pg"
+	}
+	events, err := configuredEventBus(planeCtx, busMode, m.pgDSN, m.pg)
 	if err != nil {
 		stop()
 		log.Fatalf("[event bus] startup: %v", err)
 	}
-	s := &Server{m: m, engine: newEngine(m, &Broadcaster{bus: events}), ctx: ctx, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
+	s := &Server{m: m, engine: newEngine(m, &Broadcaster{bus: events}), ctx: ctx, mode: mode, workerID: rt.WorkerID, workerZone: rt.Zone, workerConcurrency: rt.Concurrency, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
 		schedulerWake: make(chan struct{}, 1),
 		chatCancel:    map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{}, proxyPoolWake: make(chan struct{}, 1), proxyPoolProbeSem: make(chan struct{}, proxyPoolMaxProbeConcurrency),
@@ -325,10 +341,14 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 	}
 	m.stopControlPlane = s.stopControlPlane
-	go func() {
-		defer close(schedulerDone)
-		newScheduler(s).Run(planeCtx)
-	}()
+	if mode == ModeWorker {
+		close(schedulerDone)
+	} else {
+		go func() {
+			defer close(schedulerDone)
+			newScheduler(s).Run(planeCtx)
+		}()
+	}
 	s.ensureProxySupervisor()
 	s.proxyPoolWG.Add(1)
 	go func() { defer s.proxyPoolWG.Done(); s.runProxyPoolSupervisor(s.ctx) }()
@@ -344,9 +364,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	}
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
 	s.bootEnterprise()
-	s.startTaskArchiveWorker()
-	if m.pg != nil {
-		go newNotifier(s).Run(s.ctx)
+	if mode != ModeWorker {
+		s.startTaskArchiveWorker()
+		if m.pg != nil {
+			go newNotifier(s).Run(s.ctx)
+		}
 	}
 	return s
 }
@@ -374,6 +396,21 @@ func (s *Server) requestConcurrencyReconcile() {
 // Restored deadline and worker loops must inherit the same context as new tasks,
 // including the side-question checkpoint publisher installed during startup.
 func (s *Server) restoreTaskRuntimes() {
+	if s.mode == ModeWorker {
+		return
+	}
+	if s.mode == ModeAPI {
+		for _, t := range s.m.LoadExisting() {
+			life := t.lifecycleSnapshot()
+			if life.Paused || life.Queued || life.Status == "created" || isTerminalStatus(life.Status) {
+				continue
+			}
+			if err := s.enqueueTaskExecution(t); err != nil {
+				log.Printf("[execution] restore task %s: %v", t.ID, err)
+			}
+		}
+		return
+	}
 	m := s.m
 	// reload tasks persisted on disk so the task list survives a restart, and
 	// restore persisted paused state (so a task paused before restart stays paused).
@@ -850,6 +887,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings/basic-auth", s.saveBasicAuthSettings)
 
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/workers", s.listWorkers)
 	mux.HandleFunc("GET /api/version", s.version)
 	mux.HandleFunc("GET /api/stats", s.stats)
 	mux.HandleFunc("GET /api/system/metrics", s.systemMetrics)
@@ -1420,7 +1458,7 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request) {
 	}
 	// resume the engine for the opened task (idempotent — no-op if already running).
 	// 排队中的任务:仅设为活跃可查看,不启动引擎(维持并发上限,由 reconcile 补位)。
-	if t, ok := s.m.Task(req.ID); ok && !t.lifecycleSnapshot().Queued {
+	if t, ok := s.m.Task(req.ID); ok && !t.lifecycleSnapshot().Queued && s.mode != ModeAPI {
 		s.engine.Run(s.ctx, t)
 	}
 	writeJSON(w, 200, map[string]any{"active": req.ID})
@@ -1817,6 +1855,7 @@ type createTaskReq struct {
 	CoverageEnabled      *bool            `json:"coverage_enabled,omitempty"` // 资产覆盖度功能;省略/null=默认开(true)。false=关闭覆盖度计算/展示/自动累积范围+隐藏 add_task_scope/list_untested_assets。company 关联不受影响。
 	Remark               string           `json:"remark,omitempty"`           // 任务备注(最多2000字);空=无
 	WorkerCount          int              `json:"worker_count,omitempty"`     // 本任务 Worker 数;0/省略=用全局默认;上限50
+	Zone                 string           `json:"zone,omitempty"`             // 执行网段;空=default
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
 }
@@ -1905,6 +1944,10 @@ func (s *Server) createTaskFromRequest(req createTaskReq) (*Task, *taskCreateErr
 	if req.WorkerCount > db.MaxTaskWorkerCount {
 		return nil, &taskCreateError{400, fmt.Sprintf("Worker 运行数量最多 %d", db.MaxTaskWorkerCount)}
 	}
+	zone, err := db.NormalizeZone(req.Zone)
+	if err != nil {
+		return nil, &taskCreateError{400, err.Error()}
+	}
 	t, err := s.m.CreateTaskWithOptions(req.Description, req.Goal, db.TaskCreateOptions{
 		Schedule: schedule,
 		Name:     strings.TrimSpace(req.Name), CategoryID: req.CategoryID,
@@ -1916,6 +1959,7 @@ func (s *Server) createTaskFromRequest(req createTaskReq) (*Task, *taskCreateErr
 		Remark:            remark,
 		WorkerCount:       req.WorkerCount,
 		InterceptRules:    interceptRules,
+		Zone:              zone,
 	})
 	if err != nil {
 		if errors.Is(err, db.ErrTaskCategoryInvalid) || errors.Is(err, db.ErrTaskCategoryNotFound) {

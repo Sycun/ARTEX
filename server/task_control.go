@@ -141,6 +141,9 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 				// actor. Reinstall the requested cause barrier while holding
 				// concMu instead of assuming the existing barrier is sufficient.
 				s.engine.Pause(t.ID, pauseCause)
+				if err := s.bindExecutionControl(ControlTaskPause, t.ID); err != nil {
+					return out, err
+				}
 				out.Paused = true
 				out.Status = "paused"
 				return out, nil
@@ -177,11 +180,17 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 		// after the persistent pause commits, so a failed control request is fully
 		// compensated and does not lose an otherwise valid conversation turn.
 		s.cancelTaskChat(t.ID, agent.AbortChatPausedWithTask)
+		if err := s.bindExecutionControl(ControlTaskPause, t.ID); err != nil {
+			return out, err
+		}
 		out.Paused, out.Status = true, "paused"
 		s.requestConcurrencyReconcile()
 	case "resume":
 		queued, err := s.admitTaskWhenScheduled(t, "resume", true, pauseCause == agent.AbortPausedBySchedule)
 		if err != nil {
+			return out, err
+		}
+		if err := s.bindExecutionControl(ControlTaskResume, t.ID); err != nil {
 			return out, err
 		}
 		out.Queued = queued

@@ -119,6 +119,9 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 	if !s.beginTaskDelete(taskID) {
 		return errors.New("任务正在进行其他归档或删除操作")
 	}
+	if err := s.bindExecutionControl(ControlTaskCancel, taskID); err != nil {
+		return err
+	}
 	committed := false
 	defer func() {
 		if !committed {

@@ -76,6 +76,7 @@ type Task struct {
 	CoverageEnabled      bool                   `json:"coverage_enabled"`       // 资产覆盖度功能开关(创建时定,默认开)
 	ShareGlobalAssets    bool                   `json:"share_global_assets"`
 	WorkerCount          int                    `json:"worker_count"` // 本任务 Worker 数;0=用全局默认
+	Zone                 string                 `json:"zone"`
 	FirstRunAt           int64                  `json:"first_run_at,omitempty"`
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	ActiveRunSeconds     int64                  `json:"active_run_seconds"`
@@ -126,6 +127,7 @@ type taskLifecycleState struct {
 	CompanyIDs          []int64
 	CategoryID          *int64
 	CategoryName        string
+	Zone                string
 }
 
 func (t *Task) lifecycleSnapshot() taskLifecycleState {
@@ -160,6 +162,7 @@ func (t *Task) lifecycleSnapshotLocked() taskLifecycleState {
 		CompanyIDs:          append([]int64(nil), t.CompanyIDs...),
 		CategoryID:          cloneInt64Ptr(t.CategoryID),
 		CategoryName:        t.CategoryName,
+		Zone:                t.Zone,
 	}
 }
 
@@ -198,6 +201,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 	t.CompanyIDs = append(t.CompanyIDs[:0], state.CompanyIDs...)
 	t.CategoryID = cloneInt64Ptr(state.CategoryID)
 	t.CategoryName = state.CategoryName
+	t.Zone = state.Zone
 	t.lifecycleMu.Unlock()
 }
 
@@ -1177,7 +1181,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		NoResultSeconds: pt.NoResultSeconds, NoResultMinFindings: pt.NoResultMinFindings, NoResultMinSeverity: pt.NoResultMinSeverity,
 		NoResultBaseSeconds: pt.NoResultBaseSeconds, NoResultCheckedAt: unixOrZero(pt.NoResultCheckedAt), StopReason: pt.StopReason,
 		TimeoutSeconds: pt.TimeoutSeconds, PlanHeartbeatSeconds: pt.PlanHeartbeatSeconds,
-		CoverageEnabled: pt.CoverageEnabled, ShareGlobalAssets: pt.ShareGlobalAssets, WorkerCount: pt.WorkerCount,
+		CoverageEnabled: pt.CoverageEnabled, ShareGlobalAssets: pt.ShareGlobalAssets, WorkerCount: pt.WorkerCount, Zone: pt.Zone,
 		FirstRunAt: unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
 		ActiveRunSeconds: pt.ActiveRunSeconds, RunSegmentStartedAt: unixOrZero(pt.RunSegmentStartedAt),
 		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
@@ -1208,6 +1212,7 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 		state.Name = updated.Name
 		state.Remark = updated.Remark
 		state.PinnedAt = unixOrZero(updated.PinnedAt)
+		state.Zone = updated.Zone
 	})
 	return task, nil
 }
@@ -1451,6 +1456,34 @@ func (m *Manager) LoadExisting() []*Task {
 		log.Printf("[manager] reloaded %d task(s) from PG", len(loaded))
 	}
 	return loaded
+}
+
+// EnsureTask returns the in-memory handle, loading it from PostgreSQL when a
+// worker claims a task this process has not seen yet.
+func (m *Manager) EnsureTask(id int64) (*Task, error) {
+	if id <= 0 {
+		return nil, fmt.Errorf("task %d not found", id)
+	}
+	key := strconv.FormatInt(id, 10)
+	if task, ok := m.Task(key); ok {
+		return task, nil
+	}
+	pt, err := m.pg.GetTask(id)
+	if err != nil {
+		return nil, err
+	}
+	if pt == nil {
+		return nil, fmt.Errorf("task %d not found", id)
+	}
+	task := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+	m.mu.Lock()
+	if existing := m.tasks[key]; existing != nil {
+		m.mu.Unlock()
+		return existing, nil
+	}
+	m.tasks[key] = task
+	m.mu.Unlock()
+	return task, nil
 }
 
 // SetTaskPaused persists a task's paused state.

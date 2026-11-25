@@ -186,6 +186,14 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 					}
 					return
 				}
+				if r.Method == http.MethodGet && p == "/api/workers" {
+					if !actor.Platform() {
+						writeProductError(w, http.StatusForbidden, "forbidden", "仅平台管理员可访问", nil)
+						return
+					}
+					h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), actorKey{}, actor)))
+					return
+				}
 				if !enterpriseAllows(p) && !s.allowEnterpriseWorkbench(w, r, actor) {
 					return
 				}

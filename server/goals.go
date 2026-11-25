@@ -203,11 +203,27 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 	// planner/workers are still live. Still compare-and-commit the persisted
 	// status: a concurrent terminal transition must win instead of being silently
 	// reported as a successful follow-up admission.
-	if !wasTerminal && !wasPaused && !wasQueued && s.engine.Started(t.ID) && (!enabled || ready) {
+	started := s.engine.Started(t.ID)
+	if s.mode == ModeAPI && !started {
+		id, convErr := strconv.ParseInt(t.ID, 10, 64)
+		if convErr != nil {
+			return false, convErr
+		}
+		started, err = s.m.pg.ExecutionJobActive(s.ctx, id)
+		if err != nil {
+			return false, err
+		}
+	}
+	if !wasTerminal && !wasPaused && !wasQueued && started && (!enabled || ready) {
 		if err := s.m.ApplyTaskAdmission(t.ID, lifecycle.Status, lifecycle.Status, false, "resume", false); err != nil {
 			return false, err
 		}
-		s.startAdmittedTask(t, "resume")
+		if s.mode == ModeAPI {
+			return false, nil
+		}
+		if err := s.startAdmittedTask(t, "resume"); err != nil {
+			return false, err
+		}
 		return false, nil
 	}
 
@@ -267,7 +283,9 @@ func (s *Server) admitTaskWhenScheduledWithGenerationChecked(t *Task, mode strin
 		}
 		return true, nil
 	}
-	s.startAdmittedTask(t, mode)
+	if err := s.startAdmittedTask(t, mode); err != nil {
+		return false, err
+	}
 	return false, nil
 }
 
@@ -281,7 +299,15 @@ func (s *Server) hasReadyQueuedTask(excludeID string) bool {
 	return false
 }
 
-func (s *Server) startAdmittedTask(t *Task, mode string) {
+func (s *Server) startAdmittedTask(t *Task, mode string) error {
+	if s.mode == ModeAPI {
+		return s.enqueueTaskExecution(t)
+	}
+	s.runAdmittedTask(t, mode)
+	return nil
+}
+
+func (s *Server) runAdmittedTask(t *Task, mode string) {
 	if s.engine.ReadyFor(t) {
 		if err := s.m.StartTaskRunSegment(t.ID); err != nil {
 			log.Printf("[runtime] task %s start segment failed: %v", t.ID, err)
@@ -402,7 +428,11 @@ func (s *Server) reconcileConcurrency() {
 			s.engine.decInflight(task.ID)
 			continue
 		}
-		s.startAdmittedTask(task, mode)
+		if err := s.startAdmittedTask(task, mode); err != nil {
+			s.engine.decInflight(task.ID)
+			log.Printf("[concurrency] task %s start failed: %v", task.ID, err)
+			continue
+		}
 		s.engine.decInflight(task.ID)
 		slots--
 	}

@@ -36,6 +36,7 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 		Remark            *string `json:"remark"`
 		Pinned            *bool   `json:"pinned"`
 		ShareGlobalAssets *bool   `json:"share_global_assets"`
+		Zone              *string `json:"zone"`
 	}
 	if err := decode(r, &request); err != nil {
 		var tooLarge *http.MaxBytesError
@@ -50,8 +51,8 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, http.StatusForbidden, "read_only", "企业会话不能改全局资产共享", nil)
 		return
 	}
-	if request.Name == nil && request.Pinned == nil && request.Remark == nil && request.ShareGlobalAssets == nil {
-		writeErr(w, http.StatusBadRequest, "至少需要提供 name、pinned、remark 或 share_global_assets")
+	if request.Name == nil && request.Pinned == nil && request.Remark == nil && request.ShareGlobalAssets == nil && request.Zone == nil {
+		writeErr(w, http.StatusBadRequest, "至少需要提供 name、pinned、remark、share_global_assets 或 zone")
 		return
 	}
 	if request.Name != nil {
@@ -75,7 +76,15 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 		}
 		request.Remark = &remark
 	}
-	task, err := s.m.UpdateTaskMetadata(taskID, db.TaskPatch{Name: request.Name, Pinned: request.Pinned, Remark: request.Remark, ShareGlobalAssets: request.ShareGlobalAssets})
+	if request.Zone != nil {
+		zone, err := db.NormalizeZone(*request.Zone)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		request.Zone = &zone
+	}
+	task, err := s.m.UpdateTaskMetadata(taskID, db.TaskPatch{Name: request.Name, Pinned: request.Pinned, Remark: request.Remark, ShareGlobalAssets: request.ShareGlobalAssets, Zone: request.Zone})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -83,6 +92,17 @@ func (s *Server) updateTaskMetadata(w http.ResponseWriter, r *http.Request) {
 	if task == nil {
 		writeErr(w, http.StatusNotFound, "task not found")
 		return
+	}
+	if request.Zone != nil {
+		id, convErr := strconv.ParseInt(task.ID, 10, 64)
+		if convErr != nil {
+			writeErr(w, http.StatusBadRequest, "任务 id 无效")
+			return
+		}
+		if err := s.m.pg.RetargetExecutionJobZone(r.Context(), id, *request.Zone); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, taskDTO(task, s.resolvedTaskStatus(task)))
 }

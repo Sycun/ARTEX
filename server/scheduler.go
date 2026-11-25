@@ -90,6 +90,11 @@ func (sc *Scheduler) Run(ctx context.Context) {
 			sc.s.reconcileConcurrency()
 		}
 		if step && ctx.Err() == nil {
+			if sc.s.mode == ModeAPI {
+				if err := sc.reclaimExecution(ctx); err != nil {
+					log.Printf("[scheduler] execution reclaim: %v", err)
+				}
+			}
 			sc.step()
 		}
 	}
@@ -209,6 +214,24 @@ func (sc *Scheduler) init() {
 		}
 		_ = sc.pg.SetSchedState(schedKeyLastTaskCreate, strconv.FormatInt(maxID, 10))
 	}
+}
+
+func (sc *Scheduler) reclaimExecution(ctx context.Context) error {
+	requeued, failed, err := sc.pg.ReclaimExpiredExecutionJobs(ctx)
+	if err != nil {
+		return err
+	}
+	if requeued > 0 || failed > 0 {
+		log.Printf("[scheduler] execution reclaim requeued=%d failed=%d", requeued, failed)
+	}
+	n, err := sc.pg.MarkStaleWorkersOffline(ctx, workerStaleAfter)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		log.Printf("[scheduler] marked %d stale workers offline", n)
+	}
+	return nil
 }
 
 func (sc *Scheduler) step() {

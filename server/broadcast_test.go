@@ -187,6 +187,13 @@ func TestPGNotifyBusAcrossProcesses(t *testing.T) {
 			t.Fatalf("receiver did not recover activity %d: %q (%v)", want.ID, output.Text(), output.Err())
 		}
 	}
+	cancelEvent := ControlEvent{Kind: ControlTaskCancel, TaskID: taskID}
+	if err := sender.PublishControl(cancelEvent); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveBusEvent(t, control); got != cancelEvent {
+		t.Fatalf("control got %+v, want %+v", got, cancelEvent)
+	}
 	if err := sender.PublishControl(ControlEvent{Kind: ControlTaskPause, TaskID: taskID}); err != nil {
 		t.Fatal(err)
 	}
@@ -278,6 +285,9 @@ func TestPGNotifyBusProcessHelper(t *testing.T) {
 	fmt.Println("pg bus ready")
 	for range 2 {
 		fmt.Println(activityReceipt(receiveBusEvent(t, activity)))
+	}
+	if got := receiveBusEvent(t, control); got != (ControlEvent{Kind: ControlTaskCancel, TaskID: taskID}) {
+		t.Fatalf("unexpected control: %+v", got)
 	}
 	if got := receiveBusEvent(t, control); got != (ControlEvent{Kind: ControlTaskPause, TaskID: taskID}) {
 		t.Fatalf("unexpected control: %+v", got)

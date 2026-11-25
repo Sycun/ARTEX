@@ -583,6 +583,7 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS active_run_seconds BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS run_segment_started_at TIMESTAMPTZ;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pause_reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS zone TEXT NOT NULL DEFAULT 'default';
 CREATE INDEX IF NOT EXISTS idx_tasks_category ON tasks(category_id, created_at DESC)
     WHERE deleted_at IS NULL AND category_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_pinned ON tasks(pinned_at DESC)
@@ -2074,3 +2075,37 @@ CREATE TABLE IF NOT EXISTS ent_unclaimed (
     status TEXT NOT NULL,
     UNIQUE (sample_key, object_key)
 );
+
+-- Distributed execution plane. api nodes enqueue; workers claim with
+-- FOR UPDATE SKIP LOCKED. mode=all does not read these tables.
+CREATE TABLE IF NOT EXISTS worker_nodes (
+    id TEXT PRIMARY KEY,
+    zone TEXT NOT NULL DEFAULT 'default',
+    concurrency INT NOT NULL,
+    active_jobs INT NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('online','draining','offline')),
+    last_heartbeat TIMESTAMPTZ NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    project_id TEXT,
+    zone TEXT NOT NULL DEFAULT 'default',
+    status TEXT NOT NULL CHECK (status IN ('queued','leased','running','paused','done','failed','canceled')),
+    lease_owner TEXT,
+    lease_until TIMESTAMPTZ,
+    attempt INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 3,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_execution_jobs_zone_status_created
+    ON execution_jobs(zone, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_execution_jobs_status_lease
+    ON execution_jobs(status, lease_until);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_jobs_active_task
+    ON execution_jobs(task_id)
+    WHERE status IN ('queued','leased','running');

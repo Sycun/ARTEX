@@ -153,6 +153,10 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "任务正在删除")
 		return
 	}
+	if err := s.bindExecutionControl(ControlTaskDelete, id); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
 	deleted := false
 	defer func() {
 		if !deleted {

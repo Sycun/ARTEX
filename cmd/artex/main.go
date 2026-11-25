@@ -5,14 +5,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -50,19 +54,101 @@ func main() {
 	os.Exit(run())
 }
 
+type runtimeConfig struct {
+	Addr              string
+	DataDir           string
+	Proxy             string
+	Mode              string
+	WorkerID          string
+	WorkerZone        string
+	WorkerConcurrency int
+}
+
+func parseRuntimeConfig(fs *flag.FlagSet, args []string, getenv func(string) string) (runtimeConfig, error) {
+	addr := fs.String("addr", ":8787", "HTTP listen address")
+	dataDir := fs.String("data", filepath.Join(config.BaseDir(), "data"), "data directory (default: data/ next to the executable)")
+	proxy := fs.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
+	mode := fs.String("mode", "all", "process role: all, api, or worker")
+	workerID := fs.String("worker-id", "", "worker identity (default: hostname plus a short suffix)")
+	workerZone := fs.String("worker-zone", "default", "execution zone this worker claims")
+	workerConcurrency := fs.Int("worker-concurrency", 4, "maximum jobs claimed at once")
+	if err := fs.Parse(args); err != nil {
+		return runtimeConfig{}, err
+	}
+	cfg := runtimeConfig{
+		Addr:              *addr,
+		DataDir:           *dataDir,
+		Proxy:             *proxy,
+		Mode:              *mode,
+		WorkerID:          *workerID,
+		WorkerZone:        *workerZone,
+		WorkerConcurrency: *workerConcurrency,
+	}
+	if v := getenv("ARTEX_MODE"); v != "" {
+		cfg.Mode = v
+	}
+	if v := getenv("ARTEX_WORKER_ID"); v != "" {
+		cfg.WorkerID = v
+	}
+	if v := getenv("ARTEX_WORKER_ZONE"); v != "" {
+		cfg.WorkerZone = v
+	}
+	if v := getenv("ARTEX_WORKER_CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return runtimeConfig{}, fmt.Errorf("ARTEX_WORKER_CONCURRENCY: %w", err)
+		}
+		cfg.WorkerConcurrency = n
+	}
+	switch cfg.Mode {
+	case "all", "api", "worker":
+	default:
+		return runtimeConfig{}, fmt.Errorf("invalid --mode %q (want all, api, or worker)", cfg.Mode)
+	}
+	if cfg.WorkerConcurrency < 1 {
+		return runtimeConfig{}, fmt.Errorf("worker concurrency must be >= 1")
+	}
+	if cfg.WorkerZone == "" {
+		cfg.WorkerZone = "default"
+	}
+	if cfg.WorkerID == "" {
+		id, err := newWorkerID()
+		if err != nil {
+			return runtimeConfig{}, err
+		}
+		cfg.WorkerID = id
+	}
+	return cfg, nil
+}
+
+func newWorkerID() (string, error) {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "worker"
+	}
+	var buf [3]byte
+	if _, err := io.ReadFull(rand.Reader, buf[:]); err != nil {
+		return "", err
+	}
+	return host + "-" + hex.EncodeToString(buf[:]), nil
+}
+
 func run() int {
-	var (
-		addr    = flag.String("addr", ":8787", "HTTP listen address")
-		dataDir = flag.String("data", filepath.Join(config.BaseDir(), "data"), "data directory for SQLite stores (default: data/ next to the executable)")
-		proxy   = flag.String("proxy", "127.0.0.1:8788", "traffic recording proxy address (empty to disable)")
-	)
-	flag.Parse()
+	cfg, err := parseRuntimeConfig(flag.CommandLine, os.Args[1:], os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		return 2
+	}
 
 	// hand the build version to the server package so GET /api/health can report it
 	// to the frontend top bar.
 	server.BuildVersion = version
 
-	printBanner(*addr)
+	if cfg.Mode == "worker" {
+		printBanner(cfg.WorkerID + "@" + cfg.WorkerZone)
+	} else {
+		printBanner(cfg.Addr)
+	}
 
 	// capture backend logs into the in-memory sink (still to stderr) so the /logs
 	// page can show a live log stream. Do this first, to catch startup logs too.
@@ -92,10 +178,16 @@ func run() int {
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	ctx, shutdown := shutdownContext(sigCtx)
-	defer shutdown(agent.AbortShutdown)
+	var shutdown context.CancelCauseFunc
+	srvCtx := sigCtx
+	if cfg.Mode == "worker" {
+		srvCtx = context.Background()
+	} else {
+		srvCtx, shutdown = shutdownContext(sigCtx)
+		defer shutdown(agent.AbortShutdown)
+	}
 
-	mgr, err := server.NewManager(*dataDir, *proxy)
+	mgr, err := server.NewManager(cfg.DataDir, cfg.Proxy)
 	if err != nil {
 		log.Fatalf("open stores: %v", err)
 	}
@@ -112,16 +204,30 @@ func run() int {
 		skillDir = abs
 	}
 	log.Printf("[config] skill 目录: %s", skillDir)
-	srv := server.New(ctx, mgr, skillDir, *dataDir, config.BaseDir())
+	srv := server.NewRuntime(srvCtx, mgr, skillDir, cfg.DataDir, config.BaseDir(), server.Runtime{
+		Mode:        cfg.Mode,
+		WorkerID:    cfg.WorkerID,
+		Zone:        cfg.WorkerZone,
+		Concurrency: cfg.WorkerConcurrency,
+	})
 	defer srv.Close()
+	if cfg.Mode == "worker" {
+		log.Printf("ARTEX %s worker %s zone=%s concurrency=%d (data=%s)", version, cfg.WorkerID, cfg.WorkerZone, cfg.WorkerConcurrency, cfg.DataDir)
+		if err := srv.RunWorker(sigCtx); err != nil {
+			log.Printf("[worker] %v", err)
+			return 1
+		}
+		log.Println("worker stopped")
+		return 0
+	}
 	httpSrv := &http.Server{
-		Addr:              *addr,
+		Addr:              cfg.Addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
-		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d)", version, *addr, *dataDir, mgr.Workers())
+		log.Printf("ARTEX %s backend listening on %s (data=%s, workers=%d, mode=%s)", version, cfg.Addr, cfg.DataDir, mgr.Workers(), cfg.Mode)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}
@@ -132,7 +238,7 @@ func run() int {
 	// bootstrap above installs the new build).
 	code := 0
 	select {
-	case <-ctx.Done():
+	case <-srvCtx.Done():
 	case <-server.RestartRequested():
 		code = selfupdate.ExitRestart
 		shutdown(agent.AbortShutdown)
