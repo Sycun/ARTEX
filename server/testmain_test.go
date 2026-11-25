@@ -13,6 +13,9 @@ import (
 // server test suite so cross-package DELETE cleanup races with db/agent
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	if os.Getenv(pgBusChildTaskEnv) != "" {
+		os.Exit(m.Run()) // The parent process holds the suite lock.
+	}
 	dsn, _, err := db.DSN()
 	if err != nil {
 		os.Exit(m.Run())

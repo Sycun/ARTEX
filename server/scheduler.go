@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -24,9 +27,12 @@ type Scheduler struct {
 	pg        *db.DB
 	tick      time.Duration
 	startedAt time.Time
+	wake      <-chan struct{}
 }
 
 const (
+	schedulerLockKey int64 = 7337741011
+
 	schedKeyLastFinding    = "last_finding_id"    // watermark: max finding node id fired for
 	schedKeyFiredGoals     = "fired_goals"        // JSON array of goal node ids already fired
 	schedKeyLastTimeout    = "last_timeout_id"    // watermark: max task id fired for task timeout
@@ -35,15 +41,59 @@ const (
 )
 
 func newScheduler(s *Server) *Scheduler {
-	return &Scheduler{s: s, pg: s.m.pg, tick: 5 * time.Second, startedAt: time.Now()}
+	return &Scheduler{s: s, pg: s.m.pg, tick: 5 * time.Second, startedAt: time.Now(), wake: s.schedulerWake}
 }
 
-// Run loops until ctx is done, ticking the scheduler. Started once from server New.
+// Run pins the leadership lock to one session. Only that session is probed for
+// liveness, and followers do not run initialization or scheduler work.
 func (sc *Scheduler) Run(ctx context.Context) {
 	if sc.pg == nil {
 		return
 	}
-	sc.init()
+	var leader *sql.Conn
+	defer func() {
+		if leader != nil {
+			releaseSchedulerLock(leader)
+		}
+	}()
+	run := func(elect, step bool) {
+		if ctx.Err() != nil {
+			return
+		}
+		if leader == nil {
+			if !elect {
+				return
+			}
+			var err error
+			leader, err = trySchedulerLock(ctx, sc.pg.DB)
+			if err != nil && ctx.Err() == nil {
+				log.Printf("[scheduler] acquire leadership: %v", err)
+			}
+			if leader == nil {
+				return
+			}
+			sc.init()
+		} else {
+			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err := leader.PingContext(probeCtx)
+			cancel()
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("[scheduler] lost leadership: %v", err)
+				}
+				releaseSchedulerLock(leader)
+				leader = nil
+				return
+			}
+		}
+		if ctx.Err() == nil {
+			sc.s.reconcileConcurrency()
+		}
+		if step && ctx.Err() == nil {
+			sc.step()
+		}
+	}
+	run(true, false) // Preserve startup reconciliation without waiting for the first tick.
 	t := time.NewTicker(sc.tick)
 	defer t.Stop()
 	for {
@@ -51,9 +101,55 @@ func (sc *Scheduler) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			sc.s.reconcileConcurrency() // 并发上限:有空位就把排队任务补位启动
-			sc.step()
+			run(true, true)
+		case <-sc.wake:
+			run(false, false)
 		}
+	}
+}
+
+func trySchedulerLock(ctx context.Context, pool *sql.DB) (*sql.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	conn, err := pool.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var elected bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, schedulerLockKey).Scan(&elected); err != nil {
+		// An interrupted query may have acquired the lock before returning an error.
+		discardSchedulerConn(conn)
+		return nil, err
+	}
+	if !elected {
+		return nil, conn.Close()
+	}
+	return conn, nil
+}
+
+func releaseSchedulerLock(conn *sql.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var unlocked bool
+	err := conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock($1)`, schedulerLockKey).Scan(&unlocked)
+	if errors.Is(err, sql.ErrConnDone) {
+		return
+	}
+	if err != nil || !unlocked {
+		log.Printf("[scheduler] release leadership: unlocked=%t err=%v", unlocked, err)
+		discardSchedulerConn(conn)
+		return
+	}
+	if err := conn.Close(); err != nil {
+		log.Printf("[scheduler] return lock connection: %v", err)
+	}
+}
+
+// Mark an uncertain session bad so it cannot return to the pool holding a lock.
+func discardSchedulerConn(conn *sql.Conn) {
+	err := conn.Raw(func(any) error { return driver.ErrBadConn })
+	if !errors.Is(err, driver.ErrBadConn) && !errors.Is(err, sql.ErrConnDone) {
+		log.Printf("[scheduler] discard lock connection: %v", err)
 	}
 }
 

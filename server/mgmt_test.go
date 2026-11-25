@@ -15,6 +15,7 @@ func TestMgmtAPI(t *testing.T) {
 	if err != nil {
 		t.Skipf("database unavailable (%v) — skipping management API test", err)
 	}
+	defer m.Close()
 	if m.pg == nil {
 		t.Skip("postgres unavailable — skipping management API test")
 	}

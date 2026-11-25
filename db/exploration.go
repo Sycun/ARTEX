@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -1472,6 +1473,22 @@ func (s *ExplorationStore) TokenStatsBySession() ([]SessionTokenUsage, error) {
 		out = append(out, u)
 	}
 	return out, rows.Err()
+}
+
+// TaskActivity resolves a live event against its owning, non-deleted task.
+func (d *DB) TaskActivity(ctx context.Context, taskID, id int64) (Activity, error) {
+	var a Activity
+	err := d.QueryRowContext(ctx, `
+SELECT a.id, a.node_id, COALESCE(a.worker,''), COALESCE(a.kind,''), COALESCE(a.tool,''),
+       COALESCE(a.tool_use_id,''), a.is_error, COALESCE(a.summary,''), COALESCE(a.detail,''),
+       a.metadata, a.created_at, a.input_tokens, a.output_tokens, a.cache_read_tokens,
+       a.cache_write_tokens, a.main_seg
+FROM activity a JOIN tasks t USING (exploration_id)
+WHERE t.id=$1 AND t.deleted_at IS NULL AND a.id=$2`, taskID, id).Scan(
+		&a.ID, &a.NodeID, &a.Worker, &a.Kind, &a.Tool, &a.ToolUseID, &a.IsError, &a.Summary,
+		&a.Detail, &a.Metadata, &a.CreatedAt, &a.InputTokens, &a.OutputTokens,
+		&a.CacheReadTokens, &a.CacheWriteTokens, &a.MainSeg)
+	return a, err
 }
 
 // ActivityList returns steps after sinceID (exclusive), optionally filtered by node.

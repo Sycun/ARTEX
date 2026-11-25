@@ -1,62 +1,115 @@
 package server
 
 import (
+	"log"
 	"sync"
 
 	"github.com/Autumn-27/artex/db"
 )
 
-// Broadcaster is a per-task in-process pub/sub for live activity events. The
-// engine publishes each appended activity at its single emit point; SSE handlers
-// subscribe per task. Storage (activity table) and the live stream come from the
-// same Publish call, so they never diverge.
-type Broadcaster struct {
+type ControlEventKind string
+
+const (
+	ControlTaskPause  ControlEventKind = "task_pause"
+	ControlTaskResume ControlEventKind = "task_resume"
+	ControlTaskCancel ControlEventKind = "task_cancel"
+	ControlTaskDelete ControlEventKind = "task_delete"
+)
+
+type ControlEvent struct {
+	Kind   ControlEventKind `json:"kind"`
+	TaskID string           `json:"task_id"`
+}
+
+// EventBus carries best-effort live notifications. Activity and task state are
+// persisted separately. Callers must unsubscribe when they stop consuming.
+type EventBus interface {
+	SubscribeActivity(task string) (<-chan db.Activity, func())
+	PublishActivity(task string, activity db.Activity) error
+	SubscribeControl() (<-chan ControlEvent, func())
+	PublishControl(event ControlEvent) error
+}
+
+// MemoryBus fans out events without I/O or waiting for slow subscribers.
+type MemoryBus struct {
+	activity subscriptions[string, db.Activity]
+	control  subscriptions[struct{}, ControlEvent]
+}
+
+func (b *MemoryBus) SubscribeActivity(task string) (<-chan db.Activity, func()) {
+	return b.activity.subscribe(task)
+}
+
+func (b *MemoryBus) PublishActivity(task string, activity db.Activity) error {
+	b.activity.publish(task, activity)
+	return nil
+}
+
+func (b *MemoryBus) SubscribeControl() (<-chan ControlEvent, func()) {
+	return b.control.subscribe(struct{}{})
+}
+
+func (b *MemoryBus) PublishControl(event ControlEvent) error {
+	b.control.publish(struct{}{}, event)
+	return nil
+}
+
+type subscriptions[K comparable, V any] struct {
 	mu   sync.Mutex
-	subs map[string]map[chan db.Activity]struct{} // task id -> set of subscriber channels
+	subs map[K]map[chan V]struct{}
 }
 
-func NewBroadcaster() *Broadcaster {
-	return &Broadcaster{subs: map[string]map[chan db.Activity]struct{}{}}
-}
-
-// Subscribe returns a buffered channel of activities for a task plus an
-// unsubscribe func the caller must invoke (defer) to release it.
-func (b *Broadcaster) Subscribe(task string) (<-chan db.Activity, func()) {
-	ch := make(chan db.Activity, 256)
-	b.mu.Lock()
-	if b.subs[task] == nil {
-		b.subs[task] = map[chan db.Activity]struct{}{}
+func (s *subscriptions[K, V]) subscribe(key K) (<-chan V, func()) {
+	ch := make(chan V, 256)
+	s.mu.Lock()
+	if s.subs == nil {
+		s.subs = make(map[K]map[chan V]struct{})
 	}
-	b.subs[task][ch] = struct{}{}
-	b.mu.Unlock()
-
-	var once sync.Once
-	return ch, func() {
-		once.Do(func() {
-			b.mu.Lock()
-			if m := b.subs[task]; m != nil {
-				delete(m, ch)
-				if len(m) == 0 {
-					delete(b.subs, task)
-				}
-			}
-			b.mu.Unlock()
-			close(ch)
-		})
+	if s.subs[key] == nil {
+		s.subs[key] = make(map[chan V]struct{})
 	}
-}
+	s.subs[key][ch] = struct{}{}
+	s.mu.Unlock()
 
-// Publish fans an activity out to all subscribers of a task. Non-blocking: if a
-// subscriber's buffer is full the event is dropped — the client reconnects with
-// its last seq cursor and catches up the gap from the DB, so liveness never
-// stalls the engine.
-func (b *Broadcaster) Publish(task string, a db.Activity) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for ch := range b.subs[task] {
-		select {
-		case ch <- a:
-		default:
+	return ch, sync.OnceFunc(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		delete(s.subs[key], ch)
+		if len(s.subs[key]) == 0 {
+			delete(s.subs, key)
 		}
+		close(ch)
+	})
+}
+
+func (s *subscriptions[K, V]) publish(key K, value V) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ch := range s.subs[key] {
+		select {
+		case ch <- value:
+		default: // Activity consumers can replay from their last persisted cursor.
+		}
+	}
+}
+
+func (s *subscriptions[K, V]) has(key K) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.subs[key]) != 0
+}
+
+// Broadcaster preserves the engine/SSE API while delegating fan-out to the bus.
+type Broadcaster struct{ bus EventBus }
+
+func NewBroadcaster() *Broadcaster { return &Broadcaster{bus: &MemoryBus{}} }
+
+func (b *Broadcaster) Subscribe(task string) (<-chan db.Activity, func()) {
+	return b.bus.SubscribeActivity(task)
+}
+
+func (b *Broadcaster) Publish(task string, a db.Activity) {
+	if err := b.bus.PublishActivity(task, a); err != nil {
+		log.Printf("[event bus] publish activity task=%q id=%d: %v", task, a.ID, err)
 	}
 }

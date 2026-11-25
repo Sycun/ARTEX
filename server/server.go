@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,14 +42,16 @@ var BuildVersion = "dev"
 // Server exposes the ARTEX backend over a JSON HTTP API for the shadcn/ui
 // frontend.
 type Server struct {
-	scheduleMu sync.Mutex
-	m          *Manager
-	engine     *Engine
-	ctx        context.Context
-	dataDir    string
-	metricsMu  sync.Mutex
-	lastCPUUse uint64
-	lastCPUAt  time.Time
+	scheduleMu       sync.Mutex
+	schedulerWake    chan struct{}
+	stopControlPlane func()
+	m                *Manager
+	engine           *Engine
+	ctx              context.Context
+	dataDir          string
+	metricsMu        sync.Mutex
+	lastCPUUse       uint64
+	lastCPUAt        time.Time
 
 	skillDir  string // root directory for skill subdirectories
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
@@ -181,8 +184,15 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	if err != nil {
 		log.Fatalf("[auth] JWT key: %v", err)
 	}
-	s := &Server{m: m, engine: NewEngine(m), ctx: ctx, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
-		chatCancel: map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
+	planeCtx, stop := context.WithCancel(ctx)
+	events, err := configuredEventBus(planeCtx, os.Getenv("ARTEX_EVENT_BUS"), m.pgDSN, m.pg)
+	if err != nil {
+		stop()
+		log.Fatalf("[event bus] startup: %v", err)
+	}
+	s := &Server{m: m, engine: newEngine(m, &Broadcaster{bus: events}), ctx: ctx, skillDir: skillDir, dataDir: dataDir, jwtKey: key, chatBusy: map[string]bool{},
+		schedulerWake: make(chan struct{}, 1),
+		chatCancel:    map[string]context.CancelCauseFunc{}, triggerQ: map[string][]triggeredRun{},
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{}, proxyPoolWake: make(chan struct{}, 1), proxyPoolProbeSem: make(chan struct{}, proxyPoolMaxProbeConcurrency),
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
@@ -306,10 +316,22 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
 	}
 	s.restoreTaskRuntimes()
+	schedulerDone := make(chan struct{})
+	s.stopControlPlane = func() {
+		stop()
+		<-schedulerDone
+		if bus, ok := events.(*PGNotifyBus); ok {
+			<-bus.done
+		}
+	}
+	m.stopControlPlane = s.stopControlPlane
+	go func() {
+		defer close(schedulerDone)
+		newScheduler(s).Run(planeCtx)
+	}()
 	s.ensureProxySupervisor()
 	s.proxyPoolWG.Add(1)
 	go func() { defer s.proxyPoolWG.Done(); s.runProxyPoolSupervisor(s.ctx) }()
-	go s.reconcileConcurrency()
 	if m.pg != nil {
 		agent.CredentialRecorded = func() {
 			select {
@@ -329,10 +351,23 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	return s
 }
 
-// Close waits for proxy pool supervision to stop before Manager closes the DB.
+// Close stops the control plane and waits for proxy pool supervision.
 func (s *Server) Close() {
 	if s != nil {
+		if s.stopControlPlane != nil {
+			s.stopControlPlane()
+		}
 		s.proxyPoolWG.Wait()
+	}
+}
+
+// EventBus provides the live activity and control topics for in-process callers.
+func (s *Server) EventBus() EventBus { return s.engine.bc.bus }
+
+func (s *Server) requestConcurrencyReconcile() {
+	select {
+	case s.schedulerWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -358,7 +393,6 @@ func (s *Server) restoreTaskRuntimes() {
 			s.engine.startDeadlineCoordinator(s.ctx, t)
 		}
 	}
-	go newScheduler(s).Run(s.ctx)
 	// Restore every task that had already been admitted before shutdown. Starting
 	// only the active UI task left other non-queued tasks counted as concurrency
 	// occupants without live loops, which could permanently block the persistent
@@ -1955,7 +1989,7 @@ func (s *Server) updateTaskLLMProfiles(w http.ResponseWriter, r *http.Request) {
 	// live slot and postpones an unavailable task's pause/queue transition until
 	// the call returns; a nudge lets an idle running task resume promptly.
 	t.Notify()
-	go s.reconcileConcurrency()
+	s.requestConcurrencyReconcile()
 	llmState := t.llmStateSnapshot()
 	result := map[string]any{
 		"id": t.ID, "llm_profile_ids": llmState.ProfileIDs,
@@ -3425,8 +3459,13 @@ func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
-	t := s.m.ResolveTask(r.URL.Query().Get("task"))
-	if t == nil {
+	taskID, store, err := s.activityStreamStore(r.Context(), r.URL.Query().Get("task"))
+	if err != nil {
+		log.Printf("[activity/stream] resolve task=%q: %v", taskID, err)
+		writeErr(w, 500, "cannot resolve task")
+		return
+	}
+	if store == nil {
 		writeErr(w, 404, "task not found")
 		return
 	}
@@ -3459,7 +3498,7 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 
 	// Subscribe BEFORE replaying history so events in between aren't lost; dedup the
 	// overlap by skipping channel events whose id was already replayed.
-	ch, unsub := s.engine.Broadcaster().Subscribe(t.ID)
+	ch, unsub := s.engine.Broadcaster().Subscribe(taskID)
 	defer unsub()
 
 	// Emit a standard SSE id: line so the browser echoes it as Last-Event-ID on
@@ -3479,9 +3518,9 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	// the id<=since skip below drops any that this replay already covered.
 	const replayBatch = 500
 	for {
-		items, cursor, err := t.Store.ActivityList(intentPtr, since, replayBatch)
+		items, cursor, err := store.ActivityList(intentPtr, since, replayBatch)
 		if err != nil {
-			log.Printf("[activity/stream] task=%s replay since=%d: %v", t.ID, since, err)
+			log.Printf("[activity/stream] task=%s replay since=%d: %v", taskID, since, err)
 			return
 		}
 		for _, a := range items {
@@ -3520,6 +3559,30 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *Server) activityStreamStore(ctx context.Context, task string) (string, *db.ExplorationStore, error) {
+	// Replicas may not have loaded a task created after they started. Resolve
+	// explicit distributed subscriptions from PostgreSQL, not the runtime map.
+	if _, distributed := s.EventBus().(*PGNotifyBus); distributed && task != "" && task != "active" {
+		id, err := strconv.ParseInt(task, 10, 64)
+		if err != nil || id <= 0 {
+			return task, nil, nil
+		}
+		var explorationID int64
+		err = s.m.pg.QueryRowContext(ctx, `SELECT exploration_id FROM tasks WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&explorationID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return task, nil, nil
+		}
+		if err != nil {
+			return task, nil, err
+		}
+		return strconv.FormatInt(id, 10), s.m.pg.Exploration(explorationID), nil
+	}
+	if t := s.m.ResolveTask(task); t != nil {
+		return t.ID, t.Store, nil
+	}
+	return task, nil, nil
 }
 
 // activityDetail lazily returns the full detail blob for one step.
@@ -4051,7 +4114,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 立即协调一次:关闭时放行全部排队,调高上限时补位启动,不必等下一个 tick。
-		go s.reconcileConcurrency()
+		s.requestConcurrencyReconcile()
 	}
 	if req.PythonInterp != nil {
 		if err := s.m.pg.SetSetting(settingPythonInterp, strings.TrimSpace(*req.PythonInterp)); err != nil {
