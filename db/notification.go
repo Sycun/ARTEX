@@ -476,9 +476,47 @@ func (d *DB) SetFindingStatusWithNotify(ctx context.Context, id int64, status st
 	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
 		var txErr error
 		from, found, _, notified, txErr = SetFindingStatusTx(ctx, tx, id, status)
-		return txErr
+		if txErr != nil || !found {
+			return txErr
+		}
+		return syncLessonsForFindingTx(ctx, tx, id)
 	})
 	return from, found, notified, err
+}
+
+// SetFindingStatusesWithNotify updates many findings in one transaction and
+// refreshes lessons for each affected task. A lesson failure rolls the statuses back.
+func (d *DB) SetFindingStatusesWithNotify(ctx context.Context, ids []int64, status string) (int, error) {
+	changed := 0
+	err := d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		tasks := map[int64]struct{}{}
+		for _, id := range ids {
+			_, found, did, _, txErr := SetFindingStatusTx(ctx, tx, id, status)
+			if txErr != nil {
+				return txErr
+			}
+			if !found {
+				continue
+			}
+			if did {
+				changed++
+			}
+			var taskID sql.NullInt64
+			if err := tx.QueryRowContext(ctx, `SELECT task_id FROM findings WHERE id=$1`, id).Scan(&taskID); err != nil {
+				return err
+			}
+			if taskID.Valid {
+				tasks[taskID.Int64] = struct{}{}
+			}
+		}
+		for taskID := range tasks {
+			if _, err := ExtractLessonsForTaskTx(ctx, tx, taskID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return changed, err
 }
 
 // SetFindingStatusTx 在**调用方的事务**内更新漏洞状态并登记状态变更推送事件。

@@ -79,6 +79,30 @@ func (s *Server) wireInterceptReviewer() {
 		}
 		return intercept.Decision{Action: v.Action, Message: v.Reason, ProfileID: profileID}, nil
 	})
+	s.m.interceptor.SetCompleter(func(ctx context.Context, profileID int64, system, user string) (string, int64, error) {
+		if profileID == 0 {
+			if p, err := s.m.pg.ActiveProfile(); err == nil && p != nil {
+				profileID = p.ID
+			}
+		}
+		if profileID == 0 {
+			return "", 0, fmt.Errorf("未配置可用的裁判模型")
+		}
+		profile, err := s.m.pg.ProfileByID(profileID)
+		if err != nil || profile == nil {
+			return "", profileID, fmt.Errorf("裁判模型 profile %d 不可用", profileID)
+		}
+		if profile.Format == "jev" {
+			return "", profileID, fmt.Errorf("Jev 配置使用 freeform/System One，不能回答闭卷问题")
+		}
+		prov, _, ok := s.providerForProfile(profileID)
+		if !ok {
+			return "", profileID, fmt.Errorf("裁判模型 profile %d 不可用", profileID)
+		}
+		ctx = llmrec.WithWorker(ctx, judgeWorkerLane)
+		text, err := streamCollectText(ctx, prov, system, user)
+		return text, profileID, err
+	})
 }
 
 func (s *Server) recordJevJudgeUsage(ctx context.Context, profile *db.LLMProfile, usage jev.Usage, started time.Time, callErr error) {
@@ -263,10 +287,11 @@ func (s *Server) interceptListPending(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if pending == nil {
-		pending = []db.InterceptPending{}
+	out := make([]interceptPendingDTO, 0, len(pending))
+	for _, p := range pending {
+		out = append(out, pendingDTO(p))
 	}
-	writeJSON(w, 200, map[string]any{"pending": pending})
+	writeJSON(w, 200, map[string]any{"pending": out})
 }
 
 func (s *Server) interceptGetOne(w http.ResponseWriter, r *http.Request) {
@@ -288,7 +313,7 @@ func (s *Server) interceptGetOne(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	writeJSON(w, 200, p)
+	writeJSON(w, 200, pendingDTO(*p))
 }
 
 func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) {
@@ -399,10 +424,16 @@ func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {
 	default:
 		return filter, fmt.Errorf("status 必须是 pending、allowed、denied 或 timeout")
 	}
+	filter.DecidedBy = q.Get("decided_by")
 	switch filter.DecisionSource {
-	case "", "model", "rule", "manual", "unknown":
+	case "", "model", "rule", "manual", "target", "unknown":
 	default:
-		return filter, fmt.Errorf("decision_source 必须是 model、rule、manual 或 unknown")
+		return filter, fmt.Errorf("decision_source 必须是 model、rule、manual、target 或 unknown")
+	}
+	switch filter.DecidedBy {
+	case "", "human", "rule", "model", "system":
+	default:
+		return filter, fmt.Errorf("decided_by 必须是 human、rule、model 或 system")
 	}
 	return filter, nil
 }
@@ -439,9 +470,13 @@ func (s *Server) interceptDecide(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "decision 必须是 allowed 或 denied")
 		return
 	}
-	if err := s.m.interceptor.Decide(id, req.Decision == "allowed"); err != nil {
+	if err := s.m.interceptor.Decide(id, req.Decision == "allowed", s.approver(r), clientIP(r, s.trustedProxies)); err != nil {
 		if errors.Is(err, intercept.ErrAlreadyDecided) {
 			writeErr(w, 409, err.Error())
+			return
+		}
+		if errors.Is(err, db.ErrTargetPinEmpty) {
+			writeErr(w, 422, err.Error())
 			return
 		}
 		writeErr(w, 500, err.Error())
@@ -593,8 +628,21 @@ func validateInterceptRuleReq(req interceptRuleReq) error {
 	}
 	switch req.MatchType {
 	case "string", "regex":
+	case "argv":
+		if req.MatchTarget != "tool_input" {
+			return fmt.Errorf("argv 规则只能匹配 tool_input")
+		}
+		tokens, err := intercept.ParseArgvPattern(req.Pattern)
+		if err != nil {
+			return fmt.Errorf("argv pattern 无效：%w", err)
+		}
+		if req.Action == "allow" {
+			if err := intercept.CheckArgvAllow(tokens); err != nil {
+				return err
+			}
+		}
 	default:
-		return fmt.Errorf("match_type 必须是 string 或 regex")
+		return fmt.Errorf("match_type 必须是 string、regex 或 argv")
 	}
 	if req.Pattern == "" {
 		return fmt.Errorf("pattern 不能为空")
@@ -631,7 +679,16 @@ func (s *Server) interceptDetail(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not found")
 		return
 	}
-	writeJSON(w, 200, detail)
+	out := struct {
+		*db.InterceptDetail
+		AlwaysAllowPrefix string `json:"always_allow_prefix,omitempty"`
+	}{InterceptDetail: detail}
+	if detail.Status == "pending" {
+		if prefix, err := intercept.AlwaysAllowPrefix(detail.ToolName, detail.ToolInput); err == nil {
+			out.AlwaysAllowPrefix = strings.Join(prefix, " ")
+		}
+	}
+	writeJSON(w, 200, out)
 }
 
 // The navigation endpoint returns only the original call and its paired result.

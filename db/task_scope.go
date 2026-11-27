@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -277,12 +278,13 @@ type CoverageByType struct {
 // NOT a precise metric. Denominator = assets matching any active task_scope row;
 // Tested = those anchored to at least one fact node in the exploration.
 type Coverage struct {
-	Enabled     bool             `json:"enabled"`     // 资产覆盖度功能是否开启；false 时其余字段为零值
-	ScopeRows   int              `json:"scope_rows"`  // 0 → 范围未锚定
-	Denominator int              `json:"denominator"` // 范围内资产数
-	Tested      int              `json:"tested"`      // 已测(约)
-	Pct         *float64         `json:"pct"`         // 覆盖度；分母 0 时 null
-	ByType      []CoverageByType `json:"by_type"`     // 按资产类型的 总数/已测
+	Enabled        bool             `json:"enabled"`     // 资产覆盖度功能是否开启；false 时其余字段为零值
+	ScopeRows      int              `json:"scope_rows"`  // 0 → 范围未锚定
+	Denominator    int              `json:"denominator"` // 范围内资产数
+	Tested         int              `json:"tested"`      // 已测(约)
+	Pct            *float64         `json:"pct"`         // 覆盖度；分母 0 时 null
+	ByType         []CoverageByType `json:"by_type"`     // 按资产类型的 总数/已测
+	CoverageLedger *CoverageLedger  `json:"-"`           // optional agent-reported ledger merged into the JSON document
 }
 
 // CoverageEnabled reports whether a task has the asset-coverage feature turned on
@@ -294,6 +296,7 @@ func (s *AssetStore) CoverageEnabled(taskID int64) bool {
 	}
 	var enabled bool
 	if err := s.db.QueryRow(`SELECT COALESCE(coverage_enabled,true) FROM tasks WHERE id=$1`, taskID).Scan(&enabled); err != nil {
+		log.Printf("coverage flag read failed for task %d: %v; leaving coverage on", taskID, err)
 		return true
 	}
 	return enabled

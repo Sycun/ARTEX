@@ -86,7 +86,12 @@ func chatWorkDirSpec(workDir string) string {
 // chatSystem renders the DB-managed prompt body for agentKey. Custom agents have
 // no per-key in-code default, so DefaultAssistantPrompt is the render fallback.
 func chatSystem(agentKey, dataDir, workDir string) string {
-	return renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
+	body := renderSystem(agentKey, DefaultAssistantPrompt, chatVars{DataDir: dataDir, Now: nowStr()}) + chatWorkDirSpec(workDir)
+	body += untrustedContentTail(body)
+	if agentKey != "auto" {
+		body += noiseProfileBlock()
+	}
+	return body
 }
 
 // chatVars carries the runtime variables a custom agent's prompt may reference.
@@ -159,9 +164,10 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		ToolOutputDir: filepath.Join(sessionWorkDir, "cmd-output"),
 		// 命中预算(步数)→ SDK 跑收尾:输出一句总结。Prompt 与收尾轮数按本 agent key 后台可编辑
 		// (自定义 agent 各自一份;留空/0 用通用默认:10 轮)。
-		Settlement:   wrapupSettlement(agentKey, nil),
-		NonStreaming: c.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    c.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		Settlement:              wrapupSettlement(agentKey, nil),
+		NonStreaming:            c.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:               c.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()

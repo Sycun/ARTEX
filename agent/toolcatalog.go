@@ -118,6 +118,8 @@ func DecorateTool(t actool.CoreTool, desc string, schema map[string]any) actool.
 	}
 	if len(schema) == 0 {
 		schema = t.InputSchema()
+	} else if t.Name() == "record_fact" {
+		schema = RepairRecordFactSchema(schema)
 	}
 	return &overriddenTool{CoreTool: t, desc: desc, schema: schema}
 }
@@ -133,6 +135,11 @@ type overriddenTool struct {
 
 func (o *overriddenTool) Description() string         { return o.desc }
 func (o *overriddenTool) InputSchema() map[string]any { return o.schema }
+
+func (o *overriddenTool) AcceptsRawInput() bool {
+	r, ok := o.CoreTool.(interface{ AcceptsRawInput() bool })
+	return ok && r.AcceptsRawInput()
+}
 
 func (o *overriddenTool) Call(ctx context.Context, in json.RawMessage, tc *actool.ToolContext) (actool.Result, error) {
 	return o.CoreTool.Call(ctx, injectDefaults(in, o.schema), tc)

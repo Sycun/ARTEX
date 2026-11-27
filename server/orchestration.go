@@ -462,17 +462,28 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 			"finding_id":       map[string]any{"type": "integer", "description": "目标漏洞 id(report_finding 返回的 id)"},
 			"report":           strParam("详细报告全文,Markdown 格式"),
 			"evidence_version": map[string]any{"type": "integer", "description": "get_finding_traffic 返回的证据 version；用于防止报告覆盖新的证据变更"},
+			"poe_level":        map[string]any{"type": "integer", "description": "利用证明等级 0-4：1 报错/时序/响应差异，2 结构被改写，3 实际取出数据，4 关键影响。verified 至少 L3。未证明时省略或传 0。"},
+			"evidence_quotes":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "从已绑定的 proof/verification 响应正文逐字复制的行（get_finding_traffic）。服务端按空白归一化后逐字核对。"},
 		}, "finding_id", "report"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				EvidenceVersion *int64          `json:"evidence_version"`
 				FindingID       json.RawMessage `json:"finding_id"`
 				Report          string          `json:"report"`
+				PoELevel        *int            `json:"poe_level"`
+				EvidenceQuotes  []string        `json:"evidence_quotes"`
 			}
 			_ = json.Unmarshal(in, &a)
 			nodeID := parseProfileID(a.FindingID) // 复用「数字或数字字符串」解析
 			if nodeID <= 0 {
 				return actool.Errorf("finding_id 无效"), nil
+			}
+			poe := 0
+			if a.PoELevel != nil {
+				poe = *a.PoELevel
+			}
+			if poe < 0 || poe > 4 {
+				return actool.Errorf(fmt.Sprintf("invalid poe_level %d (want 0-4)", poe)), nil
 			}
 			fid, err := s.m.pg.FindingIDByNodeID(nodeID)
 			if err != nil {
@@ -500,7 +511,20 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 			if n == 0 {
 				return actool.Errorf(fmt.Sprintf("未找到 finding_id=%d 对应的漏洞记录(先用 report_finding 登记)", nodeID)), nil
 			}
-			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", nodeID, len(a.Report))), nil
+			status, note := db.VerificationUnverified, "no proof traffic bound"
+			if fid > 0 {
+				status, note = s.assessFindingVerification(ctx, fid, poe, a.EvidenceQuotes)
+				if err := s.m.pg.SetFindingVerification(fid, status, poe, note); err != nil {
+					return actool.Errorf("report saved, but verification not recorded: " + err.Error()), nil
+				}
+			}
+			msg := fmt.Sprintf("finding %d report updated (%d chars)\nverification: %s", nodeID, len(a.Report), status)
+			if status == db.VerificationVerified {
+				msg += fmt.Sprintf(" (POE L%d)", poe)
+			} else {
+				msg += " - " + note + "\nwarning: the report is saved but the finding is not verified. To reach verified, declare poe_level 3 or 4 and pass exact quotes copied from a bound proof/verification response body."
+			}
+			return actool.Text(msg), nil
 		})
 }
 

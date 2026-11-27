@@ -439,6 +439,19 @@ func nodeSummary(n *db.Node) string {
 	return ""
 }
 
+func nodeFactSource(n *db.Node) string {
+	if n == nil {
+		return ""
+	}
+	var p map[string]any
+	if json.Unmarshal(n.Payload, &p) == nil {
+		if s, ok := p["source"].(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
 func nodeConfidence(n *db.Node) string {
 	if n == nil {
 		return ""
@@ -474,8 +487,18 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 			state = n.State
 		}
 		line := fmt.Sprintf("- #%d [%s/%s] %s", m, kind, state, nodeSummary(n))
+		var meta []string
 		if conf := nodeConfidence(n); conf != "" {
-			line += fmt.Sprintf(" (confidence=%s)", conf)
+			meta = append(meta, "confidence="+conf)
+		}
+		if src := nodeFactSource(n); src != "" {
+			meta = append(meta, "source="+src)
+		}
+		if n != nil && n.Origin != "" {
+			meta = append(meta, "origin="+n.Origin)
+		}
+		if len(meta) > 0 {
+			line += " (" + strings.Join(meta, ", ") + ")"
 		}
 		sb.WriteString(line)
 		sb.WriteByte('\n')

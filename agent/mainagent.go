@@ -104,7 +104,7 @@ const mainAgentDefaultTmpl = `你是一个授权渗透测试系统的"主 agent"
 
 func mainAgentSystem(goal, dataDir, workDir string) string {
 	body := renderSystem("mainagent", mainAgentDefaultTmpl, MainVars{Goal: goal, DataDir: dataDir, Now: nowStr()})
-	return body + artifactSpec(workDir)
+	return body + untrustedContentTail(body) + artifactSpec(workDir)
 }
 
 // Chat handles one human message and returns the assistant reply. emit, if
@@ -163,9 +163,10 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		Compaction:         compactionConfig(m.compactionWindow()), // long chats stay within the window
 		Todos:              actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		// 命中预算(步数)→ SDK 跑收尾:向用户输出一句进展总结。Prompt 与收尾轮数可后台编辑(默认 10 轮)。
-		Settlement:   wrapupSettlement("mainagent", nil),
-		NonStreaming: m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:    m.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		Settlement:              wrapupSettlement("mainagent", nil),
+		NonStreaming:            m.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:               m.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
+		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
 	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx

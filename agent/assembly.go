@@ -76,6 +76,7 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	for i, t := range out {
 		out[i] = guardPanic(t)
 	}
+	out = applyToolRAG(ctx, agentKey, out, def.Deferred, nil)
 	return out, def, cleanup
 }
 

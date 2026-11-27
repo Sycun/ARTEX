@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -76,42 +78,105 @@ func taskEmitFromCtx(ctx context.Context) func(db.Activity) {
 	return f
 }
 
-// compiledRule is an InterceptRule with the regex pre-compiled (nil for string rules).
+// targetScopeCtxKey is a separate unexported key type for the target-gate scope.
+type targetScopeCtxKey struct{}
+
+// DefaultTargetWaitBound is how long a gated tool call may wait for a human
+// decision on an unpinned target before it fails with the request left open.
+const DefaultTargetWaitBound = 300 * time.Second
+
+// TargetScope binds an asset-target approval to one task or one conversation.
+// Enabled is read on every gated call; nil means the gate is off.
+type TargetScope struct {
+	TaskID             string
+	ConversationID     int64
+	Enabled            func() bool
+	WaitBound          time.Duration
+	Interceptor        *Interceptor
+	AssessmentIdentity AssessmentIdentity
+}
+
+// WithTargetScope returns a child context carrying the target-gate scope.
+func WithTargetScope(ctx context.Context, s TargetScope) context.Context {
+	return context.WithValue(ctx, targetScopeCtxKey{}, s)
+}
+
+// TargetScopeFromContext extracts the target-gate scope.
+func TargetScopeFromContext(ctx context.Context) (s TargetScope, ok bool) {
+	s, ok = ctx.Value(targetScopeCtxKey{}).(TargetScope)
+	return s, ok
+}
+
+// compiledRule is an InterceptRule with the regex pre-compiled and the argv
+// tokens pre-parsed. bad marks a deny or ask rule whose pattern does not compile.
 type compiledRule struct {
 	db.InterceptRule
-	re *regexp.Regexp
+	re   *regexp.Regexp
+	argv []string
+	bad  bool
 }
 
-// pendingManager tracks in-flight "ask" requests via per-request channels.
+func compileRule(r db.InterceptRule) (compiledRule, bool) {
+	cr := compiledRule{InterceptRule: r}
+	switch r.MatchType {
+	case "regex":
+		re, err := regexp.Compile(r.Pattern)
+		if err != nil {
+			return cr, false
+		}
+		cr.re = re
+	case "argv":
+		tokens, err := ParseArgvPattern(r.Pattern)
+		if err != nil {
+			return cr, false
+		}
+		cr.argv = tokens
+	}
+	return cr, true
+}
+
+// pendingManager tracks in-flight approval requests. A classic ask has one
+// waiter; a target request can have several.
 type pendingManager struct {
 	mu sync.Mutex
-	ch map[int64]chan bool
+	ch map[int64][]chan bool
 }
 
-func newPendingManager() *pendingManager { return &pendingManager{ch: map[int64]chan bool{}} }
+func newPendingManager() *pendingManager { return &pendingManager{ch: map[int64][]chan bool{}} }
 
 func (p *pendingManager) add(id int64) chan bool {
 	ch := make(chan bool, 1)
 	p.mu.Lock()
-	p.ch[id] = ch
+	p.ch[id] = append(p.ch[id], ch)
 	p.mu.Unlock()
 	return ch
 }
 
 func (p *pendingManager) resolve(id int64, allowed bool) {
 	p.mu.Lock()
-	ch, ok := p.ch[id]
+	waiters := p.ch[id]
 	delete(p.ch, id)
 	p.mu.Unlock()
-	if ok {
+	for _, ch := range waiters {
 		ch <- allowed
 	}
 }
 
-func (p *pendingManager) remove(id int64) {
+func (p *pendingManager) remove(id int64, ch chan bool) {
 	p.mu.Lock()
-	delete(p.ch, id)
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	waiters := p.ch[id]
+	for n, w := range waiters {
+		if w == ch {
+			waiters = append(waiters[:n:n], waiters[n+1:]...)
+			break
+		}
+	}
+	if len(waiters) == 0 {
+		delete(p.ch, id)
+		return
+	}
+	p.ch[id] = waiters
 }
 
 // Reviewer runs the LLM fallback judge for one tool call and returns its verdict
@@ -120,15 +185,28 @@ func (p *pendingManager) remove(id int64) {
 // free of any llm dependency. profileID == 0 means "use the active/default profile".
 type Reviewer func(ctx context.Context, profileID int64, prompt string, input ReviewInput) (Decision, error)
 
+// Completer runs one model completion for the closed-question judge and returns
+// the raw reply. The reply is parsed and decided in this package.
+type Completer func(ctx context.Context, profileID int64, system, user string) (text string, usedProfileID int64, err error)
+
 // Interceptor loads intercept rules from the database and evaluates them on
 // tool calls. It is safe for concurrent use.
 type Interceptor struct {
-	db           *db.DB
-	mu           sync.RWMutex
-	cached       []compiledRule  // sorted by priority DESC; nil means not loaded yet
-	enabledTools map[string]bool // nil means not loaded yet
-	pending      *pendingManager
-	reviewer     Reviewer // nil = LLM fallback judge not wired
+	db            *db.DB
+	mu            sync.RWMutex
+	cached        []compiledRule
+	enabledTools  map[string]bool
+	loadFailed    bool
+	pending       *pendingManager
+	reviewer      Reviewer
+	completer     Completer
+	upstreamProxy func() bool
+	toolProxy     func(string) bool
+	derivedExempt func() []string
+	targets       targetStore
+	resolve       *resolveCache
+	firstUse      sync.Map
+	dial          func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // SetReviewer installs the LLM fallback judge callback. Passing nil disables it.
@@ -138,18 +216,41 @@ func (i *Interceptor) SetReviewer(r Reviewer) {
 	i.mu.Unlock()
 }
 
+// SetCompleter installs the closed-question judge callback. Nil disables it.
+func (i *Interceptor) SetCompleter(c Completer) {
+	i.mu.Lock()
+	i.completer = c
+	i.mu.Unlock()
+}
+
+// SetUpstreamProxyCheck reports whether target traffic leaves through an upstream proxy.
+func (i *Interceptor) SetUpstreamProxyCheck(f func() bool) {
+	i.mu.Lock()
+	i.upstreamProxy = f
+	i.mu.Unlock()
+}
+
+// SetToolProxyCheck reports whether one tool routes its own traffic through a proxy.
+func (i *Interceptor) SetToolProxyCheck(f func(string) bool) {
+	i.mu.Lock()
+	i.toolProxy = f
+	i.mu.Unlock()
+}
+
 // defaultEnabledTools is the hard-coded set of tools that enter the intercept
 // rule system when no intercept_enabled_tools setting has been saved.
 var defaultEnabledTools = []string{
 	"Bash", "WebFetch", "web_search",
 	"shell_open", "shell_send",
 	"Write", "Edit", "MultiEdit",
+	"ExecuteExtraTool", "Monitor",
 }
 
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on
 // first use.
 func New(d *db.DB) *Interceptor {
-	return &Interceptor{db: d, pending: newPendingManager()}
+	return &Interceptor{db: d, pending: newPendingManager(),
+		targets: dbTargetStore{d}, resolve: newResolveCache(systemResolver{}), dial: baseDial}
 }
 
 // Invalidate clears the in-memory rule cache and the enabled-tools cache.
@@ -164,47 +265,60 @@ func (i *Interceptor) Invalidate() {
 
 func (i *Interceptor) loadLocked() error {
 	rules, err := i.db.ListInterceptRules()
+	var val string
+	var ok bool
+	if err == nil {
+		val, ok, err = i.db.GetSetting("intercept_enabled_tools")
+	}
 	if err != nil {
+		if !i.loadFailed {
+			i.loadFailed = true
+			slog.Error("[intercept] the rule store cannot be read; every tool call is denied until it can", "err", err)
+		}
 		return err
 	}
+	i.loadFailed = false
 	var out []compiledRule
 	for _, r := range rules {
 		if !r.Enabled {
 			continue
 		}
-		cr := compiledRule{InterceptRule: r}
-		if r.MatchType == "regex" {
-			re, err := regexp.Compile(r.Pattern)
-			if err != nil {
-				continue // skip rules with bad regex rather than crashing
+		cr, compiled := compileRule(r)
+		if !compiled {
+			if r.Action != "deny" && r.Action != "ask" {
+				continue
 			}
-			cr.re = re
+			cr.bad, cr.Action = true, "deny"
+			cr.Message = "intercept rule [" + r.Name + "] has a pattern that does not compile; calls are blocked until the rule is fixed or disabled"
 		}
 		out = append(out, cr)
 	}
 	i.cached = out
-
-	// Load enabled-tools set from settings, falling back to hard-coded defaults.
-	val, ok, _ := i.db.GetSetting("intercept_enabled_tools")
-	if !ok {
-		m := make(map[string]bool, len(defaultEnabledTools))
-		for _, n := range defaultEnabledTools {
-			m[n] = true
-		}
-		i.enabledTools = m
-	} else {
-		var names []string
-		if json.Unmarshal([]byte(val), &names) != nil {
-			i.enabledTools = map[string]bool{}
-		} else {
-			m := make(map[string]bool, len(names))
-			for _, n := range names {
-				m[n] = true
-			}
-			i.enabledTools = m
-		}
-	}
+	i.enabledTools = enabledToolsFromSetting(val, ok)
 	return nil
+}
+
+func storeUnreadableDecision() Decision {
+	return Decision{Action: "deny", Message: "the intercept rules could not be loaded, so the call cannot be checked; it is blocked until the rule store is readable again"}
+}
+
+func enabledToolsFromSetting(val string, ok bool) map[string]bool {
+	m := make(map[string]bool, len(defaultEnabledTools))
+	for _, n := range defaultEnabledTools {
+		m[n] = true
+	}
+	if !ok {
+		return m
+	}
+	var names []string
+	if json.Unmarshal([]byte(val), &names) != nil {
+		return m
+	}
+	m = make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
 }
 
 func (i *Interceptor) rules() ([]compiledRule, error) {
@@ -242,7 +356,9 @@ func (i *Interceptor) IsToolEnabled(name string) bool {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.enabledTools == nil {
-		_ = i.loadLocked()
+		if err := i.loadLocked(); err != nil {
+			return true
+		}
 	}
 	return i.enabledTools[name]
 }
@@ -295,6 +411,7 @@ type Decision struct {
 	TimeoutEnabled   bool
 	TimeoutSeconds   int
 	TimeoutAction    string // "deny" | "allow"
+	JudgeAnswers     []db.JudgeAnswer
 }
 
 // --- LLM fallback judge ---
@@ -312,6 +429,14 @@ const (
 	settingJudgeAskTimeoutAction = "llm_judge_ask_timeout_action"
 	settingJudgeIncompleteScript = "llm_judge_incomplete_script_action"
 	settingJudgeConfidence       = "llm_judge_confidence_threshold"
+	settingJudgeMode             = "llm_judge_mode"
+)
+
+// Judge modes. Empty or unknown stays freeform so an upgrade keeps the existing
+// reviewer, including Jev. Closed is opt-in via llm_judge_mode=closed.
+const (
+	JudgeModeClosed   = "closed"
+	JudgeModeFreeform = "freeform"
 )
 
 // Judge default values.
@@ -340,6 +465,7 @@ type JudgeConfig struct {
 	AskTimeoutAction       string  `json:"ask_timeout_action"`       // allow|deny
 	IncompleteScriptAction string  `json:"incomplete_script_action"` // ask|model
 	ConfidenceThreshold    float64 `json:"confidence_threshold"`     // Jev only; below this becomes ask
+	Mode                   string  `json:"mode,omitempty"`           // closed|freeform; empty reads as freeform
 }
 
 // judgeConfig reads the judge configuration from settings, applying defaults for
@@ -357,6 +483,7 @@ func (i *Interceptor) judgeConfig() JudgeConfig {
 		AskTimeoutAction:       i.getSettingChoice(settingJudgeAskTimeoutAction, defaultJudgeAskTimeoutAction, "allow", "deny"),
 		IncompleteScriptAction: i.getSettingChoice(settingJudgeIncompleteScript, DefaultIncompleteScriptAction, "ask", "model"),
 		ConfidenceThreshold:    i.getSettingFloat(settingJudgeConfidence, defaultJudgeConfidence),
+		Mode:                   i.getSettingChoice(settingJudgeMode, JudgeModeFreeform, JudgeModeClosed, JudgeModeFreeform),
 	}
 	// Prompt: stored value if non-empty, else the built-in template.
 	if v, ok, _ := i.db.GetSetting(settingJudgePrompt); ok && strings.TrimSpace(v) != "" {
@@ -430,6 +557,13 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 	if err := i.db.SetBool(settingJudgeEnabled, c.Enabled); err != nil {
 		return err
 	}
+	mode := c.Mode
+	if mode != JudgeModeClosed && mode != JudgeModeFreeform {
+		mode = JudgeModeFreeform
+	}
+	if err := i.db.SetSetting(settingJudgeMode, mode); err != nil {
+		return err
+	}
 	if err := i.db.SetSetting(settingJudgeProfileID, strconv.FormatInt(c.ProfileID, 10)); err != nil {
 		return err
 	}
@@ -479,8 +613,12 @@ func (i *Interceptor) SetJudgeConfig(c JudgeConfig) error {
 func (i *Interceptor) Judge(ctx context.Context, tool string, arguments json.RawMessage) (Decision, bool) {
 	cfg := i.judgeConfig()
 	i.mu.RLock()
-	rv := i.reviewer
+	rv, cp := i.reviewer, i.completer
 	i.mu.RUnlock()
+	if cfg.Mode == JudgeModeClosed {
+		return judgeWith(ctx, cfg, rv, cp, tool, arguments)
+	}
+	_ = cp
 	if !cfg.Enabled || rv == nil {
 		return Decision{}, false
 	}
@@ -564,17 +702,100 @@ func judgeActionLabel(action string) string {
 	}
 }
 
+// judgeWith is the closed-question path and the freeform path the closed-judge
+// tests exercise. Production freeform and Jev stay in Judge unless mode is closed.
+// An empty mode here is closed, matching the closed-judge contract.
+func judgeWith(ctx context.Context, cfg JudgeConfig, rv Reviewer, cp Completer, tool string, arguments json.RawMessage) (Decision, bool) {
+	closed := cfg.Mode != JudgeModeFreeform
+	if !cfg.Enabled || (!closed && rv == nil) {
+		return Decision{}, false
+	}
+	cctx := ctx
+	if cfg.TimeoutSeconds > 0 {
+		var cancel context.CancelFunc
+		cctx, cancel = context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+		defer cancel()
+	}
+	var input ReviewInput
+	var contextErr error
+	if !closed {
+		input, contextErr = BuildReviewInput(cctx, tool, arguments)
+	}
+	policy := cfg.Prompt
+	cfg.Prompt = EffectiveJudgePrompt(cfg.Prompt)
+	var out Decision
+	var err error
+	var modelInput []byte
+	switch {
+	case closed:
+		out, modelInput = judgeClosed(cctx, cp, cfg.ProfileID, policy, tool, arguments)
+	case contextErr != nil:
+		out = Decision{Action: "ask", ModelFallback: true, Message: "review context incomplete, manual confirmation required: " + contextErr.Error()}
+	default:
+		modelInput, _ = json.Marshal(input)
+		out, err = rv(cctx, cfg.ProfileID, cfg.Prompt, input)
+	}
+	if err != nil {
+		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "model review failed, applying failure policy: " + err.Error()}
+	}
+	switch out.Action {
+	case "allow", "ask", "deny":
+	default:
+		out = Decision{ProfileID: out.ProfileID, ModelFallback: true, Action: cfg.FailAction, Message: "model output unparsable, applying failure policy"}
+	}
+	out.RuleID = 0
+	if len(modelInput) > 0 {
+		out.ModelInput = modelInput
+		out.ModelInputDigest = digestInput(modelInput)
+	}
+	if out.ProfileID != 0 {
+		cfg.ProfileID = out.ProfileID
+	}
+	out.ProfileID = cfg.ProfileID
+	configJSON, _ := json.Marshal(cfg)
+	out.ConfigDigest = digestInput(configJSON)
+	out.Message = JudgeReason(out.Action, out.Message)
+	if out.Action == "ask" {
+		out.TimeoutEnabled = true
+		out.TimeoutSeconds = cfg.AskTimeoutSeconds
+		out.TimeoutAction = cfg.AskTimeoutAction
+	}
+	return out, true
+}
+
+// JudgeReason prefixes a judge verdict so readers record decision_source=model.
+func JudgeReason(action, message string) string {
+	label := action
+	switch action {
+	case "allow":
+		label = "allow"
+	case "deny":
+		label = "deny"
+	case "ask":
+		label = "ask"
+	}
+	if message == "" {
+		return db.ModelReasonPrefix + " " + label
+	}
+	if !strings.HasPrefix(message, db.ModelReasonPrefix) {
+		return db.ModelReasonPrefix + " " + message
+	}
+	return message
+}
+
 // Match evaluates the rule list (priority DESC) against a tool call.
 // Returns (Decision, true) for the first matching enabled rule, or
 // (Decision{}, false) if no rule matches.
 func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	rules, err := i.rules()
-	if err != nil || len(rules) == 0 {
+	if err != nil {
+		return storeUnreadableDecision(), true
+	}
+	if len(rules) == 0 {
 		return Decision{}, false
 	}
-	values := inputStrings(input)
 	for _, r := range rules {
-		if ruleMatches(r, toolName, input, values) {
+		if ruleMatches(r, toolName, input) {
 			msg := r.Message
 			if msg == "" {
 				msg = defaultMessage(r.Action, r.Name)
@@ -594,12 +815,83 @@ func (i *Interceptor) Match(toolName string, input []byte) (Decision, bool) {
 	return Decision{}, false
 }
 
-// ruleMatches reports whether r applies to the call. tool_input rules are tried
-// against the raw JSON first, then against each decoded string value in values.
-// The raw form alone is not enough: JSON escapes newlines, tabs and quotes, and
-// Go's encoder also escapes & < >, so a rule like `\brm\b` never fires on
-// "cd /tmp\nrm -rf /var/www" (the raw bytes read `\nrm`, with no word boundary).
-func ruleMatches(r compiledRule, toolName string, input []byte, values []string) bool {
+const builtinRulePrefix = "[内置]"
+
+// MatchBuiltin is Match restricted to built-in deny rules. The local seed uses
+// the Chinese prefix 「[内置]」; the English 「[built-in]」 is accepted too.
+func (i *Interceptor) MatchBuiltin(toolName string, input []byte) (Decision, bool) {
+	i.mu.RLock()
+	loaded := i.cached != nil
+	i.mu.RUnlock()
+	if !loaded && i.db == nil {
+		return Decision{}, false
+	}
+	if !i.IsToolEnabled(toolName) {
+		return Decision{}, false
+	}
+	rules, err := i.rules()
+	if err != nil {
+		return storeUnreadableDecision(), true
+	}
+	for _, r := range rules {
+		if r.Action != "deny" || !isBuiltinRuleName(r.Name) || !ruleMatches(r, toolName, input) {
+			continue
+		}
+		msg := r.Message
+		if msg == "" {
+			msg = defaultMessage(r.Action, r.Name)
+		}
+		return Decision{RuleName: r.Name, Action: r.Action, Message: msg, RuleID: r.ID}, true
+	}
+	return Decision{}, false
+}
+
+func isBuiltinRuleName(name string) bool {
+	return strings.HasPrefix(name, builtinRulePrefix) || strings.HasPrefix(name, "[built-in]")
+}
+
+// SetRulesForTest installs rules without a database.
+func (i *Interceptor) SetRulesForTest(rules []db.InterceptRule) {
+	out := []compiledRule{}
+	for _, r := range rules {
+		if !r.Enabled {
+			continue
+		}
+		cr, ok := compileRule(r)
+		if !ok {
+			panic("SetRulesForTest: bad pattern " + r.Pattern)
+		}
+		out = append(out, cr)
+	}
+	tools := make(map[string]bool, len(defaultEnabledTools))
+	for _, n := range defaultEnabledTools {
+		tools[n] = true
+	}
+	i.mu.Lock()
+	i.cached, i.enabledTools = out, tools
+	i.mu.Unlock()
+}
+
+// ruleMatches reports whether r applies to the call. tool_input string and regex
+// rules are tried against the raw JSON and each decoded string, so a newline
+// escaped inside JSON still matches. argv rules match the parsed command.
+func ruleMatches(r compiledRule, toolName string, input []byte) bool {
+	if r.bad {
+		return true
+	}
+	if r.MatchType == "argv" {
+		if r.Action == "allow" {
+			if CheckArgvAllow(r.argv) != nil {
+				return false
+			}
+			return r.MatchTarget == "tool_input" && argvRuleMatches(r.argv, toolName, input)
+		}
+		if r.Action == "deny" || r.Action == "ask" {
+			return r.MatchTarget == "tool_input" && argvCompoundMatches(r.argv, toolName, input)
+		}
+		return false
+	}
+	values := inputStrings(input)
 	switch r.MatchTarget {
 	case "tool_name":
 		return r.matchString(toolName)
@@ -668,6 +960,9 @@ func defaultMessage(action, name string) string {
 // error is swallowed so logging never changes the tool call's outcome. The pending list
 // (status='pending') is unaffected, so it still shows only asks awaiting a decision.
 func (i *Interceptor) Log(ctx context.Context, convID int64, dec Decision, toolName string, input []byte, status string) {
+	if i.db == nil {
+		return
+	}
 	taskID, agentName := taskInfoFromCtx(ctx)
 	audit := auditFor(ctx, dec, input, status)
 	id, err := i.db.CreateDecidedIntercept(dec.RuleID, convID, taskID, agentName, toolName, input, status, dec.Message, audit)
@@ -697,7 +992,7 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 
 	i.bindResult(ctx, pendingID, audit)
 	ch := i.pending.add(pendingID)
-	defer i.pending.remove(pendingID)
+	defer i.pending.remove(pendingID, ch)
 	// Polling clients can decide after INSERT commits but before the channel is
 	// registered. Re-read after registration so that decision cannot be lost;
 	// later decisions will be delivered through ch.
@@ -770,8 +1065,16 @@ func (i *Interceptor) HandleAsk(ctx context.Context, convID int64, dec Decision,
 
 var ErrAlreadyDecided = errors.New("审批已处理或不存在，请刷新记录")
 
-// Decide resolves a pending request. Called by the HTTP decide endpoint.
-func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
+// Decide resolves a pending request. approver and remoteAddr are optional and
+// recorded on target-gate pins. Classic asks keep the existing Chinese reasons.
+func (i *Interceptor) Decide(pendingID int64, allowed bool, who ...string) error {
+	approver, remoteAddr := "", ""
+	if len(who) > 0 {
+		approver = who[0]
+	}
+	if len(who) > 1 {
+		remoteAddr = who[1]
+	}
 	status := "denied"
 	if allowed {
 		status = "allowed"
@@ -780,7 +1083,16 @@ func (i *Interceptor) Decide(pendingID int64, allowed bool) error {
 	if allowed {
 		action, reason = "allow", "人工允许执行"
 	}
-	resolved, err := i.db.ResolveIntercept(pendingID, status, action, reason, "manual")
+	targetKey, err := i.db.TargetRequestKey(pendingID)
+	if err != nil {
+		return err
+	}
+	var resolved bool
+	if targetKey != "" {
+		_, resolved, err = i.db.ResolveTargetRequest(pendingID, allowed, approver, remoteAddr)
+	} else {
+		resolved, err = i.db.ResolveInterceptBy(pendingID, status, action, reason, "human", approver, remoteAddr)
+	}
 	if err != nil {
 		return err
 	}

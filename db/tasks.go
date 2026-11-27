@@ -64,6 +64,8 @@ type Task struct {
 	// (task_scope kind=company)与此开关无关，永不受影响。见 db/task_scope.go。
 	CoverageEnabled   bool `json:"coverage_enabled"`
 	ShareGlobalAssets bool `json:"share_global_assets"`
+	// TargetGate is the opt-in asset approval gate. The default is false.
+	TargetGate bool `json:"target_gate"`
 	// WorkerCount is the per-task concurrent work-agent count. 0 means use the
 	// global settings.workers default when the engine starts this task.
 	WorkerCount int `json:"worker_count"`
@@ -213,6 +215,8 @@ type TaskCreateOptions struct {
 	InterceptRules []TaskInterceptRuleInput
 	// Zone is the execution zone. Empty means default.
 	Zone string
+	// TargetGate opts this task into the asset approval gate. Nil and false keep it off.
+	TargetGate *bool
 }
 
 // CreateTaskWithOptions creates an exploration, task, direct source relations,
@@ -297,13 +301,13 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		CompanyIDs:      append([]int64(nil), opts.CompanyIDs...),
 		NoResultSeconds: opts.NoResultSeconds, NoResultMinFindings: opts.NoResultMinFindings, NoResultMinSeverity: opts.NoResultMinSeverity,
 		TimeoutSeconds: opts.TimeoutSeconds, PlanHeartbeatSeconds: opts.PlanHeartbeatSeconds,
-		CoverageEnabled: coverageEnabled, ShareGlobalAssets: opts.ShareGlobalAssets, WorkerCount: opts.WorkerCount, Remark: opts.Remark,
+		CoverageEnabled: coverageEnabled, ShareGlobalAssets: opts.ShareGlobalAssets, TargetGate: opts.TargetGate != nil && *opts.TargetGate, WorkerCount: opts.WorkerCount, Remark: opts.Remark,
 		Zone: zone,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_global_assets, no_result_seconds, no_result_min_findings, no_result_min_severity, zone)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-RETURNING id, status, paused, created_at`, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity, zone).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_global_assets, target_gate, no_result_seconds, no_result_min_findings, no_result_min_severity, zone)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+RETURNING id, status, paused, created_at`, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.TargetGate != nil && *opts.TargetGate, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity, zone).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -440,11 +444,11 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), remark, category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_global_assets, COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason, COALESCE(zone,'default')`
+description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_global_assets, COALESCE(target_gate,false), COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason, COALESCE(zone,'default')`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason, &t.Zone); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.TargetGate, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason, &t.Zone); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil
@@ -490,6 +494,7 @@ type TaskPatch struct {
 	Remark            *string
 	Pinned            *bool
 	ShareGlobalAssets *bool
+	TargetGate        *bool
 	Zone              *string
 	WorkerCount       *int
 }
@@ -518,10 +523,11 @@ func (d *DB) UpdateTask(id int64, patch TaskPatch) (*Task, error) {
 		ELSE NULL
 	END,
 	share_global_assets = COALESCE($7::boolean, share_global_assets),
+	target_gate = COALESCE($11::boolean, target_gate),
 	zone = CASE WHEN $8::boolean THEN $9 ELSE zone END,
 	worker_count = COALESCE($10::integer, worker_count)
 WHERE id=$1 AND deleted_at IS NULL
-RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned, patch.Remark != nil, patch.Remark, patch.ShareGlobalAssets, patch.Zone != nil, patch.Zone, patch.WorkerCount))
+RETURNING `+taskCols, id, patch.Name != nil, patch.Name, patch.Pinned, patch.Remark != nil, patch.Remark, patch.ShareGlobalAssets, patch.Zone != nil, patch.Zone, patch.WorkerCount, patch.TargetGate))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -666,6 +672,7 @@ func (d *DB) SetStatusRuntime(id int64, status string) (int64, *time.Time, error
 UPDATE tasks
    SET status = $1,
        stop_reason = CASE WHEN $1 IN ('done','failed') OR ($1 NOT IN ('done','failed','timeout') AND status IN ('done','failed','timeout')) THEN '' ELSE stop_reason END,
+       end_reason = CASE WHEN $1 NOT IN ('done','failed','timeout') AND status IN ('done','failed','timeout') THEN '' ELSE end_reason END,
        pause_reason = CASE WHEN $1 IN ('done','failed','timeout') THEN '' ELSE pause_reason END,
        completed_at = CASE WHEN $1 IN ('done','failed','timeout') THEN COALESCE(completed_at, now()) ELSE NULL END,
        active_run_seconds = active_run_seconds + CASE WHEN $1 IN ('done','failed','timeout') AND run_segment_started_at IS NOT NULL THEN GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (now() - run_segment_started_at)))::bigint) ELSE 0 END,
@@ -682,8 +689,12 @@ UPDATE tasks
 // terminal, so a completed↔timeout race resolves to the first writer (won=true).
 // Returns won=false (no error) when another terminal status already stuck — the
 // caller then leaves it alone. Non-terminal transitions / re-run still use SetStatus.
-func (d *DB) SetTerminalStatusGuarded(id int64, status string) (won bool, err error) {
+func (d *DB) SetTerminalStatusGuarded(id int64, status string, endReason ...string) (won bool, err error) {
 	_, _, won, err = d.SetTerminalStatusGuardedRuntime(id, status)
+	if err != nil || !won || len(endReason) == 0 || endReason[0] == "" {
+		return won, err
+	}
+	_, err = d.Exec(`UPDATE tasks SET end_reason=$2 WHERE id=$1`, id, endReason[0])
 	return won, err
 }
 
@@ -874,6 +885,14 @@ DELETE FROM assets a USING deletable d WHERE a.id=d.id`, id, expID)
 	}
 	// llm_usage (the token metering ledger) is intentionally NOT deleted with the
 	// task — it is kept as historical accounting even after the task is gone.
+	// Target pins and approval rows stay as history: pins are revoked and open
+	// target requests are settled in this transaction.
+	if err := revokeTaskPins(tx, id); err != nil {
+		return result, err
+	}
+	if err := settleTaskTargetRequests(tx, id); err != nil {
+		return result, err
+	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1`, id); err != nil {
 		return result, err
 	}

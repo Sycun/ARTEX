@@ -47,6 +47,27 @@ CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(task_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_exp   ON llm_usage(exploration_id);
 `
 
+// TaskLLMSpend sums planner, worker, judge and compactor calls for one task.
+// Input tokens already include cache buckets, so those columns are not added again.
+func (d *DB) TaskLLMSpend(taskID string) (tokens, turns int64, err error) {
+	if d == nil || taskID == "" {
+		return 0, 0, nil
+	}
+	err = d.QueryRow(`SELECT COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
+FROM llm_usage
+WHERE task_id=$1 AND worker IN ('planner', 'worker', 'judge', 'compactor')`, taskID).Scan(&tokens, &turns)
+	return tokens, turns, err
+}
+
+// ClearRunEndReason drops a previous run's end_reason once the task is running again.
+func (d *DB) ClearRunEndReason(taskID int64) error {
+	if d == nil || taskID <= 0 {
+		return nil
+	}
+	_, err := d.Exec(`UPDATE tasks SET end_reason='' WHERE id=$1 AND status NOT IN ('done','failed','timeout')`, taskID)
+	return err
+}
+
 // EnsureLLMUsageTable creates the llm_usage metering table if it does not exist.
 func (d *DB) EnsureLLMUsageTable() error {
 	tx, err := d.Begin()

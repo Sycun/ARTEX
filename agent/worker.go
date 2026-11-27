@@ -150,6 +150,18 @@ func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, w
 
 // defaultToolsExcept returns actool.DefaultTools() minus the named tools (by
 // CoreTool.Name()). Used to trim SDK default tools an agent shouldn't have.
+func writeIntentAutoScope(as *db.AssetStore, taskID int64, assets []*db.Asset, coverageEnabled bool) {
+	if as == nil || !coverageEnabled {
+		return
+	}
+	for _, a := range assets {
+		if a == nil {
+			continue
+		}
+		_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
+	}
+}
+
 func defaultToolsExcept(exclude ...string) []actool.CoreTool {
 	drop := make(map[string]bool, len(exclude))
 	for _, n := range exclude {
@@ -233,7 +245,9 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 - **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
 
 
-完成本意图后用一句话总结你做了什么、写回了哪些事实。`
+完成本意图后用一句话总结你做了什么、写回了哪些事实。
+
+Declare the source of every recorded fact: target_response, tool_output, third_party_intel, operator_input, inference.`
 
 // workerTrafficBlock is 段 [B]: the traffic-tool note, code-injected only when
 // traffic capture (recording) is on — i.e. the traffic_* tools actually exist.
@@ -283,7 +297,7 @@ func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	// caCert is present only when the recording MITM is on, which is exactly when
 	// the traffic_* tools are registered — so it gates the traffic-tool note.
 	// Optional finding guidance is added for every role after tool resolution.
-	return body + workerTrafficBlock(caCert != "") + workerArtifactSpec(runDir)
+	return body + workerTrafficBlock(caCert != "") + untrustedContentTail(body) + noiseProfileBlock() + workerArtifactSpec(runDir)
 }
 
 // renderIntentTask formats the claimed intent for the worker's launch USER message:
@@ -315,19 +329,18 @@ func renderIntentTask(intent *db.Node) string {
 // must NOT widen the worker's job — it still does only its assigned intent. Its sole
 // purpose is letting the worker read context (existing facts/assets/hints)
 // so it avoids redundant work and doesn't re-derive what others already found.
-func renderWorkerGraphOverview(data map[string]any) string {
+func renderWorkerGraphOverview(data map[string]any, env dataEnvelope) string {
 	// coverage 是给规划者判断「哪类测得少 / 要不要扩范围」的信号，与 worker「只做领到的
-	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。data 是本次 worker
-	// 专属的新 map，删键不影响 planner。
+	// 那条意图、别追未覆盖的点」的职责边界相悖 → 从 worker 视图里剔除。
 	delete(data, "coverage")
-	b, err := json.Marshal(data)
-	if err != nil {
-		return "" // fall back silently: the worker just won't have the global context
+	sections := renderOverviewSections(data, env)
+	if sections == "" {
+		return ""
 	}
 	return "\n\n【全局探索态势（只读，帮你把自己这条意图放进大局看）】：\n" +
 		"下面是整个任务当前的探索概况。用途有两个：一是知道别人已发现什么，别重复；二是让你探自己这条意图时，能联想到它和全局的关系。\n" +
 		"**发散是好事**：探本意图时尽管深想、多联想。唯一的界线是——别真的动手去执行别的意图（那是别的 worker 的事，由规划者调度）。但凡你联想到有价值的线索（跨资产的联动、疑似另一条利用链的入口、全局层面的可疑点），**务必写进 fact 交规划者**——这是你重要的产出，不是可有可无。宁可多报一条让规划者判断，也别自己咽下去。\n" +
-		string(b)
+		env.intro() + sections
 }
 
 // Execute runs one intent. hooks (the per-task Guard) gates every tool call; may
@@ -355,6 +368,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
+	tsx.SetWorkBase(w.workDir)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {
@@ -385,7 +399,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData())
+	overview := renderWorkerGraphOverview(tsx.graphOverviewData(), newDataEnvelope())
 	proxyAddr := w.proxyAddr
 	if w.proxyAddrFn != nil {
 		proxyAddr = w.proxyAddrFn()
@@ -446,7 +460,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		// Bash 子命令的 HTTP 默认走记录代理 + 信任其 CA（工具无需 -x/-k）。
 		BashEnv:    proxyEnv(proxyAddr, w.proxyCACert),
 		WorkingDir: runDir,
-		MaxTurns:   w.maxTurns, // 0 = unlimited (configurable in agent management)
+		MaxTurns:   w.turnCap(ctx), // 0 = unlimited; an intent budget clamps it when one is set
 		// 墙钟预算,轮边界判,不打断半路;0 = 不限。有任务级 deadline 时夹逼到 min(自身预算,
 		// 距 deadline 剩余),让本 run 在任务到点时自然进收尾(见 taskclock.go)。
 		MaxDuration: maxDur,
@@ -456,11 +470,12 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		Settlement: settle,
 		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
 		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
-		ToolOutputDir: cmdOutDir(runDir),
-		Compaction:    compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
-		Todos:         actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
-		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
-		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		ToolOutputDir:           cmdOutDir(runDir),
+		Compaction:              compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
+		Todos:                   actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
+		NonStreaming:            w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
+		MaxTokens:               w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
+		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks

@@ -85,10 +85,24 @@ func (e *Engine) taskDeadline(t *Task) int64 {
 // stamps a fresh full budget. coordStarted is reset because the coordinator that
 // produced the timeout has already completed (or is in its final return path).
 func (e *Engine) resetTimeoutRevival(taskID string) {
-	e.settling.Delete(taskID)
+	e.resetSettledRun(taskID)
 	e.deadline.Delete(taskID)
 	e.stamped.Delete(taskID)
 	e.coordStarted.Delete(taskID)
+}
+
+// resetSettledRun clears settle state so a revived task can plan again.
+// The next budget ledger is seeded from llm_usage.
+func (e *Engine) resetSettledRun(taskID string) {
+	e.settling.Delete(taskID)
+	e.budgets.Delete(taskID)
+	if e.m != nil && e.m.pg != nil {
+		if n, err := strconv.ParseInt(taskID, 10, 64); err == nil {
+			if err := e.m.pg.ClearRunEndReason(n); err != nil {
+				log.Printf("[budget] task %s failed to clear end_reason: %v", taskID, err)
+			}
+		}
+	}
 }
 
 // stampFirstRun records first_run_at + deadline_at on the FIRST real run (LLM ready)
@@ -326,8 +340,11 @@ func (e *Engine) runFinalPlannerRound(ctx context.Context, t *Task, reason strin
 	defer e.decInflight(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	label := "任务超时收尾"
-	if reason == db.StopReasonNoResult {
+	switch reason {
+	case db.StopReasonNoResult:
 		label = "无成果止损收尾"
+	case "budget":
+		label = "预算用尽收尾"
 	}
 	e.emitActivity(t, db.Activity{Worker: "planner", Kind: "round",
 		Summary: fmt.Sprintf("%s·终局判定(第 %d 轮)", label, e.nextPlannerRound(t.ID))})

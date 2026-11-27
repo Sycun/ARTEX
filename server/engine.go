@@ -139,6 +139,7 @@ type Engine struct {
 
 	// 任务级超时(见 docs/任务级超时与收尾设计.md):
 	settling     sync.Map // taskID -> bool, 任务已进入收尾时序(停止派/领新意图)
+	budgets      sync.Map // taskID -> *agent.BudgetLedger; absent means no env budget
 	deadline     sync.Map // taskID -> int64 unix, 绝对截止时刻(首次运行时盖章;0/缺省=不限)
 	stamped      sync.Map // taskID -> bool, first_run_at 是否已盖章(本进程内只盖一次)
 	inflight     sync.Map // taskID -> *int64, 在跑的 planner.Plan + worker.Execute 计数(用于 drain)
@@ -563,6 +564,7 @@ type steerHooks struct {
 	// nudges 是本条意图已注入的空转续跑次数，上限 limit。指针:harness 持有的是
 	// steerHooks 的值拷贝，计数必须共享同一份。
 	nudges *atomic.Int64
+	budget *agent.IntentMeter
 	// limit 是空转续跑的次数上限，由 Engine.emptyTurnNudgeLimit() 从「空响应重试
 	// 次数」解析而来。<=0 = 不介入(用户显式关掉了这层)。
 	limit int
@@ -605,6 +607,9 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 }
 
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
+	if h.budget != nil && h.budget.Exhausted() && agent.BudgetWrapupBlocks(name) {
+		return true, agent.WorkerBudgetWrapup, nil
+	}
 	if msg, ok := h.drain(); ok {
 		return true, "【规划者实时纠偏】" + msg +
 			"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
@@ -962,6 +967,10 @@ func (e *Engine) plannerLoop(ctx context.Context, t *Task) {
 		// what fired this round (worker done / finding; may be several — debounce
 		// coalesces a burst; empty for time/heartbeat wakes).
 		triggers := t.drainTriggers()
+		if e.budgetStop(ectx, t) {
+			return
+		}
+		ectx = e.budgetRoundCtx(ectx, t, false)
 		taskIDInt, _ := strconv.ParseInt(t.ID, 10, 64)
 		e.BeginLLMCall(t.ID)
 		met, reason, err := planner.Plan(ectx, taskIDInt, e.m.assets, t.Store, t.Goal, triggers, emit)
@@ -1120,14 +1129,29 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	label := fmt.Sprintf("%s · #%d", name, iid)
 	workCtx = intercept.WithTaskContext(workCtx, t.ID, label, taskEmit)
+	if id, err := strconv.ParseInt(t.ID, 10, 64); err == nil {
+		if on, err := e.m.pg.TaskTargetGate(id); err == nil && on && e.m.interceptor != nil {
+			workCtx = intercept.WithTargetScope(workCtx, intercept.TargetScope{
+				TaskID:      t.ID,
+				Enabled:     func() bool { return true },
+				WaitBound:   intercept.DefaultTargetWaitBound,
+				Interceptor: e.m.interceptor,
+			})
+		}
+	}
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
+	workCtx, meter := e.budgetIntent(workCtx, t.ID)
 	hooks := steerHooks{
 		inner:  t.Guard.Hooks(),
 		drain:  func() (string, bool) { return e.drainSteer(iid) },
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
+		budget: meter,
+	}
+	if meter != nil {
+		defer meter.Finish()
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	e.BeginLLMCall(t.ID)
@@ -1374,6 +1398,9 @@ func sleepCtx(ctx context.Context, d time.Duration) (done bool) {
 }
 
 func (e *Engine) claimNext(t *Task, name string) *db.Node {
+	if e.budgetBlocksClaim(t.ID) {
+		return nil
+	}
 	fr, _ := t.Store.Frontier(20)
 	for _, in := range fr {
 		if ok, _ := t.Store.ClaimIntent(in.ID, name); ok {

@@ -63,6 +63,9 @@ type ToolSet struct {
 	// auto-scope hook (insertAssets) is skipped, and add_task_scope/list_untested_assets
 	// are filtered out of the agent's tool list. The scope field stays regardless.
 	coverageDisabled bool
+	// workBase is the data directory run directories live under. ingest tools
+	// open files only inside a run directory below it. Empty refuses every path.
+	workBase string
 	// ownerNode is the exploration node that writes attach to: assets this run
 	// touches get anchored to it as lineage/provenance (NOT visibility — the asset
 	// graph is global and shared). Worker = its claimed intent; planner = begin root.
@@ -87,7 +90,10 @@ type ToolSet struct {
 	// notifyFinding, if set, wakes the task's planner when this run reports a finding,
 	// carrying (intentID, summary) so the round can spell out which intent found what.
 	// Wired for workers; nil elsewhere → falls back to notify (bare wake).
-	notifyFinding func(intentID int64, summary string)
+	notifyFinding       func(intentID int64, summary string)
+	triage              TriageClient
+	factTraffic         FactTrafficLookup
+	trafficProofChecker func(ctx context.Context, trafficID string) (bool, error)
 	// resumeTask, if set, revives the task after a graph change that should make a
 	// stopped task run again (currently: set_goals adds a goal). It flips a terminal/
 	// paused task back to running and (re)starts the engine loops — a plain notify()
@@ -181,6 +187,8 @@ func (t *ToolSet) SetTaskID(id int64) { t.taskID = id }
 // asset queries), not merely a coverage denominator.
 func (t *ToolSet) SetCoverageEnabled(enabled bool) { t.coverageDisabled = !enabled }
 
+func (t *ToolSet) SetWorkBase(base string) { t.workBase = base }
+
 // CoverageDisabled reports whether the coverage feature is off for this task.
 func (t *ToolSet) CoverageDisabled() bool { return t.coverageDisabled }
 
@@ -191,7 +199,7 @@ func (t *ToolSet) CoverageDisabled() bool { return t.coverageDisabled }
 // (the filter basis for asset queries), not merely a coverage denominator, so the
 // agents that own范围定义 keep it either way — in lockstep with insertAssets'
 // auto-scope hook, which also runs regardless of the switch.
-var coverageOnlyTools = map[string]bool{"list_untested_assets": true}
+var coverageOnlyTools = map[string]bool{"list_untested_assets": true, "record_coverage": true}
 
 // DropCoverageTools returns tools with the coverage-only ones removed when this
 // task has the feature disabled; otherwise it returns tools unchanged.
@@ -294,8 +302,12 @@ func readTool(name, desc string, schema map[string]any, run func(context.Context
 }
 
 func writeTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
+	return writeToolOpts(name, desc, schema, run, false)
+}
+
+func writeToolOpts(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error), rawInput bool) actool.CoreTool {
 	return actool.Build(actool.Spec{
-		Name: name, Description: desc, Schema: schema,
+		Name: name, Description: desc, Schema: schema, RawInput: rawInput,
 		Permissions: func(context.Context, json.RawMessage, acperm.Context) acperm.Decision { return acperm.Allowed() },
 		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			return run(ctx, in)
@@ -316,7 +328,7 @@ func (t *ToolSet) readExpTool(name, desc string, schema map[string]any, run func
 }
 
 func (t *ToolSet) writeExpTool(name, desc string, schema map[string]any, run func(context.Context, json.RawMessage) (actool.Result, error)) actool.CoreTool {
-	return writeTool(name, desc, schema, t.needExploration(name, run))
+	return writeToolOpts(name, desc, schema, t.needExploration(name, run), name == "record_fact")
 }
 
 // needExploration wraps a handler so it only runs with an exploration store.
@@ -879,6 +891,15 @@ func compactNode(n *db.Node) map[string]any {
 	var p map[string]any
 	_ = json.Unmarshal(n.Payload, &p)
 	m := map[string]any{"id": n.ID, "state": n.State, "summary": p["summary"]}
+	if n.Origin != "" {
+		m["origin"] = n.Origin
+	}
+	if src, ok := p["source"].(string); ok && src != "" {
+		m["source"] = src
+	}
+	if prov, ok := p["provenance"].(string); ok && prov != "" {
+		m["provenance"] = prov
+	}
 	if n.Inherited {
 		inheritedMap(m, n.SourceTaskID)
 	}
@@ -1183,7 +1204,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			"evidence_id": idp("证明它的发现/事实节点 id"),
 			"reason":      str("为什么这个证据满足该目标"),
 		}, "goal_id", "evidence_id"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
@@ -1201,6 +1222,42 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
+			}
+			if evidenceNode.Kind == db.KindFact {
+				var fp map[string]any
+				_ = json.Unmarshal(evidenceNode.Payload, &fp)
+				if prov, ok := fp["provenance"].(string); ok && prov == factProvenanceUnverified {
+					note, _ := fp["provenance_note"].(string)
+					if note == "" {
+						note = "its evidence is not tied to a recorded activity"
+					}
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d is unverified (%s). Goal %d stays open: prove it with a finding or with a fact whose evidence quotes this intent's recorded activity.", ev, note, goal)), nil
+				}
+				confidence, _ := fp["confidence"].(string)
+				if strings.ToLower(strings.TrimSpace(confidence)) != "observed" {
+					if confidence == "" {
+						confidence = "none"
+					}
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has confidence %q, and a fact proves a goal only when its confidence is \"observed\" (seen directly in tool output). Goal %d stays open: prove it with a finding backed by verified bound traffic or with an observed tool_output fact.", ev, confidence, goal)), nil
+				}
+				if source, _ := fp["source"].(string); strings.ToLower(strings.TrimSpace(source)) == factSourceTargetResponse {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: fact %d has source \"target_response\" (its content comes from the target, which could have planted it), and such a fact never proves a goal. Goal %d stays open: prove it with a finding backed by verified bound traffic or with an observed fact from another source.", ev, goal)), nil
+				}
+			}
+			if evidenceNode.Kind == db.KindFinding {
+				var payload map[string]any
+				_ = json.Unmarshal(evidenceNode.Payload, &payload)
+				status, _ := payload["status"].(string)
+				if findingTriageBlocksGoal(status) {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: finding %d has status %q, and a false_positive, duplicate, or ignored finding never proves a goal. Goal %d stays open: prove it with a confirmed finding or with an observed fact.", ev, status, goal)), nil
+				}
+				check, err := t.ts.VerifyFindingProofForNode(ctx, evidenceNode.ID, t.trafficProofChecker)
+				if err != nil {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused (fail-closed): finding %d proof verification unavailable (%v). Goal %d stays open.", ev, err, goal)), nil
+				}
+				if !check.Proven {
+					return actool.Errorf(fmt.Sprintf("prove_goal refused: finding %d cannot close goal %d (%s). The finding remains recorded and visible; bind at least one verified traffic_ref matching the finding's asset via bind_finding_traffic, or for non-HTTP goals prove with an observed tool_output fact. Goal %d stays open.", ev, goal, check.Reason, goal)), nil
+				}
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")
@@ -1253,6 +1310,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			AssetIDs                                     []json.RawMessage `json:"asset_ids"`
 			TrafficRefs                                  []db.TrafficRef   `json:"traffic_refs"`
 			EvidenceHintID                               json.RawMessage   `json:"evidence_hint_id"`
+			ForceRegister                                bool              `json:"force_register"`
 		}
 		if err := json.Unmarshal(in, &a); err != nil {
 			return actool.Errorf(err.Error()), nil
@@ -1276,6 +1334,33 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			return actool.Errorf(err.Error()), nil
 		}
 		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
+		if !a.ForceRegister {
+			if dup, ok := t.fingerprintDuplicate(input); ok {
+				res := map[string]any{
+					"duplicate_of_finding_id":      dup.FindingID,
+					"duplicate_of_finding_node_id": dup.NodeID,
+					"dedup_source":                 "fingerprint",
+					"fingerprint":                  dup.Fingerprint,
+					"evidence_status":              "duplicate_not_registered",
+					"note": fmt.Sprintf("Deterministic fingerprint (%s) matched already registered finding_id %d (exploration node %d), so no new finding was created. "+
+						"To extend that finding with new evidence, call update_finding_report with finding_id=%d. "+
+						"If the new evidence is in fact a distinct defect, call report_finding again with force_register=true.",
+						dup.Fingerprint, dup.FindingID, dup.NodeID, dup.NodeID),
+				}
+				raw, _ := json.Marshal(res)
+				return actool.Text(fmt.Sprintf("finding matched existing finding_id %d (node %d, fingerprint %s) — not registered again\n%s", dup.FindingID, dup.NodeID, dup.Fingerprint, raw)), nil
+			}
+			if ans, ok := t.triageDuplicate(ctx, input); ok && triageDuplicateHit(ans) {
+				res := map[string]any{
+					"duplicate_of_finding_id":      ans.DuplicateOf,
+					"duplicate_of_finding_node_id": ans.DuplicateOfNode,
+					"triage_confidence":            ans.Confidence,
+					"evidence_status":              "duplicate_not_registered",
+				}
+				raw, _ := json.Marshal(res)
+				return actool.Text(fmt.Sprintf("finding matched existing finding_id %d\n%s", ans.DuplicateOf, raw)), nil
+			}
+		}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1326,14 +1411,26 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 // must NOT be stuffed into the asset graph via upsert_asset.
 // factItem 是 record_fact 批量/单条的一条事实。
 type factItem struct {
-	Intelligence []db.IntelligenceInput `json:"intelligence"`
-	Summary      string                 `json:"summary"`
-	Detail       string                 `json:"detail"`
-	Evidence     string                 `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
-	Confidence   string                 `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
-	IntentID     json.RawMessage        `json:"intent_id"`
-	AssetIDs     []json.RawMessage      `json:"asset_ids"`
+	Intelligence   []db.IntelligenceInput `json:"intelligence"`
+	Summary        string                 `json:"summary"`
+	Detail         string                 `json:"detail"`
+	Evidence       string                 `json:"evidence"`   // 一行关键证据（命令+关键输出行），支撑结论、便于事后核对
+	Confidence     string                 `json:"confidence"` // observed（直接看到）| inferred（据现象推断）
+	Source         string                 `json:"source,omitempty"`
+	IntentID       json.RawMessage        `json:"intent_id"`
+	AssetIDs       []json.RawMessage      `json:"asset_ids"`
+	TestedAssetIDs []json.RawMessage      `json:"tested_asset_ids,omitempty"`
 }
+
+var factSources = []string{factSourceTargetResponse, factSourceToolOutput, factSourceThirdPartyIntel, factSourceOperatorInput, factSourceInference}
+
+const (
+	factSourceTargetResponse  = "target_response"
+	factSourceToolOutput      = "tool_output"
+	factSourceThirdPartyIntel = "third_party_intel"
+	factSourceOperatorInput   = "operator_input"
+	factSourceInference       = "inference"
+)
 
 // recordOneFact 写一条 fact 节点并连到意图（intent→yields→fact）。defaultIntent 为
 // 批量时的默认意图（本条未给 intent_id 时用）。
@@ -1341,15 +1438,13 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
-	payload := map[string]any{"summary": it.Summary}
-	if it.Detail != "" {
-		payload["detail"] = it.Detail
+	source, err := normalizeFactSource(it.Source)
+	if err != nil {
+		return 0, err
 	}
-	if e := strings.TrimSpace(it.Evidence); e != "" {
-		payload["evidence"] = e
-	}
-	if c := strings.TrimSpace(it.Confidence); c != "" {
-		payload["confidence"] = c
+	anchors, err := it.factAssetAnchors()
+	if err != nil {
+		return 0, err
 	}
 	intent := pid(it.IntentID)
 	if intent <= 0 {
@@ -1361,13 +1456,44 @@ func (t *ToolSet) recordOneFact(it factItem, defaultIntent int64) (int64, error)
 			return 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
-	// a fact is its OWN node kind (distinct from a vuln finding).
-	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, pidList(it.AssetIDs))
+	confidence := strings.TrimSpace(it.Confidence)
+	prov, provActivity, provTraffic, provNote := t.factProvenance(source, it.Evidence, intent)
+	if prov == factProvenanceUnverified {
+		if source == factSourceTargetResponse || source == factSourceToolOutput {
+			source = factSourceInference
+		}
+		if strings.EqualFold(confidence, "observed") {
+			confidence = "inferred"
+		}
+	}
+	if prov == factProvenanceCaptured {
+		source = factSourceTargetResponse
+	}
+	payload := map[string]any{"summary": it.Summary, "source": source, "provenance": prov}
+	if it.Detail != "" {
+		payload["detail"] = it.Detail
+	}
+	if e := strings.TrimSpace(it.Evidence); e != "" {
+		payload["evidence"] = e
+	}
+	if confidence != "" {
+		payload["confidence"] = confidence
+	}
+	if provActivity > 0 {
+		payload["provenance_activity_id"] = provActivity
+	}
+	if provTraffic != "" {
+		payload["provenance_traffic_id"] = provTraffic
+	}
+	if provNote != "" {
+		payload["provenance_note"] = provNote
+	}
+	id, err := t.ts.AddNode(db.KindFact, payload, 5, "confirmed", t.worker, anchors)
 	if err != nil {
 		return 0, err
 	}
 	if intent > 0 {
-		_ = t.ts.Link(intent, db.RelYields, id) // chain: intent -> fact
+		_ = t.ts.Link(intent, db.RelYields, id)
 	}
 	t.writes.Facts++
 	return id, nil
@@ -1380,28 +1506,21 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。evidence 与 confidence 用来防止不准确的结论污染图谱：\n"+
 		"  · evidence=支撑本结论的【一行】关键证据（命令+最能证明的那一两行输出），**务必简洁**——细节已在 detail，这里不要再粘大段输出。\n"+
 		"  · confidence=observed（输出里直接看到）| inferred（据现象推断）。\n"+
-		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。",
-		obj(map[string]any{
-			"facts":      map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段（summary/detail/evidence/confidence/intent_id/asset_ids）；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
-			"intent_id":  idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
-			"detail":     str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
-			"evidence":   str("【一行】关键证据：命令 + 最能证明结论的那一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"confidence": str("observed（输出里直接看到）| inferred（据现象推断）。否定结论务必如实标注。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
-		}),
+		"  · **否定类结论**（不可注入/端口关闭/未发现入口等）只写\"观察 + 试探性读法\"——陈述你实际看到什么，方向是否放弃由规划者综合全局定；务必给 evidence，手段没穷尽或证据弱（含只探一次、看起来像）标 inferred，确已穷尽且直接看到才标 observed。"+recordFactContractNote,
+		recordFactSchema(),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
-			var a struct {
-				Facts    []factItem `json:"facts"`
-				factItem            // 单条模式 + 批量默认 intent_id
+			a, batch, err := decodeRecordFactInput(in)
+			if err != nil {
+				return actool.Errorf("invalid record_fact input: " + err.Error() + "; no facts were written"), nil
 			}
-			_ = json.Unmarshal(in, &a)
-			batch := len(a.Facts) > 0
 			items := a.Facts
 			if !batch {
 				items = []factItem{a.factItem}
 			}
-			defaultIntent := pid(a.factItem.IntentID) // 顶层 intent_id = 批量默认
+			defaultIntent := pid(a.factItem.IntentID)
+			if defaultIntent <= 0 {
+				defaultIntent = t.runningIntent()
+			}
 
 			ids := make([]int64, len(items))
 			errs := map[string]string{}
@@ -1429,7 +1548,7 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 				}
 			}
 
-			if !batch { // 单条：保持原返回
+			if !batch {
 				if e, bad := errs["0"]; bad {
 					return actool.Errorf(e), nil
 				}
@@ -1438,9 +1557,23 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			out := map[string]any{"ids": ids}
 			if len(errs) > 0 {
 				out["errors"] = errs
+				out["retry_instruction"] = "Retry only failed indices with complete facts, including summary. Successful indices were already saved; do not retry them."
 			}
-			return jsonResult(out)
+			result, err := jsonResult(out)
+			result.IsError = len(errs) > 0
+			return result, err
 		})
+}
+
+func (t *ToolSet) runningIntent() int64 {
+	if t.ts == nil || t.ownerNode <= 0 {
+		return 0
+	}
+	node, err := t.ts.GetNode(t.ownerNode)
+	if err != nil || node == nil || node.Kind != db.KindIntent {
+		return 0
+	}
+	return node.ID
 }
 
 type hintItem struct {
@@ -2076,7 +2209,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
 		t.killWorkTool(), t.steerWorkTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
-		t.addFinding(),
+		t.addFinding(), t.knowledgeLookup(),
 		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。
 		t.listCompanies(),
 		// list_assets：规划时按 DSL 检索全资产库（配合 list_untested_assets 的"范围内未测"视角，

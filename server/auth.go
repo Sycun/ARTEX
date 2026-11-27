@@ -98,6 +98,18 @@ func signJWT(key []byte) (string, error) {
 	}).SignedString(key)
 }
 
+// approver is who a human decision is recorded for. Enterprise sessions use the
+// actor id; the standalone session token's subject is ARTEX.
+func (s *Server) approver(r *http.Request) string {
+	if actor, ok := currentActor(r); ok && actor.ID != "" {
+		return actor.ID
+	}
+	if verifyJWT(s.extractToken(r), s.jwtKey) {
+		return "ARTEX"
+	}
+	return ""
+}
+
 // verifyJWT returns true when tokenStr is a valid, non-expired HS256 token.
 func verifyJWT(tokenStr string, key []byte) bool {
 	claims := jwt.MapClaims{}

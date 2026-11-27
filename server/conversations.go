@@ -559,7 +559,16 @@ func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) {
 func (s *Server) conversationRunContext(id int64, busyKey string) (context.Context, context.CancelCauseFunc) {
 	// Per-run cancellable context so a manual stop (pgStopConversation) can abort
 	// just this session. Registered under chatMu so the stop handler can find it.
-	ctx, cancel := context.WithCancelCause(intercept.WithConvID(s.ctx, id))
+	base := intercept.WithConvID(s.ctx, id)
+	if on, err := s.m.pg.ConversationTargetGate(id); err == nil && on && s.m.interceptor != nil {
+		base = intercept.WithTargetScope(base, intercept.TargetScope{
+			ConversationID: id,
+			Enabled:        func() bool { return true },
+			WaitBound:      intercept.DefaultTargetWaitBound,
+			Interceptor:    s.m.interceptor,
+		})
+	}
+	ctx, cancel := context.WithCancelCause(base)
 	s.chatMu.Lock()
 	s.chatCancel[busyKey] = cancel
 	s.chatMu.Unlock()

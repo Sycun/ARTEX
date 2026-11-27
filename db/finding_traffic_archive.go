@@ -75,9 +75,17 @@ func normalizeArchivedFindingVersions(raw json.RawMessage) (json.RawMessage, err
 		return nil, err
 	}
 	for _, row := range rows {
-		for _, key := range []string{"evidence_version", "report_evidence_version"} {
+		for _, key := range []string{"evidence_version", "report_evidence_version", "poe_level"} {
 			if row[key] == nil {
 				row[key] = 0
+			}
+		}
+		if row["verification_status"] == nil {
+			row["verification_status"] = "unverified"
+		}
+		for _, key := range []string{"verification_note", "counterevidence", "confidence_rationale", "report_state"} {
+			if row[key] == nil {
+				row[key] = ""
 			}
 		}
 	}

@@ -2262,3 +2262,136 @@ BEGIN
     RETURN part;
 END;
 $$;
+
+
+-- =====================================================================
+-- Phase 2: BaaRai agent hardening (idempotent; do not replace earlier sections).
+-- Target gate, POE verification, report stage, lessons and coverage ledger.
+-- Fresh and existing databases both re-run this file on startup.
+-- =====================================================================
+
+-- Opt-in asset target gate. false keeps every existing task and conversation unchanged.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
+-- Why the current run ended ('' = normal). Cleared when a task leaves a terminal state.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS end_reason TEXT NOT NULL DEFAULT '';
+
+-- argv prefix rules. string and regex stay valid. The inline CHECK on a fresh
+-- CREATE is replaced so existing databases pick up argv without a second runner.
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_match_type_check;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_match_type_check
+    CHECK (match_type IN ('string','regex','argv'));
+
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS target_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_intercept_pending_target
+    ON intercept_pending (COALESCE(task_id,''), COALESCE(conversation_id,0), target_key)
+    WHERE status = 'pending' AND target_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS target_pins (
+    id              BIGSERIAL PRIMARY KEY,
+    task_id         BIGINT,
+    conversation_id BIGINT,
+    host            TEXT NOT NULL,
+    port            INTEGER NOT NULL DEFAULT 0,
+    version         INTEGER NOT NULL DEFAULT 1,
+    pinned_ips      TEXT[] NOT NULL DEFAULT '{}',
+    resolver        TEXT NOT NULL DEFAULT '',
+    resolved_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status          TEXT NOT NULL DEFAULT 'active',
+    intercept_id    BIGINT,
+    decided_by      TEXT NOT NULL DEFAULT '',
+    decided_from    TEXT NOT NULL DEFAULT '',
+    name_only_effective BOOLEAN NOT NULL DEFAULT false,
+    revoked_at      TIMESTAMPTZ,
+    revoked_reason  TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_target_pins_active
+    ON target_pins (COALESCE(task_id,0), COALESCE(conversation_id,0), host, port)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_target_pins_scope ON target_pins (task_id, conversation_id, status);
+
+CREATE TABLE IF NOT EXISTS target_gate_exemption_log (
+    id          BIGSERIAL PRIMARY KEY,
+    changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    changed_by  TEXT NOT NULL DEFAULT '',
+    before      JSONB,
+    after       JSONB,
+    digest      TEXT NOT NULL DEFAULT ''
+);
+
+-- Machine-checked proof state. Separate from findings.status (human disposition)
+-- and from finding_cases / enterprise report issuance.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS poe_level SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'unverified';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_note TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS counterevidence TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS confidence_rationale TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_state TEXT NOT NULL DEFAULT 'none';
+CREATE INDEX IF NOT EXISTS idx_findings_report_state ON findings (report_state, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS rsi_lessons (
+    id          BIGSERIAL PRIMARY KEY,
+    dedupe_key  TEXT NOT NULL UNIQUE,
+    kind        TEXT NOT NULL CHECK (kind IN ('positive','negative','caution')),
+    cue         TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    category_id BIGINT REFERENCES task_categories(id) ON DELETE SET NULL,
+    company_id  BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+    status      TEXT NOT NULL DEFAULT 'candidate'
+                CHECK (status IN ('candidate','adopted','retired')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rsi_lessons_scope ON rsi_lessons(company_id, category_id, status);
+CREATE INDEX IF NOT EXISTS idx_rsi_lessons_kind  ON rsi_lessons(kind, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS rsi_lesson_evidence (
+    id           BIGSERIAL PRIMARY KEY,
+    lesson_id    BIGINT NOT NULL REFERENCES rsi_lessons(id) ON DELETE CASCADE,
+    source_kind  TEXT NOT NULL,
+    source_id    BIGINT NOT NULL,
+    detail       TEXT NOT NULL DEFAULT '',
+    withdrawn_at TIMESTAMPTZ
+);
+ALTER TABLE rsi_lesson_evidence ADD COLUMN IF NOT EXISTS withdrawn_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_rsi_lesson_evidence_live
+    ON rsi_lesson_evidence(lesson_id, source_kind, source_id)
+    WHERE withdrawn_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS rsi_lesson_usage (
+    lesson_id BIGINT NOT NULL REFERENCES rsi_lessons(id) ON DELETE CASCADE,
+    task_id   BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    mode      TEXT NOT NULL CHECK (mode IN ('shadow','inject')),
+    shown_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (lesson_id, task_id, mode)
+);
+
+CREATE TABLE IF NOT EXISTS coverage_ledger (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    surface     TEXT NOT NULL,
+    risk_area   TEXT NOT NULL,
+    outcome     TEXT NOT NULL
+                CHECK (outcome IN ('reported','no_issue_found','ruled_out','not_applicable','needs_follow_up')),
+    evidence    TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    worker      TEXT NOT NULL DEFAULT '',
+    intent_id   BIGINT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, surface, risk_area)
+);
+CREATE TABLE IF NOT EXISTS coverage_ledger_history (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    surface     TEXT NOT NULL,
+    risk_area   TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    evidence    TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    worker      TEXT NOT NULL DEFAULT '',
+    intent_id   BIGINT,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_coverage_ledger_history_task ON coverage_ledger_history(task_id, id);

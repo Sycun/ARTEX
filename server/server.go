@@ -23,6 +23,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/enterprise"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/intercept/jev"
@@ -1118,6 +1119,7 @@ func (s *Server) Handler() http.Handler {
 		s.getIntelligence(w, r)
 	})
 	mux.HandleFunc("GET /api/settings", s.getSettings)
+	mux.HandleFunc("GET /api/settings/noise", s.noiseStatus)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
 	// 漏洞 IM 推送。渠道是「多实例 + 各自过滤规则」的资源，因此独立成一组
 	// REST 接口，而不是塞进扁平的 /api/settings 键值里。
@@ -1260,6 +1262,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
 	mux.HandleFunc("POST /api/intercept/pending/{id}/decide", s.interceptDecide)
+	mux.HandleFunc("POST /api/intercept/pending/batch-decide", s.interceptBatchDecide)
+	mux.HandleFunc("POST /api/intercept/pending/{id}/always-allow", s.interceptAlwaysAllow)
+	mux.HandleFunc("GET /api/tasks/{id}/target-pins", s.taskListTargetPins)
+	mux.HandleFunc("POST /api/tasks/{id}/target-pins/{pid}/revoke", s.taskRevokeTargetPin)
+	mux.HandleFunc("GET /api/conversations/{id}/target-pins", s.convListTargetPins)
+	mux.HandleFunc("POST /api/conversations/{id}/target-pins/{pid}/revoke", s.convRevokeTargetPin)
+	mux.HandleFunc("GET /api/intercept/target-gate/exemptions", s.targetGateGetExemptions)
+	mux.HandleFunc("PUT /api/intercept/target-gate/exemptions", s.targetGateSetExemptions)
+	mux.HandleFunc("GET /api/intercept/target-gate/exemptions/history", s.targetGateExemptionHistory)
 	mux.HandleFunc("GET /api/intercept/history", s.interceptHistory)
 	mux.HandleFunc("GET /api/intercept/history/{id}", s.interceptDetail)
 	mux.HandleFunc("GET /api/intercept/history/{id}/execution", s.interceptExecution)
@@ -4177,6 +4188,7 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_enabled":             s.m.pg.GetBool(settingNotifyEnabled, true),
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
+		"noise_profile":              egress.CurrentProfile().Name,
 	}
 }
 
@@ -4270,10 +4282,24 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		NoiseProfile     *string `json:"noise_profile"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	if req.NoiseProfile != nil {
+		name := strings.ToLower(strings.TrimSpace(*req.NoiseProfile))
+		profile, ok := egress.ProfileByName(name)
+		if name == "" || !ok {
+			writeErr(w, 400, "noise_profile 必须是 off、quiet、balanced 或 aggressive")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingNoiseProfile, profile.Name); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		egress.SetProfile(profile)
 	}
 	if req.EgressProbeURL != nil {
 		value := strings.TrimSpace(*req.EgressProbeURL)

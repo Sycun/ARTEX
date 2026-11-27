@@ -18,6 +18,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	pgdb "github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
@@ -639,6 +640,7 @@ func newManager(dir, proxyAddr, mode string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	egress.SetProfile(startupNoiseProfile(pg))
 	backend, err := traffic.Backend(mode)
 	if err != nil {
 		pg.Close()

@@ -708,10 +708,16 @@ func restoreInterceptRows(tx *sql.Tx, raw json.RawMessage) error {
 			}
 			row["decision_source"] = source
 		}
+		if _, ok := row["decided_by"]; !ok || row["decided_by"] == nil {
+			row["decided_by"] = ""
+		}
 		if status, _ := row["status"].(string); status == "pending" {
 			row["status"] = "timeout"
 			row["reason"] = "任务归档期间审批已超时"
 			row["decided_at"] = time.Now().UTC()
+			if decidedBy, _ := row["decided_by"].(string); decidedBy == "" {
+				row["decided_by"] = "system"
+			}
 			if audit, ok := row["audit"].(map[string]any); ok {
 				audit["effective_action"] = "deny"
 				audit["decision_reason"] = "任务归档期间审批已超时"
@@ -785,6 +791,12 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 		return fmt.Errorf("%w: task %d", ErrTaskArchiveDeleteBlocked, dependent)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := revokeTaskPins(tx, taskID); err != nil {
+		return err
+	}
+	if err := settleTaskTargetRequests(tx, taskID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1 AND archived_at IS NOT NULL`, taskID); err != nil {

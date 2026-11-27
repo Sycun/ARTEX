@@ -45,6 +45,7 @@ type ReviewInput struct {
 	Tool                string            `json:"tool_name"`
 	Arguments           json.RawMessage   `json:"arguments"`
 	EvidenceTruncated   bool              `json:"evidence_truncated,omitempty"`
+	OperatorPolicy      *ReviewPolicy     `json:"operator_policy,omitempty"`
 }
 
 type reviewContextKey struct{}

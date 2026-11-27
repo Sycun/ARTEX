@@ -38,7 +38,8 @@ type InterceptPending struct {
 	ToolInput      json.RawMessage `json:"tool_input"`
 	Status         string          `json:"status"`
 	DecisionSource string          `json:"decision_source"`
-	Reason         string          `json:"reason"` // 规则 message 或模型判定理由(前缀 [模型])
+	DecidedBy      string          `json:"decided_by,omitempty"`
+	Reason         string          `json:"reason"` // 规则 message 或模型判定理由(前缀 [模型] 或 [model])
 	DecidedAt      *time.Time      `json:"decided_at"`
 	CreatedAt      time.Time       `json:"created_at"`
 }
@@ -172,11 +173,11 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9, $10) RETURNING id`,
 	return id, err
 }
 
-const interceptPendingCols = `id, rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, created_at, decision_source`
+const interceptPendingCols = `id, rule_id, conversation_id, task_id, agent_name, tool_name, tool_input, status, reason, decided_at, created_at, decision_source, decided_by`
 
 func scanInterceptPending(s interface{ Scan(...any) error }, p *InterceptPending) error {
 	return s.Scan(&p.ID, &p.RuleID, &p.ConversationID, &p.TaskID, &p.AgentName,
-		&p.ToolName, &p.ToolInput, &p.Status, &p.Reason, &p.DecidedAt, &p.CreatedAt, &p.DecisionSource)
+		&p.ToolName, &p.ToolInput, &p.Status, &p.Reason, &p.DecidedAt, &p.CreatedAt, &p.DecisionSource, &p.DecidedBy)
 }
 
 // ListPendingIntercepts returns all unresolved approval requests, newest first.
@@ -222,20 +223,34 @@ func scanInterceptApprovalRow(rows interface{ Scan(...any) error }, r *Intercept
 	return rows.Scan(
 		&r.ID, &r.RuleID, &r.ConversationID, &r.TaskID, &r.AgentName,
 		&r.ToolName, &r.ToolInput, &r.Status, &r.Reason, &r.DecidedAt, &r.CreatedAt,
-		&r.DecisionSource, &r.ConvTitle, &r.ConvAgentKey, &r.RuleName,
+		&r.DecisionSource, &r.DecidedBy, &r.ConvTitle, &r.ConvAgentKey, &r.RuleName,
 	)
 }
 
+// ModelReasonPrefix starts reasons written by the closed-question judge.
+// The freeform judge still writes the legacy Chinese prefix.
+const (
+	ModelReasonPrefix       = "[model]"
+	legacyModelReasonPrefix = "[模型]"
+)
+
+func isModelReason(reason string) bool {
+	return strings.HasPrefix(strings.ToLower(reason), ModelReasonPrefix) ||
+		strings.HasPrefix(reason, legacyModelReasonPrefix)
+}
+
 // Keep legacy rows without decision_source consistent with their displayed source.
+// A stored manual decision stays manual even when the reason is no longer Chinese.
 const approvalDecisionSource = `CASE
  WHEN ip.audit->>'decision_reason' LIKE '人工允许%' OR ip.audit->>'decision_reason' LIKE '人工拒绝%' THEN 'manual'
  ELSE COALESCE(NULLIF(ip.decision_source,''), CASE
    WHEN ip.rule_id IS NOT NULL THEN 'rule'
-   WHEN ip.reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END)
+   WHEN lower(ip.reason) LIKE '[model]%' OR ip.reason LIKE '[模型]%' THEN 'model' ELSE 'unknown' END)
  END`
 
 const approvalRowColumns = `ip.id, ip.rule_id, ip.conversation_id, ip.task_id, ip.agent_name,
        ip.tool_name, ip.tool_input, ip.status, ip.reason, ip.decided_at, ip.created_at, ` + approvalDecisionSource + `,
+       ip.decided_by,
        COALESCE(c.title,'') AS conv_title,
        COALESCE(c.agent_key,'') AS conv_agent_key,
        COALESCE(ir.name,'') AS rule_name`
@@ -253,7 +268,7 @@ func interceptSource(ruleID int64, reason string) string {
 	if ruleID != 0 {
 		return "rule"
 	}
-	if strings.HasPrefix(reason, "[模型]") {
+	if isModelReason(reason) {
 		return "model"
 	}
 	return "unknown"
@@ -294,6 +309,7 @@ func (d *DB) ListAllIntercepts(limit int) ([]InterceptApprovalRow, error) {
 type InterceptApprovalFilter struct {
 	Status         string
 	DecisionSource string
+	DecidedBy      string
 	Search         string
 	CreatedFrom    string // inclusive UTC calendar date, YYYY-MM-DD
 	CreatedTo      string // inclusive UTC calendar date, YYYY-MM-DD
@@ -350,6 +366,7 @@ func (d *DB) listInterceptsPage(taskID string, page, size int, filter InterceptA
 	add("ip.task_id", taskID)
 	add("ip.status", filter.Status)
 	add(approvalDecisionSource, filter.DecisionSource)
+	add("ip.decided_by", filter.DecidedBy)
 	if filter.CreatedFrom != "" {
 		args = append(args, filter.CreatedFrom)
 		conditions = append(conditions, "ip.created_at >= $"+fmt.Sprint(len(args))+"::date")

@@ -161,6 +161,9 @@ func auditFor(ctx context.Context, dec Decision, input []byte, status string) *d
 	a.ModelFallback = dec.ModelFallback
 	a.ModelInput, a.ModelInputDigest = dec.ModelInput, dec.ModelInputDigest
 	a.RuleName, a.ConfigDigest, a.ProfileID = dec.RuleName, dec.ConfigDigest, dec.ProfileID
+	if len(dec.JudgeAnswers) > 0 {
+		a.JudgeAnswers = dec.JudgeAnswers
+	}
 	a.ExecutionStatus = "not_started"
 	if status == "allowed" {
 		a.EffectiveAction, a.ExecutionStatus = "allow", "awaiting_result"

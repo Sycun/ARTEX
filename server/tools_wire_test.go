@@ -75,10 +75,8 @@ func TestWireTools(t *testing.T) {
 	t.Cleanup(func() { _ = pg.UpsertToolForce(rf.Key, rf.Description, rf.Schema, mustJSON(rf.Agents)) })
 	var schema map[string]any
 	_ = json.Unmarshal(rf.Schema, &schema)
-	if props, ok := schema["properties"].(map[string]any); ok {
-		if conf, ok := props["confidence"].(map[string]any); ok {
-			conf["default"] = "inferred"
-		}
+	if conf := recordFactConfidenceProp(schema); conf != nil {
+		conf["default"] = "inferred"
 	}
 	edited := mustJSON(schema)
 	if err := pg.UpdateTool(rf.Key, "EDITED DESC", edited, mustJSON([]string{"worker"}), true); err != nil {
@@ -95,12 +93,22 @@ func TestWireTools(t *testing.T) {
 	}
 	// Default injection: omit confidence → handler input should carry the default.
 	// We can't run the real handler (nil store), but InputSchema must show the default.
-	sc := got.InputSchema()
-	props := sc["properties"].(map[string]any)
-	conf := props["confidence"].(map[string]any)
-	if conf["default"] != "inferred" {
-		t.Errorf("confidence.default = %v, want inferred", conf["default"])
+	conf := recordFactConfidenceProp(got.InputSchema())
+	if conf == nil || conf["default"] != "inferred" {
+		t.Errorf("confidence.default = %v, want inferred", conf)
 	}
+}
+
+func recordFactConfidenceProp(schema map[string]any) map[string]any {
+	props, _ := schema["properties"].(map[string]any)
+	if conf, ok := props["confidence"].(map[string]any); ok {
+		return conf
+	}
+	facts, _ := props["facts"].(map[string]any)
+	items, _ := facts["items"].(map[string]any)
+	itemProps, _ := items["properties"].(map[string]any)
+	conf, _ := itemProps["confidence"].(map[string]any)
+	return conf
 }
 
 func mustJSON(v any) json.RawMessage {

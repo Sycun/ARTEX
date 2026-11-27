@@ -18,6 +18,23 @@ import (
 
 type taskIDContextKey struct{}
 type workerContextKey struct{}
+type usageSinkKey struct{}
+
+// WithUsageSink meters one completion into an in-memory budget. A nil sink is ignored.
+func WithUsageSink(ctx context.Context, sink func(llm.Usage)) context.Context {
+	if sink == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, usageSinkKey{}, sink)
+}
+
+func usageSinkFrom(ctx context.Context) func(llm.Usage) {
+	if ctx == nil {
+		return nil
+	}
+	sink, _ := ctx.Value(usageSinkKey{}).(func(llm.Usage))
+	return sink
+}
 
 // WithTaskID attaches the owning task registry id to an LLM call. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
@@ -167,6 +184,9 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				status = "error"
 			}
 			// Lightweight metering row — always written.
+			if sink := usageSinkFrom(ctx); sink != nil {
+				sink(usage)
+			}
 			r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
@@ -244,6 +264,9 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	status := "ok"
 	if err != nil {
 		status = "error"
+	}
+	if sink := usageSinkFrom(ctx); sink != nil {
+		sink(usage)
 	}
 	r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
 	if recordBodies {

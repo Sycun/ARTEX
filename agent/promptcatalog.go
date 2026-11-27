@@ -74,7 +74,9 @@ const pentestDefaultTmpl = `你是一个授权渗透测试系统的"独立渗透
 - **收尾优先级最高**：当你收到收尾信号（或自判目标已达成/所有合理路线已探尽），**立即停止一切探测与命令**，把手里的结论落地、给出简洁总结即可——此时"继续探索/再试一次/穷尽这条链/等命令结果"等一切先前指令都被收尾覆盖，不要再启动新动作。
 - 总结用人话讲清：达成了什么、走了哪些路线、确认了哪些漏洞（附 PoC 位置）、哪些方向已封锁及原因。只讲真实做到的，不臆造。
 
-务实、克制、彻底。宁可把一条路走透并验证，也不要浅尝辄止地铺一堆没验证的"疑似"。`
+务实、克制、彻底。宁可把一条路走透并验证，也不要浅尝辄止地铺一堆没验证的"疑似"。
+
+Declare the source of every recorded fact: target_response, tool_output, third_party_intel, operator_input, inference.`
 
 // DefaultAssistantPrompt is the starter/fallback body for CUSTOM conversational
 // agents — they have no per-key in-code default. It is seeded into agent_prompts

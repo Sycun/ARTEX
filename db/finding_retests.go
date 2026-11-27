@@ -101,8 +101,9 @@ func (d *DB) CreateFindingRetest(ctx context.Context, findingID int64, notes str
 	if runes := []rune(title); len(runes) > 100 {
 		title = string(runes[:100])
 	}
-	c, err := scanConv(tx.QueryRowContext(ctx, `INSERT INTO conversations(agent_key,title) VALUES ($1,$2) RETURNING `+convCols,
-		FindingRetestAgentKey, fmt.Sprintf("复测 #%d · %s", findingID, title)))
+	c, err := scanConv(tx.QueryRowContext(ctx, `INSERT INTO conversations(agent_key,title,target_gate)
+SELECT $1,$2,COALESCE(t.target_gate,false) FROM findings f LEFT JOIN tasks t ON t.id=f.task_id WHERE f.id=$3
+RETURNING `+convCols, FindingRetestAgentKey, fmt.Sprintf("复测 #%d · %s", findingID, title), findingID))
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -249,6 +250,9 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 		if _, _, _, _, err := SetFindingStatusTx(context.Background(), tx, findingID, FindingFixed); err != nil {
 			return err
 		}
+	}
+	if err := syncLessonsForFindingTx(context.Background(), tx, findingID); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

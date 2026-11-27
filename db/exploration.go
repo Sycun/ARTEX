@@ -202,6 +202,11 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 		return 0, err
 	}
 	defer tx.Rollback()
+	if kind == KindFact && len(anchors) > 0 {
+		if err := checkFactAnchorAssets(tx, anchors); err != nil {
+			return 0, err
+		}
+	}
 	var id int64
 	if err := tx.QueryRow(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
@@ -215,6 +220,40 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		}
 	}
 	return id, tx.Commit()
+}
+
+func checkFactAnchorAssets(tx *sql.Tx, ids []int64) error {
+	rows, err := tx.Query("SELECT id FROM assets WHERE id = ANY($1::bigint[]) ORDER BY id FOR KEY SHARE", ids)
+	if err != nil {
+		return err
+	}
+	found := make(map[int64]bool, len(ids))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		found[id] = true
+	}
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	var missing []int64
+	for _, id := range ids {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("asset IDs do not exist: %v; use existing IDs or register the assets first", missing)
+	}
+	return nil
 }
 
 // AddIntent is a convenience: an open intent.
@@ -2033,6 +2072,69 @@ func (s *ExplorationStore) ActivityByIDsForTerminalIntents(ids []int64) ([]Activ
 // AddStandaloneFinding writes a finding to the standalone findings table, which
 // persists across task deletion (task_id / node_id become NULL when the task or
 // exploration node is deleted). taskID and nodeID may be 0 (stored as NULL).
+// ActivityContainingEvidence returns the newest activity of nodeID whose detail
+// or summary contains one of lines verbatim.
+func (s *ExplorationStore) ActivityContainingEvidence(nodeID int64, lines []string) (id int64, createdAt time.Time, ok bool, err error) {
+	if nodeID <= 0 || len(lines) == 0 {
+		return 0, time.Time{}, false, nil
+	}
+	err = s.db.QueryRow(`SELECT id, created_at FROM activity a
+WHERE exploration_id=$1 AND node_id=$2
+  AND EXISTS (SELECT 1 FROM unnest($3::text[]) AS line
+              WHERE strpos(COALESCE(a.detail,''), line) > 0
+                 OR strpos(COALESCE(a.summary,''), line) > 0)
+ORDER BY id DESC LIMIT 1`, s.expID, nodeID, lines).Scan(&id, &createdAt)
+	if err == sql.ErrNoRows {
+		return 0, time.Time{}, false, nil
+	}
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	return id, createdAt, true, nil
+}
+
 func (s *ExplorationStore) AddStandaloneFinding(taskID, nodeID int64, vulnclass, name, severity, summary, evidence, worker string, assetIDs []int64) (int64, error) {
 	return s.db.AddFinding(taskID, nodeID, vulnclass, name, severity, summary, evidence, worker, assetIDs)
+}
+
+// FactOnlyIntent is one finished intent that yielded facts and no finding.
+type FactOnlyIntent struct {
+	IntentID int64
+	Summary  string
+	Facts    int
+}
+
+// FactOnlyIntents returns intents of this exploration that yielded at least one
+// fact and zero findings, newest first. limit <= 0 means 10.
+func (s *ExplorationStore) FactOnlyIntents(limit int) ([]FactOnlyIntent, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.Query(`SELECT i.id, COALESCE(i.payload->>'summary',''), count(*)
+FROM exploration_edges e
+JOIN exploration_nodes i ON i.id=e.src_id AND i.exploration_id=e.exploration_id
+JOIN exploration_nodes d ON d.id=e.dst_id AND d.exploration_id=e.exploration_id
+WHERE e.exploration_id=$1 AND e.rel=$2 AND d.kind=$3
+  AND i.state IN ('done','blocked','exhausted','stopped')
+  AND NOT EXISTS (
+    SELECT 1 FROM exploration_edges e2
+    JOIN exploration_nodes f ON f.id=e2.dst_id AND f.exploration_id=e2.exploration_id
+    WHERE e2.exploration_id=e.exploration_id AND e2.src_id=e.src_id
+      AND e2.rel=$2 AND f.kind='finding')
+GROUP BY i.id, 2
+ORDER BY i.id DESC
+LIMIT $4`, s.expID, RelYields, KindFact, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FactOnlyIntent
+	for rows.Next() {
+		var r FactOnlyIntent
+		if err := rows.Scan(&r.IntentID, &r.Summary, &r.Facts); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
