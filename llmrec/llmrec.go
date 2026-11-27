@@ -138,6 +138,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 	// stats and must be complete even for interrupted/failed runs, so it is NOT
 	// gated. Only body serialization + response accumulation are skipped when off.
 	recordBodies := r.enabled == nil || r.enabled()
+	collectContext := ContextTelemetryEnabled()
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)
@@ -150,6 +151,10 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 		// Backward compatibility for non-task callers. For task calls, the task
 		// runtime always supplies the registry id explicitly.
 		taskID = parsedID
+	}
+	var ctxMetrics ContextMetrics
+	if collectContext {
+		ctxMetrics = MeasureContext(req)
 	}
 
 	// Serialize the request only when storing bodies (this is the expensive part).
@@ -188,6 +193,9 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				sink(usage)
 			}
 			r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+			if collectContext {
+				r.recordContext(taskID, worker, ctxMetrics, usage, status)
+			}
 			// Heavy trace row — only when body recording is on.
 			if recordBodies {
 				r.record(req, session, taskID, worker, reqBody, capt, start, textBuf.String(), thinkingBuf.String(), usage, stopReason, err)
@@ -241,6 +249,7 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 // usage metering, normalized body recording and raw wire capture as Stream.
 func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
 	recordBodies := r.enabled == nil || r.enabled()
+	collectContext := ContextTelemetryEnabled()
 	start := time.Now()
 	session := transcript.SessionIDFrom(ctx)
 	parsedID, worker := parseSession(session)
@@ -251,6 +260,10 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	taskID := TaskIDFrom(ctx)
 	if taskID == "" {
 		taskID = parsedID
+	}
+	var ctxMetrics ContextMetrics
+	if collectContext {
+		ctxMetrics = MeasureContext(req)
 	}
 
 	reqBody := ""
@@ -269,6 +282,9 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 		sink(usage)
 	}
 	r.recordUsage(taskID, expID, worker, usage, int(time.Since(start).Milliseconds()), status)
+	if collectContext {
+		r.recordContext(taskID, worker, ctxMetrics, usage, status)
+	}
 	if recordBodies {
 		r.record(req, session, taskID, worker, reqBody, capt, start, msg.Text(), thinkingText(msg), usage, stopReason, err)
 	}

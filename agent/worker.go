@@ -292,6 +292,42 @@ func ensureRunDir(base string, taskID, intentID int64) string {
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
 func cmdOutDir(dir string) string { return filepath.Join(dir, "cmd-output") }
 
+// CachePrefixEnv opts a worker into a static/dynamic system-prompt split.
+// Off unless ARTEX_CACHE_PREFIX is 1, true, on, or yes. Planner, main agent,
+// chat, and goals are unchanged. When off, the prompt is byte-identical.
+const CachePrefixEnv = "ARTEX_CACHE_PREFIX"
+
+func cachePrefixEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(CachePrefixEnv))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
+}
+
+// workerPrompt keeps the historical single-segment prompt when split is false.
+// When split is true, the per-intent artifact directory and everything after it
+// leave the cached prefix. Joining the two segments with "\n\n" reproduces the
+// unsplit text.
+func workerPrompt(sysBody string, def DeferredInfo, split bool) (system []string, boundary int) {
+	if !split {
+		return deferredSystem(sysBody, def)
+	}
+	const marker = "\n\n**中间产物输出规约**"
+	idx := strings.Index(sysBody, marker)
+	if idx < 0 {
+		return deferredSystem(sysBody, def)
+	}
+	static := sysBody[:idx]
+	dynamic := sysBody[idx:] + def.FindingGuidance + def.CaseGuidance + def.IntelligenceGuidance
+	dyn := strings.TrimPrefix(dynamic, "\n\n")
+	block := actool.RenderDeferredToolsBlock(def.GlobalNames)
+	if block == "" {
+		return []string{static, dyn}, 1
+	}
+	return []string{static, dyn, block}, 1
+}
+
 func workerSystem(proxyAddr, caCert, dataDir, runDir string) string {
 	body := renderSystem("worker", workerDefaultTmpl, WorkerVars{ProxyAddr: proxyAddr, DataDir: dataDir, Now: nowStr()})
 	// caCert is present only when the recording MITM is on, which is exactly when
@@ -429,7 +465,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		}
 	}
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
-	system, boundary := deferredSystem(sysBody, def)
+	system, boundary := workerPrompt(sysBody, def, cachePrefixEnabled())
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
 	tc := taskClockFrom(ctx)
 	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, w.runTimeout)

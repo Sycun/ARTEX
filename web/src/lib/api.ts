@@ -372,6 +372,8 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   if (q.from) p.set("from", q.from);
   if (q.to) p.set("to", q.to);
   if (q.assetScope) p.set("asset_scope", q.assetScope);
+  if (q.company) p.set("company", q.company);
+  if (q.verification) p.set("verification", q.verification);
   return p;
 }
 
@@ -995,6 +997,8 @@ export const api = {
   // 漏洞链路:该漏洞节点回溯到任务初始节点的子图(节点 + 关系)。
   findingLineage: (id: string) => get<{ nodes: TaskNode[]; edges: Edge[] }>(`/exploration/findings/${id}/lineage`),
   setFindingStatus: (id: string, status: FindingStatus) => patch<Finding>(`/exploration/findings/${id}`, { status }),
+  bulkSetFindingStatus: (ids: number[], status: FindingStatus) =>
+    post<{ updated: number }>("/exploration/findings/bulk-status", { ids, status }),
   setFindingSeverity: (id: string, severity: Severity) => patch<Finding>(`/exploration/findings/${id}`, { severity }),
   // 一次保存漏洞的名称/类别/严重等级(发现列表行内编辑用),只传出现的字段。
   updateFinding: (
@@ -1252,6 +1256,26 @@ export const api = {
   setBasicAuthSettings: (settings: { enabled: boolean; username: string; password: string }) =>
     put<{ enabled: boolean; username: string; password_set: boolean }>("/settings/basic-auth", settings),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
+  noiseStatus: () =>
+    get<{ profile: "off" | "quiet" | "balanced" | "aggressive"; hosts: Array<{ host: string; rpm?: number; inflight?: number }> }>(
+      "/settings/noise",
+    ),
+  chatBridges: () =>
+    get<
+      Array<{
+        kind: string;
+        configured: boolean;
+        enabled: boolean;
+        config: Record<string, string>;
+        allowed_chats: string[];
+        status?: { state?: string; last_error?: string };
+      }>
+    >("/chat-bridges"),
+  saveChatBridge: (
+    kind: string,
+    body: { enabled: boolean; config: Record<string, string>; allowed_chats: string[] },
+  ) => put(`/chat-bridges/${kind}`, body),
+  testChatBridge: (kind: string) => post(`/chat-bridges/${kind}/test`, {}),
 
   // ---- MCP 服务端（ARTEX 对外暴露的 /mcp）：开关、访问令牌、调用审计 ----
   mcpServerSettings: () => get<McpServerSettings>("/mcp-server/settings"),
@@ -1436,6 +1460,8 @@ export const api = {
     profile_id?: number,
     streaming = true, // 用该配置真实的收发模式来测，别让"流式能通、非流式不通"漏到会话里
     session_header_key = "", // 非空=测试请求也带该自定义会话头（值为一次性 session id）
+    max_tokens_field = "",
+    custom_headers = "",
   ) =>
     // reply = 模型实际回复(已截断);一个字都不回的配置后端直接判失败
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
@@ -1449,6 +1475,8 @@ export const api = {
       profile_id,
       streaming,
       session_header_key,
+      max_tokens_field,
+      custom_headers,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -1470,6 +1498,11 @@ export const api = {
     max_tokens?: number; // 单次回复输出上限；0=不发送，由服务端默认值决定
     max_tokens_field?: string; // ""=max_tokens(默认) | "max_completion_tokens"（仅 openai 格式）
     session_header_key?: string; // 非空=每次请求带该 HTTP 头，头值=当前会话 session id；""=不发送
+    custom_headers?: string;
+    price_input_per_m?: number;
+    price_output_per_m?: number;
+    price_cache_read_per_m?: number;
+    price_cache_write_per_m?: number;
     retry?: LLMRetryOverride; // 本配置的重试覆盖；各项留 0 = 跟随全局重试策略
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),

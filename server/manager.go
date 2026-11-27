@@ -14,9 +14,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/enrich"
@@ -63,9 +65,12 @@ type Task struct {
 	LLMChainRevision   int64   `json:"-"`
 	LLMFailoverState   string  `json:"llm_failover_state,omitempty"`
 	LLMFailoverReason  string  `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []int64 `json:"source_task_ids,omitempty"`
-	CompanyIDs         []int64 `json:"company_ids,omitempty"`
-	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
+	// LLMRotate round-robins worker intents across the task chain. Slot-pinned
+	// workers ignore it and stay on their bound profile.
+	LLMRotate     bool    `json:"llm_rotate,omitempty"`
+	SourceTaskIDs []int64 `json:"source_task_ids,omitempty"`
+	CompanyIDs    []int64 `json:"company_ids,omitempty"`
+	Status        string  `json:"status"` // persisted lifecycle status (done/failed/timeout 为终态；空/其它则由运行态推导)
 	// No-result options are immutable. Mutable checkpoint fields use lifecycleMu.
 	NoResultSeconds      int                    `json:"no_result_seconds"`
 	NoResultMinFindings  int                    `json:"no_result_min_findings"`
@@ -88,6 +93,8 @@ type Task struct {
 	notify               chan struct{}
 	lifecycleMu          sync.RWMutex
 	llmMu                sync.RWMutex
+	rotateMu             sync.Mutex
+	rotateNext           int
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -211,6 +218,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 }
 
 type taskLLMState struct {
+	Rotate         bool
 	ProfileID      *int64
 	ProfileIDs     []int64
 	ActiveID       *int64
@@ -231,6 +239,7 @@ func (t *Task) llmStateSnapshot() taskLLMState {
 	t.llmMu.RLock()
 	defer t.llmMu.RUnlock()
 	return taskLLMState{
+		Rotate:         t.LLMRotate,
 		ProfileID:      cloneInt64Ptr(t.LLMProfileID),
 		ProfileIDs:     append(make([]int64, 0, len(t.LLMProfileIDs)), t.LLMProfileIDs...),
 		ActiveID:       cloneInt64Ptr(t.ActiveLLMProfileID),
@@ -240,11 +249,34 @@ func (t *Task) llmStateSnapshot() taskLLMState {
 	}
 }
 
-func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revision int64, state, reason string) bool {
+// nextRotatedProfile returns the next chain head for one unpinned worker intent.
+// Pinned worker slots must not call it: advancing the counter would steal a turn
+// from the unpinned pool. An exhausted chain or a disabled switch returns false.
+func (t *Task) nextRotatedProfile() (int64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	t.llmMu.RLock()
+	defer t.llmMu.RUnlock()
+	t.rotateMu.Lock()
+	defer t.rotateMu.Unlock()
+	ids := t.LLMProfileIDs
+	if !t.LLMRotate || len(ids) == 0 {
+		return 0, false
+	}
+	pick := ids[t.rotateNext%len(ids)]
+	t.rotateNext++
+	return pick, true
+}
+
+func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revision int64, state, reason string, rotate ...bool) bool {
 	t.llmMu.Lock()
 	defer t.llmMu.Unlock()
 	if revision < t.LLMChainRevision {
 		return false
+	}
+	if len(rotate) > 0 {
+		t.LLMRotate = rotate[0]
 	}
 	t.LLMProfileID = cloneInt64Ptr(profileID)
 	t.ActiveLLMProfileID = cloneInt64Ptr(activeID)
@@ -614,6 +646,48 @@ func (m *Manager) SetWorkers(n int) error {
 // Enrich returns the asset auto-completion engine (may be nil if init failed).
 func (m *Manager) Enrich() *enrich.Engine { return m.enrich }
 
+func init() {
+	// Tests share one process-wide key directory so secret.key never lands in the
+	// package working tree. Production reads ARTEX_JWT_KEY_DIR or the executable dir.
+	if testing.Testing() && strings.TrimSpace(os.Getenv("ARTEX_JWT_KEY_DIR")) == "" {
+		if dir, err := os.MkdirTemp("", "artex-keys-"); err == nil {
+			_ = os.Setenv("ARTEX_JWT_KEY_DIR", dir)
+		}
+	}
+}
+
+// migrateSecretKey moves a legacy dataDir/secret.key next to jwt.key. The key
+// must not stay in the browsable workspace data directory.
+func migrateSecretKey(keyDir, dataDir string) {
+	if keyDir == "" || dataDir == "" {
+		return
+	}
+	dst := filepath.Join(keyDir, "secret.key")
+	src := filepath.Join(dataDir, "secret.key")
+	if src == dst {
+		return
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(keyDir, 0o700); err != nil {
+		log.Printf("[secrets] create key dir: %v", err)
+		return
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		log.Printf("[secrets] move secret key: %v", err)
+		return
+	}
+	if err := os.Remove(src); err != nil {
+		log.Printf("[secrets] remove legacy secret key: %v", err)
+	}
+	log.Printf("[secrets] secret key moved from %s to %s", src, dst)
+}
+
 // NewManager connects to PostgreSQL and, if proxyAddr is non-empty, starts the
 // traffic-recording proxy. PostgreSQL is required (it is the single data source).
 func NewManager(dir, proxyAddr string) (*Manager, error) {
@@ -648,7 +722,9 @@ func newManager(dir, proxyAddr, mode string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := pg.InitSecrets(dir); err != nil {
+	keyDir := config.KeyDir()
+	migrateSecretKey(keyDir, dir)
+	if err := pg.InitSecrets(keyDir); err != nil {
 		pg.Close()
 		return nil, fmt.Errorf("init secrets: %w", err)
 	}
@@ -1272,7 +1348,7 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		LLMProfileID:  pt.LLMProfileID,
 		LLMProfileIDs: append([]int64(nil), pt.LLMProfileIDs...), ActiveLLMProfileID: pt.ActiveLLMProfileID,
 		LLMChainRevision: pt.LLMChainRevision,
-		LLMFailoverState: pt.LLMFailoverState, LLMFailoverReason: pt.LLMFailoverReason,
+		LLMFailoverState: pt.LLMFailoverState, LLMFailoverReason: pt.LLMFailoverReason, LLMRotate: pt.LLMRotate,
 		SourceTaskIDs:   append([]int64(nil), pt.SourceTaskIDs...),
 		CompanyIDs:      append([]int64(nil), pt.CompanyIDs...),
 		NoResultSeconds: pt.NoResultSeconds, NoResultMinFindings: pt.NoResultMinFindings, NoResultMinSeverity: pt.NoResultMinSeverity,
@@ -1500,7 +1576,7 @@ func (m *Manager) ReplaceTaskLLMProfiles(id string, profileIDs []int64, activePr
 	}
 	m.mu.Lock()
 	if task := m.tasks[id]; task != nil {
-		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
+		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason, pt.LLMRotate)
 	}
 	m.mu.Unlock()
 	// 终态任务不重开额度阻塞意图:任务已经没有 worker 在跑,重开只会把它们从

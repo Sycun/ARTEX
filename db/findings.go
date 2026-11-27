@@ -34,6 +34,8 @@ type DBFinding struct {
 	Worker               string
 	AssetIDs             []int64
 	Status               string
+	VerificationStatus   string
+	PoeLevel             int
 	Report               string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
 	ReportConversationID *int64 `json:"report_conversation_id,omitempty"`
 	CreatedAt            time.Time
@@ -109,7 +111,8 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 		f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
-	(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+	(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
+	COALESCE(f.verification_status, 'unverified'), COALESCE(f.poe_level, 0)`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -122,7 +125,7 @@ func scanFindings(rows interface {
 		f := &DBFinding{}
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -166,6 +169,10 @@ type FindingFilter struct {
 	// AssetScope 是资产树的节点 key(a:<id> / c:<id> / r:<domain> / __none__),
 	// 选中一个节点等于选中它的整棵子树。空 = 不按资产筛选。
 	AssetScope string
+	// Company is a company id from the sidebar switcher. Empty means every company.
+	Company string
+	// Verification is the POE verification state. Empty means every state.
+	Verification string
 
 	// 下面三个由 applyAssetScope 从 AssetScope 解析而来,调用方不用设置。
 	assetIDs  []int64 // 子树里所有资产 id
@@ -202,6 +209,39 @@ func (f FindingFilter) where() (string, []any) {
 	add("severity", f.Severity)
 	add("status", f.Status)
 	add("vulnclass", f.VulnClass)
+	if v := strings.TrimSpace(f.Verification); v != "" {
+		if !ValidVerificationStatus(v) {
+			conds = append(conds, "FALSE")
+		} else {
+			args = append(args, v)
+			conds = append(conds, fmt.Sprintf("f.verification_status = $%d", len(args)))
+		}
+	}
+	if company := strings.TrimSpace(f.Company); company != "" {
+		cid, err := strconv.ParseInt(company, 10, 64)
+		if err != nil || cid <= 0 {
+			conds = append(conds, "FALSE")
+		} else {
+			args = append(args, cid)
+			n := len(args)
+			conds = append(conds, fmt.Sprintf(`(
+				EXISTS (
+					SELECT 1 FROM jsonb_array_elements_text(COALESCE(f.asset_ids, '[]'::jsonb)) e(v)
+					JOIN assets a ON a.id = e.v::bigint AND a.company_id = $%d
+				)
+				OR (
+					NOT EXISTS (
+						SELECT 1 FROM jsonb_array_elements_text(COALESCE(f.asset_ids, '[]'::jsonb)) e(v)
+						JOIN assets a ON a.id = e.v::bigint
+					)
+					AND EXISTS (
+						SELECT 1 FROM task_scope ts
+						WHERE ts.task_id = f.task_id AND ts.kind = 'company' AND ts.company_id = $%d
+					)
+				)
+			)`, n, n))
+		}
+	}
 	if from := strings.TrimSpace(f.From); from != "" {
 		if parsed, err := time.Parse(time.RFC3339, from); err == nil {
 			args = append(args, parsed)
@@ -539,7 +579,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -706,7 +746,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report, &reportConv)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel, &f.Report, &reportConv)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

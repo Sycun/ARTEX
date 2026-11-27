@@ -228,7 +228,7 @@ func run() int {
 	// OIDC/S3 settings, then scrubs secretEnv. ARTEX_WORKER_* stay in cfg and in
 	// the environment, so --mode=worker keeps its identity and does not hand
 	// the database or OIDC secrets to a child process.
-	srv := server.NewRuntime(srvCtx, mgr, skillDir, cfg.DataDir, config.BaseDir(), server.Runtime{
+	srv := server.NewRuntime(srvCtx, mgr, skillDir, cfg.DataDir, config.KeyDir(), server.Runtime{
 		Mode:        cfg.Mode,
 		WorkerID:    cfg.WorkerID,
 		Zone:        cfg.WorkerZone,

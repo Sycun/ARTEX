@@ -32,16 +32,19 @@ type Task struct {
 	LLMProfileID  *int64     `json:"llm_profile_id,omitempty"`
 	// Task-level ordered LLM chain. LLMProfileID remains the compatibility alias
 	// for ActiveLLMProfileID while older API clients still send one profile id.
-	LLMProfileIDs      []int64    `json:"llm_profile_ids,omitempty"`
-	ActiveLLMProfileID *int64     `json:"active_llm_profile_id,omitempty"`
-	LLMChainRevision   int64      `json:"-"`
-	LLMFailoverState   string     `json:"llm_failover_state,omitempty"`
-	LLMFailoverReason  string     `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []int64    `json:"source_task_ids,omitempty"`
-	CompanyIDs         []int64    `json:"company_ids,omitempty"`
-	ParentRef          string     `json:"parent_ref,omitempty"` // 父任务 id(编排 spawn 记录;空=顶层)
-	CreatedAt          time.Time  `json:"created_at"`
-	CompletedAt        *time.Time `json:"completed_at,omitempty"` // 进入终态(done/failed/timeout)的时刻;非终态为 nil
+	LLMProfileIDs      []int64 `json:"llm_profile_ids,omitempty"`
+	ReadyLLMProfileIDs []int64 `json:"-"`
+	ActiveLLMProfileID *int64  `json:"active_llm_profile_id,omitempty"`
+	// LLMRotate distributes unpinned worker intents across the chain. Default false.
+	LLMRotate         bool       `json:"llm_rotate"`
+	LLMChainRevision  int64      `json:"-"`
+	LLMFailoverState  string     `json:"llm_failover_state,omitempty"`
+	LLMFailoverReason string     `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs     []int64    `json:"source_task_ids,omitempty"`
+	CompanyIDs        []int64    `json:"company_ids,omitempty"`
+	ParentRef         string     `json:"parent_ref,omitempty"` // 父任务 id(编排 spawn 记录;空=顶层)
+	CreatedAt         time.Time  `json:"created_at"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty"` // 进入终态(done/failed/timeout)的时刻;非终态为 nil
 	// Optional active-runtime checkpoint; StopReason also persists a pending stop.
 	NoResultSeconds     int        `json:"no_result_seconds"`
 	NoResultMinFindings int        `json:"no_result_min_findings"`
@@ -191,12 +194,14 @@ func (d *DB) CreateTask(description, goal string, llmProfileID *int64, timeoutSe
 // TaskCreateOptions contains the task data that must be committed atomically
 // with the task/exploration row.
 type TaskCreateOptions struct {
-	Schedule             *TaskScheduleInput
-	Name                 string // 可选任务名称;空=未命名
-	CategoryID           *int64
-	SourceTaskIDs        []int64
-	CompanyIDs           []int64
-	LLMProfileIDs        []int64
+	Schedule      *TaskScheduleInput
+	Name          string // 可选任务名称;空=未命名
+	CategoryID    *int64
+	SourceTaskIDs []int64
+	CompanyIDs    []int64
+	LLMProfileIDs []int64
+	// LLMRotate enables per-intent round-robin. Nil keeps the default (off).
+	LLMRotate            *bool
 	TimeoutSeconds       int
 	NoResultSeconds      int
 	NoResultMinFindings  int
@@ -292,10 +297,14 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		id := opts.LLMProfileIDs[0]
 		active = &id
 	}
+	rotate := false
+	if opts.LLMRotate != nil {
+		rotate = *opts.LLMRotate
+	}
 	t := &Task{
 		Name: opts.Name, CategoryID: opts.CategoryID, CategoryName: categoryName,
 		Description: description, Goal: goal, ExplorationID: expID,
-		LLMProfileID: active, ActiveLLMProfileID: active,
+		LLMProfileID: active, ActiveLLMProfileID: active, LLMRotate: rotate,
 		LLMProfileIDs:   append([]int64(nil), opts.LLMProfileIDs...),
 		SourceTaskIDs:   append([]int64(nil), opts.SourceTaskIDs...),
 		CompanyIDs:      append([]int64(nil), opts.CompanyIDs...),
@@ -305,9 +314,9 @@ VALUES ($1, 'fact', $2, 0, 'origin', 'system')`, expID, string(originPayload)); 
 		Zone: zone,
 	}
 	if err := tx.QueryRow(`
-INSERT INTO tasks(name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_global_assets, target_gate, no_result_seconds, no_result_min_findings, no_result_min_severity, zone)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-RETURNING id, status, paused, created_at`, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.TargetGate != nil && *opts.TargetGate, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity, zone).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
+INSERT INTO tasks(name, remark, category_id, description, goal, exploration_id, llm_profile_id, active_llm_profile_id, timeout_seconds, plan_heartbeat_seconds, coverage_enabled, worker_count, share_global_assets, target_gate, no_result_seconds, no_result_min_findings, no_result_min_severity, zone, llm_rotate)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+RETURNING id, status, paused, created_at`, opts.Name, opts.Remark, opts.CategoryID, description, goal, expID, active, opts.TimeoutSeconds, opts.PlanHeartbeatSeconds, coverageEnabled, opts.WorkerCount, opts.ShareGlobalAssets, opts.TargetGate != nil && *opts.TargetGate, opts.NoResultSeconds, opts.NoResultMinFindings, opts.NoResultMinSeverity, zone, rotate).Scan(&t.ID, &t.Status, &t.Paused, &t.CreatedAt); err != nil {
 		return nil, err
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
@@ -444,11 +453,11 @@ func insertTaskLLMProfiles(tx *sql.Tx, taskID int64, profileIDs []int64) error {
 
 const taskCols = `id, COALESCE(name,''), remark, category_id,
 COALESCE((SELECT category.name FROM task_categories category WHERE category.id=tasks.category_id),''),
-description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_global_assets, COALESCE(target_gate,false), COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason, COALESCE(zone,'default')`
+description, goal, exploration_id, status, paused, COALESCE(pause_reason,''), queued, queued_at, COALESCE(queue_mode,''), llm_profile_id, active_llm_profile_id, COALESCE(parent_ref,''), pinned_at, created_at, completed_at, COALESCE(timeout_seconds,0), COALESCE(plan_heartbeat_seconds,300), COALESCE(coverage_enabled,true), share_global_assets, COALESCE(target_gate,false), COALESCE(worker_count,0), first_run_at, deadline_at, COALESCE(active_run_seconds,0), run_segment_started_at, no_result_seconds, no_result_min_findings, no_result_min_severity, no_result_base_seconds, no_result_checked_at, stop_reason, COALESCE(zone,'default'), COALESCE(llm_rotate,false)`
 
 func scanTask(sc interface{ Scan(...any) error }) (*Task, error) {
 	var t Task
-	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.TargetGate, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason, &t.Zone); err != nil {
+	if err := sc.Scan(&t.ID, &t.Name, &t.Remark, &t.CategoryID, &t.CategoryName, &t.Description, &t.Goal, &t.ExplorationID, &t.Status, &t.Paused, &t.PauseReason, &t.Queued, &t.QueuedAt, &t.QueueMode, &t.LLMProfileID, &t.ActiveLLMProfileID, &t.ParentRef, &t.PinnedAt, &t.CreatedAt, &t.CompletedAt, &t.TimeoutSeconds, &t.PlanHeartbeatSeconds, &t.CoverageEnabled, &t.ShareGlobalAssets, &t.TargetGate, &t.WorkerCount, &t.FirstRunAt, &t.DeadlineAt, &t.ActiveRunSeconds, &t.RunSegmentStartedAt, &t.NoResultSeconds, &t.NoResultMinFindings, &t.NoResultMinSeverity, &t.NoResultBaseSeconds, &t.NoResultCheckedAt, &t.StopReason, &t.Zone, &t.LLMRotate); err != nil {
 		return nil, err
 	}
 	t.Pinned = t.PinnedAt != nil

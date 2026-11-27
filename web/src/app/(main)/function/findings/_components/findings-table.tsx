@@ -318,6 +318,12 @@ export function FindingsTable({
                   ) : (
                     <StatusBadge domain="finding" value={f.status} dot />
                   )}
+                  {f.verification_status ? (
+                    <Badge variant="outline" className="mt-1">
+                      {t(`findings.verification.${f.verification_status}`)}
+                      {f.poe_level ? ` · ${t("findings.poe", { level: f.poe_level })}` : ""}
+                    </Badge>
+                  ) : null}
                 </TableCell>
                 <TableCell>
                   {f.task_id ? (

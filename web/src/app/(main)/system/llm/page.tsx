@@ -18,6 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -75,7 +76,7 @@ function cooldownText(secs: number) {
 // 其余状态来自轮询的熔断记录（轮询关着时不会产生新记录，此时「正常」= 没有已知故障）。
 type Health = { label: string; cls: string; hint?: string };
 function healthOf(p: LLMProfile, m: LLMPoolMember | undefined, ui: UITranslate): Health {
-  if (!p.api_key_hint) {
+  if (!p.api_key_hint && p.format !== "ollama") {
     return {
       label: ui("screen.3c87680f913852"),
       cls: "border-muted-foreground/40 text-muted-foreground",
@@ -326,9 +327,7 @@ function ProfileSheet({
 
   const isNew = !profile;
   const [name, setName] = React.useState("");
-  const [format, setFormat] = React.useState<"anthropic" | "openai" | "openai-responses" | "gemini" | "jev">(
-    "anthropic",
-  );
+  const [format, setFormat] = React.useState<LLMProfile["format"]>("anthropic");
   const [model, setModel] = React.useState("");
   const [baseUrl, setBaseUrl] = React.useState("");
   const [proxy, setProxy] = React.useState("");
@@ -345,6 +344,11 @@ function ProfileSheet({
   const [maxTokens, setMaxTokens] = React.useState("0"); // 单次回复输出上限;0=不发送
   const [maxTokensField, setMaxTokensField] = React.useState(NONE); // 上限用哪个字段名;NONE=max_tokens
   const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // 自定义会话头名;空=不发送
+  const [customHeaders, setCustomHeaders] = React.useState("");
+  const [priceInput, setPriceInput] = React.useState("0");
+  const [priceOutput, setPriceOutput] = React.useState("0");
+  const [priceCacheRead, setPriceCacheRead] = React.useState("0");
+  const [priceCacheWrite, setPriceCacheWrite] = React.useState("0");
   const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // 本配置的重试覆盖;全 0=跟随全局
   const [testing, setTesting] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
@@ -357,14 +361,7 @@ function ProfileSheet({
   React.useEffect(() => {
     if (!open) return;
     setName(profile?.name ?? "");
-    setFormat(
-      profile?.format === "openai" ||
-        profile?.format === "openai-responses" ||
-        profile?.format === "gemini" ||
-        profile?.format === "jev"
-        ? profile.format
-        : "anthropic",
-    );
+    setFormat(profile?.format ?? "anthropic");
     setModel(profile?.model ?? (profile?.format === "jev" ? "jev-latest" : ""));
     setBaseUrl(profile?.base_url ?? "");
     setProxy(profile?.proxy ?? "");
@@ -379,6 +376,11 @@ function ProfileSheet({
     setMaxTokens(String(profile?.max_tokens ?? 0));
     setMaxTokensField(fromStore(profile?.max_tokens_field));
     setSessionHeaderKey(profile?.session_header_key ?? "");
+    setCustomHeaders(profile?.custom_headers ?? "");
+    setPriceInput(String(profile?.price_input_per_m ?? 0));
+    setPriceOutput(String(profile?.price_output_per_m ?? 0));
+    setPriceCacheRead(String(profile?.price_cache_read_per_m ?? 0));
+    setPriceCacheWrite(String(profile?.price_cache_write_per_m ?? 0));
     setRetry(profile?.retry ?? ZERO_OVERRIDE);
     setApiKey("");
     setKeyHint(profile?.api_key_hint ?? "");
@@ -425,6 +427,8 @@ function ProfileSheet({
         profileId,
         streaming,
         sessionHeaderKey.trim(),
+        format === "openai" ? toStore(maxTokensField) : "",
+        customHeaders,
       );
       // 回复内容一并展示：看得见模型确实说了话，才算和会话里跑通是一回事。
       if (r.ok)
@@ -468,6 +472,11 @@ function ProfileSheet({
         // 后端也会再做一次同样的归一化，这里只是别让 UI 送出自相矛盾的值。
         max_tokens_field: format === "openai" ? toStore(maxTokensField) : "",
         session_header_key: sessionHeaderKey.trim(),
+        custom_headers: format === "bedrock-gateway" ? customHeaders : "",
+        price_input_per_m: Number(priceInput) || 0,
+        price_output_per_m: Number(priceOutput) || 0,
+        price_cache_read_per_m: Number(priceCacheRead) || 0,
+        price_cache_write_per_m: Number(priceCacheWrite) || 0,
         retry,
       });
       if (isNew) toast.success(ui("screen.f829d810ba52c6", { v0: name.trim() }));
@@ -515,7 +524,7 @@ function ProfileSheet({
               <Select
                 value={format}
                 onValueChange={(v) => {
-                  const next = v as "anthropic" | "openai" | "openai-responses" | "gemini" | "jev";
+                  const next = v as LLMProfile["format"];
                   setFormat(next);
                   if (next === "jev" && !model.trim()) setModel("jev-latest");
                 }}
@@ -529,6 +538,8 @@ function ProfileSheet({
                   <SelectItem value="openai-responses">OpenAI (Responses API)</SelectItem>
                   <SelectItem value="gemini">Google Gemini</SelectItem>
                   <SelectItem value="jev">{ui("screen.1959e996efa50a")}</SelectItem>
+                  <SelectItem value="ollama">{ui("llm.format.ollama")}</SelectItem>
+                  <SelectItem value="bedrock-gateway">{ui("llm.format.bedrock")}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -637,6 +648,35 @@ function ProfileSheet({
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
             />
+            {format === "ollama" ? <p className="text-muted-foreground text-xs">{ui("llm.ollamaKeyHint")}</p> : null}
+          </div>
+
+          {format === "bedrock-gateway" ? (
+            <div className="grid gap-2">
+              <Label htmlFor="p-headers">{ui("llm.customHeaders")}</Label>
+              <Textarea id="p-headers" className="font-mono" rows={4} value={customHeaders} onChange={(e) => setCustomHeaders(e.target.value)} />
+              <p className="text-muted-foreground text-xs">{ui("llm.customHeadersHint")}</p>
+            </div>
+          ) : null}
+
+          <div className="grid gap-2">
+            <Label>{ui("llm.price.title")}</Label>
+            <div className="grid gap-2 sm:grid-cols-4">
+              {(
+                [
+                  ["p-price-in", "llm.price.input", priceInput, setPriceInput],
+                  ["p-price-out", "llm.price.output", priceOutput, setPriceOutput],
+                  ["p-price-cr", "llm.price.cacheRead", priceCacheRead, setPriceCacheRead],
+                  ["p-price-cw", "llm.price.cacheWrite", priceCacheWrite, setPriceCacheWrite],
+                ] as const
+              ).map(([id, label, value, setValue]) => (
+                <div key={id} className="grid gap-1">
+                  <Label htmlFor={id}>{ui(label)}</Label>
+                  <Input id={id} type="number" min={0} step="0.000001" value={value} onChange={(e) => setValue(e.target.value)} />
+                </div>
+              ))}
+            </div>
+            <p className="text-muted-foreground text-xs">{ui("llm.price.hint")}</p>
           </div>
 
           <div className="grid gap-4 sm:grid-cols-3">

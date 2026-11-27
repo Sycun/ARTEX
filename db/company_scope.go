@@ -163,10 +163,10 @@ func ParseAutoScopeLine(line string) (ParsedScope, error) {
 	return ParseScopeInput(ScopeInput{Kind: "keyword", Value: raw})
 }
 
-func scopeHostname(raw string) (string, error) {
+func scopeHostname(raw string) (string, bool, error) {
 	candidate := strings.TrimSpace(raw)
 	if candidate == "" {
-		return "", fmt.Errorf("主机名为空")
+		return "", false, fmt.Errorf("主机名为空")
 	}
 	if strings.HasPrefix(candidate, "//") {
 		candidate = "http:" + candidate
@@ -178,38 +178,42 @@ func scopeHostname(raw string) (string, error) {
 		if err == nil {
 			err = fmt.Errorf("缺少主机名")
 		}
-		return "", err
+		return "", false, err
 	}
 	host := strings.TrimSuffix(strings.TrimSpace(parsed.Hostname()), ".")
+	host, wildcard := strings.CutPrefix(host, "*.")
 	if host == "" {
-		return "", fmt.Errorf("主机名为空")
+		return "", false, fmt.Errorf("主机名为空")
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		return ip.String(), nil
+		if wildcard {
+			return "", false, fmt.Errorf("通配符只能用于域名")
+		}
+		return ip.String(), false, nil
 	}
 	host, err = idna.Lookup.ToASCII(host)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	host = strings.ToLower(host)
 	if len(host) > 253 {
-		return "", fmt.Errorf("域名超过 253 个字符")
+		return "", false, fmt.Errorf("域名超过 253 个字符")
 	}
 	labels := strings.Split(host, ".")
 	if len(labels) < 2 {
-		return "", fmt.Errorf("域名至少需要两个标签")
+		return "", false, fmt.Errorf("域名至少需要两个标签")
 	}
 	for _, label := range labels {
 		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return "", fmt.Errorf("域名标签无效")
+			return "", false, fmt.Errorf("域名标签无效")
 		}
 		for _, r := range label {
 			if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-') {
-				return "", fmt.Errorf("域名包含无效字符")
+				return "", false, fmt.Errorf("域名包含无效字符")
 			}
 		}
 	}
-	return host, nil
+	return host, wildcard, nil
 }
 
 // ParseScopeLine classifies and validates one scope line (root domain / IP /
@@ -243,9 +247,16 @@ func ParseScopeLine(line string) (ParsedScope, error) {
 		}
 		return r, nil
 	}
-	host, err := scopeHostname(raw)
+	host, wildcard, err := scopeHostname(raw)
 	if err != nil {
 		return r, fmt.Errorf("无法识别为有效域名/IP/CIDR: %s", raw)
+	}
+	// "*.example.com" covers the registrable domain and its subdomains, which is
+	// what a domain rule on example.com already matches. Deeper wildcards are rejected.
+	if wildcard {
+		if root, err := publicsuffix.EffectiveTLDPlusOne(host); err != nil || root != host {
+			return r, fmt.Errorf("通配符只支持可注册域名，例如 *.example.com: %s", raw)
+		}
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		r.Kind = "ip"

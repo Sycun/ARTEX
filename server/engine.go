@@ -1079,7 +1079,17 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, slot WorkerSlot, contr
 		control.pool.mu.Unlock()
 		if intent != nil {
 			log.Printf("[worker %s] task %s 领取意图 #%d", name, t.ID, intent.ID)
-			e.runIntent(ctx, t, name, worker, intent, "", "")
+			runCtx := ctx
+			// Slot-pinned workers stay on their bound profile. Rotation is only
+			// for the unpinned pool, and the counter advances after the claim
+			// so a rolled-back claim does not consume a turn... the claim already
+			// succeeded here. Pinned slots must not call nextRotatedProfile.
+			if slot.ProfileID <= 0 {
+				if head, pinned := t.nextRotatedProfile(); pinned {
+					runCtx = withLLMProfilePin(runCtx, head)
+				}
+			}
+			e.runIntent(runCtx, t, name, worker, intent, "", "")
 		}
 		e.decInflight(t.ID)
 		if intent == nil && sleepCtx(idleCtx, 800*time.Millisecond) {

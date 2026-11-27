@@ -97,6 +97,20 @@ type taskLLMSelection struct {
 	retry agent.RetryConfig
 }
 
+type llmProfilePinKey struct{}
+
+func withLLMProfilePin(ctx context.Context, profileID int64) context.Context {
+	return context.WithValue(ctx, llmProfilePinKey{}, profileID)
+}
+
+func llmProfilePinFrom(ctx context.Context) (int64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	id, ok := ctx.Value(llmProfilePinKey{}).(int64)
+	return id, ok && id > 0
+}
+
 type taskLLMStreamHooks struct {
 	current    func() (taskLLMSelection, error)
 	exhaust    func(taskLLMSelection, error) (db.TaskLLMTransition, error)
@@ -110,6 +124,14 @@ type taskLLMStreamHooks struct {
 // 返回的 profile id 只有走任务链时才非零 —— streamTaskLLM 以此判断额度错误是否
 // 应该推进任务的故障转移状态（绑定/全局路径不改任务链状态，沿用既有语义）。
 func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
+	return r.currentFor(context.Background())
+}
+
+// currentFor resolves the provider for this call. A slot-pinned worker
+// (pinProfileID) is exclusive and ignores per-intent rotation. An unpinned
+// worker honors a context pin when that profile is still ready on the task
+// chain. Agent bindings still win over both the pin and the active head.
+func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, error) {
 	if r.pinProfileID != nil {
 		// Pinned worker runtimes are exclusive: resolve their profile before
 		// touching bindings or the task failover state. A missing or invalid
@@ -144,6 +166,18 @@ func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
 			return sel, &taskLLMError{taskID: r.taskID, chainExhausted: true, cause: errors.New("all selected profiles are quota exhausted")}
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
+		if pin, pinned := llmProfilePinFrom(ctx); pinned && pin != sel.profileID {
+			ready := pt.ReadyLLMProfileIDs
+			if len(ready) == 0 {
+				ready = pt.LLMProfileIDs
+			}
+			for _, id := range ready {
+				if id == pin {
+					sel.profileID = pin
+					break
+				}
+			}
+		}
 		prov, cfg, ok := r.s.providerForProfile(sel.profileID)
 		if !ok {
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
@@ -216,9 +250,9 @@ func parseTaskID(id string) (int64, error) {
 // streamHooks builds the failover/exhaustion callbacks shared by Stream and
 // Complete: how to read the current profile selection, how to mark it quota
 // exhausted, and how to emit a failover transition.
-func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
+func (r *taskLLMRuntime) streamHooks(ctx context.Context) taskLLMStreamHooks {
 	return taskLLMStreamHooks{
-		current: r.current,
+		current: func() (taskLLMSelection, error) { return r.currentFor(ctx) },
 		exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
 			taskNum, _ := parseTaskID(r.taskID)
 			transition, err := r.s.m.pg.MarkTaskLLMProfileQuotaExhaustedAtRevision(taskNum, selection.profileID, selection.revision, cause.Error())
@@ -243,7 +277,7 @@ func (r *taskLLMRuntime) Stream(ctx context.Context, req llm.CompletionRequest) 
 		}
 	}
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
-	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	return streamTaskLLM(ctx, r.taskID, req, r.streamHooks(ctx))
 }
 
 // Complete is the non-streaming counterpart of Stream. A non-streaming call is
@@ -256,7 +290,7 @@ func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest
 		return llm.Message{}, "", llm.Usage{}, err
 	}
 	ctx = llmrec.WithTaskID(ctx, r.taskID)
-	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks())
+	return completeTaskLLM(ctx, r.taskID, req, r.streamHooks(ctx))
 }
 
 func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) (llm.Message, string, llm.Usage, error) {
@@ -687,7 +721,7 @@ func (s *Server) syncTaskLLMState(pt *db.Task) {
 	id := fmt.Sprintf("%d", pt.ID)
 	s.m.mu.Lock()
 	if task := s.m.tasks[id]; task != nil {
-		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
+		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason, pt.LLMRotate)
 	}
 	s.m.mu.Unlock()
 }

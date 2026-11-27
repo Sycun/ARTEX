@@ -3,6 +3,7 @@ import { errorMessages } from "./error-messages";
 import { inlineEditorMessages } from "./inline-editor-messages";
 import { notifyMessages } from "./notify-messages";
 import { overviewMessages } from "./overview-messages";
+import { phase4Messages } from "./phase4-messages";
 import { scheduleMessages } from "./schedule-messages";
 import screenCatalog from "./screen-catalog.json";
 import { settingsMessages } from "./settings-messages";
@@ -25,6 +26,7 @@ export const messages = {
   ...overviewMessages,
   ...settingsMessages,
   ...settingsRuntimeMessages,
+  ...phase4Messages,
   "common.cancel": ["取消", "Cancel"],
   "common.retry": ["重试", "Retry"],
   "common.close": ["关闭", "Close"],
@@ -59,6 +61,7 @@ export const messages = {
   "nav.skills": ["Skill", "Skills"],
   "nav.tools": ["工具", "Tools"],
   "nav.notify": ["通知推送", "Notifications"],
+  "nav.chat-bridge": ["Chat Bridge", "Chat Bridge"],
   "nav.intercept": ["拦截规则", "Interception rules"],
   "nav.asset-intercept": ["资产拦截", "Asset interception"],
   "nav.approvals": ["审批记录", "Approval history"],

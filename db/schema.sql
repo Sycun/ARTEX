@@ -341,6 +341,12 @@ CREATE INDEX IF NOT EXISTS idx_act_result_usage ON activity(exploration_id)
     INCLUDE (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
     WHERE kind='result';
 CREATE INDEX IF NOT EXISTS idx_act_latest ON activity(exploration_id, created_at DESC);
+-- Dashboard daily token rollups filter kind='result' by created_at. Keep this
+-- index in db/partitions.go ledgerIndexes so monthly partitions do not drop it.
+CREATE INDEX IF NOT EXISTS idx_act_result_created
+    ON activity(created_at)
+    INCLUDE (input_tokens, output_tokens, cache_read_tokens)
+    WHERE kind = 'result';
 
 -- main_sessions records the resettable main-agent conversation segments of a task.
 -- Segment 0 (the original session) is implicit and never stored; this table holds
@@ -366,7 +372,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS llm_profiles (
     id               BIGSERIAL PRIMARY KEY,
     name             TEXT NOT NULL UNIQUE,
-    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses','gemini','jev')),
+    format           TEXT NOT NULL CHECK (format IN ('openai','anthropic','openai-responses','gemini','jev','ollama','bedrock-gateway')),
     base_url         TEXT,
     proxy            TEXT,
     model            TEXT NOT NULL,
@@ -419,11 +425,11 @@ ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS priority     INTEGER NOT NULL 
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS pool_exclude BOOLEAN NOT NULL DEFAULT false;
 -- 流式开关；补旧库。默认 true = 保持既有的流式行为，旧配置无感升级。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS streaming    BOOLEAN NOT NULL DEFAULT true;
--- 放开 format 约束以容纳 openai-responses(OpenAI Responses API)、gemini(Google Gemini)和 Jev System One；补旧库。
--- 每次启动执行,幂等:先删旧 CHECK 再建新 CHECK。
+-- 放开 format 约束。七种格式共存：openai、anthropic、openai-responses、gemini、jev、ollama、bedrock-gateway。
+-- 每次启动执行,幂等:先删旧 CHECK 再建新 CHECK。不得拿掉既有 gemini / jev。
 ALTER TABLE llm_profiles DROP CONSTRAINT IF EXISTS llm_profiles_format_check;
 ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_format_check
-    CHECK (format IN ('openai','anthropic','openai-responses','gemini','jev'));
+    CHECK (format IN ('openai','anthropic','openai-responses','gemini','jev','ollama','bedrock-gateway'));
 
 -- 输出上限及其字段名；补旧库。默认 0 / '' = 不发送上限、沿用 max_tokens 字段名，
 -- 旧配置行为完全不变。
@@ -438,6 +444,12 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_max_tokens_check
     CHECK (max_tokens >= 0);
 -- 自定义会话头名；补旧库。默认 '' = 不发送，旧配置行为不变。
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_header_key TEXT NOT NULL DEFAULT '';
+-- Bedrock gateway 静态请求头（每行 Name: Value）。单价是每百万 token 的美元价格，0 = 未配置。
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS custom_headers TEXT NOT NULL DEFAULT '';
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_input_per_m NUMERIC(12,6) NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_output_per_m NUMERIC(12,6) NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_cache_read_per_m NUMERIC(12,6) NOT NULL DEFAULT 0;
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS price_cache_write_per_m NUMERIC(12,6) NOT NULL DEFAULT 0;
 
 -- 单配置的重试覆盖（见 docs/LLM重试设计.md）。三组各自一对「次数 + 固定间隔」，
 -- 语义统一：次数 0=沿用全局默认、-1=关闭该层重试、>0=用该值；间隔 0=沿用该层的
@@ -1021,6 +1033,10 @@ CREATE TABLE IF NOT EXISTS conversation_activities (
 CREATE INDEX IF NOT EXISTS idx_conv_act ON conversation_activities(conversation_id, id);
 CREATE INDEX IF NOT EXISTS idx_conv_act_tool_call ON conversation_activities(conversation_id, tool_use_id, id)
   WHERE kind IN ('tool_use', 'tool_result');
+CREATE INDEX IF NOT EXISTS idx_conv_act_result
+    ON conversation_activities(conversation_id)
+    INCLUDE (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+    WHERE kind = 'result';
 
 -- =====================================================================
 -- J. Agent 触发器
@@ -2272,6 +2288,8 @@ $$;
 
 -- Opt-in asset target gate. false keeps every existing task and conversation unchanged.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
+-- Per-intent round-robin over the task LLM chain. Default off: workers stay on the active head.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_rotate BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
 -- Why the current run ended ('' = normal). Cleared when a task leaves a terminal state.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS end_reason TEXT NOT NULL DEFAULT '';
@@ -2529,3 +2547,46 @@ CREATE TABLE IF NOT EXISTS traffic_tamper_hook_versions (
     UNIQUE (hook_id, version)
 );
 CREATE INDEX IF NOT EXISTS idx_tamper_hook_versions_hook ON traffic_tamper_hook_versions(hook_id, version DESC);
+
+-- Opt-in LLM context size telemetry. Written only when ARTEX_CONTEXT_TELEMETRY=1.
+-- Sizes and token counts only; never prompt, tool, or message content.
+CREATE TABLE IF NOT EXISTS llm_context (
+    id                       BIGSERIAL PRIMARY KEY,
+    ts                       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    task_id                  TEXT,
+    worker                   TEXT,
+    model                    TEXT,
+    profile                  TEXT,
+    tool_count               INTEGER NOT NULL DEFAULT 0,
+    message_count            INTEGER NOT NULL DEFAULT 0,
+    system_static_bytes      BIGINT NOT NULL DEFAULT 0,
+    system_dynamic_bytes     BIGINT NOT NULL DEFAULT 0,
+    tools_bytes              BIGINT NOT NULL DEFAULT 0,
+    messages_user_bytes      BIGINT NOT NULL DEFAULT 0,
+    messages_assistant_bytes BIGINT NOT NULL DEFAULT 0,
+    messages_other_bytes     BIGINT NOT NULL DEFAULT 0,
+    tool_result_bytes        BIGINT NOT NULL DEFAULT 0,
+    last_message_bytes       BIGINT NOT NULL DEFAULT 0,
+    input_tokens             INTEGER NOT NULL DEFAULT 0,
+    output_tokens            INTEGER NOT NULL DEFAULT 0,
+    cache_read               INTEGER NOT NULL DEFAULT 0,
+    cache_write              INTEGER NOT NULL DEFAULT 0,
+    status                   TEXT NOT NULL DEFAULT 'ok'
+);
+CREATE INDEX IF NOT EXISTS idx_llm_context_ts           ON llm_context(ts);
+CREATE INDEX IF NOT EXISTS idx_llm_context_task         ON llm_context(task_id);
+CREATE INDEX IF NOT EXISTS idx_llm_context_worker_model ON llm_context(worker, model);
+
+-- Inbound chat bridges. Default disabled. Config may hold a bot token and is sealed at rest.
+-- Isolated from enterprise notification delivery.
+CREATE TABLE IF NOT EXISTS chat_bridges (
+    id             BIGSERIAL PRIMARY KEY,
+    kind           TEXT NOT NULL UNIQUE,
+    enabled        BOOLEAN NOT NULL DEFAULT false,
+    config         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    allowed_chats  JSONB NOT NULL DEFAULT '[]'::jsonb,
+    poll_offset    BIGINT NOT NULL DEFAULT 0,
+    config_version BIGINT NOT NULL DEFAULT 1,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

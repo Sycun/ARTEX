@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 CREATE INDEX IF NOT EXISTS idx_llm_usage_task  ON llm_usage(task_id);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_model ON llm_usage(task_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_usage_exp   ON llm_usage(exploration_id);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_judge_ts
+    ON llm_usage(ts)
+    INCLUDE (input_tokens, output_tokens, cache_read, cache_write)
+    WHERE worker = 'judge';
 `
 
 // TaskLLMSpend sums planner, worker, judge and compactor calls for one task.

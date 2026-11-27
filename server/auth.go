@@ -178,7 +178,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			return
 		}
 		p := r.URL.Path
-		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" || p == "/api/basic-auth/check" || s.enterprisePublic(p) {
+		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" || p == "/api/ready" || p == "/api/basic-auth/check" || s.enterprisePublic(p) {
 			h.ServeHTTP(w, r)
 			return
 		}

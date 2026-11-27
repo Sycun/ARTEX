@@ -53,16 +53,18 @@ func (c secretColumn) valueExpr() string {
 }
 
 var (
-	colRewriteMatchers = secretColumn{"traffic_rewrite_rules", "matchers", true}
-	colRewriteActions  = secretColumn{"traffic_rewrite_rules", "actions", true}
-	colHookMatchers    = secretColumn{"traffic_tamper_hooks", "matchers", true}
-	colHookSource      = secretColumn{"traffic_tamper_hooks", "source", false}
-	colHookVerMatchers = secretColumn{"traffic_tamper_hook_versions", "matchers", true}
-	colHookVerSource   = secretColumn{"traffic_tamper_hook_versions", "source", false}
-	secretColumns      = []secretColumn{
+	colRewriteMatchers  = secretColumn{"traffic_rewrite_rules", "matchers", true}
+	colRewriteActions   = secretColumn{"traffic_rewrite_rules", "actions", true}
+	colHookMatchers     = secretColumn{"traffic_tamper_hooks", "matchers", true}
+	colHookSource       = secretColumn{"traffic_tamper_hooks", "source", false}
+	colHookVerMatchers  = secretColumn{"traffic_tamper_hook_versions", "matchers", true}
+	colHookVerSource    = secretColumn{"traffic_tamper_hook_versions", "source", false}
+	colChatBridgeConfig = secretColumn{"chat_bridges", "config", true}
+	secretColumns       = []secretColumn{
 		colRewriteMatchers, colRewriteActions,
 		colHookMatchers, colHookSource,
 		colHookVerMatchers, colHookVerSource,
+		colChatBridgeConfig,
 	}
 )
 

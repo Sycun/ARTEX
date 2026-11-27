@@ -25,6 +25,7 @@ import { clearProject, ent, type ProjectBrief, projectPath } from "@/lib/enterpr
 import { getSidebarItems, type NavGroup, type NavMainLinkItem } from "@/navigation/sidebar/sidebar-items";
 import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
 
+import { CompanySwitcher } from "./company-switcher";
 import { NavMain } from "./nav-main";
 import { NavUser } from "./nav-user";
 
@@ -73,6 +74,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
+      {path.startsWith("/enterprise") ? null : <CompanySwitcher />}
       <SidebarContent>
         {bench?.active && (
           <p className="px-3 pb-1 text-xs text-muted-foreground">

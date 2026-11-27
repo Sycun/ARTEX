@@ -30,6 +30,7 @@ import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSend
 import type { EgressReport, LLMProfile, ProxyPoolEntry, Settings, WorkerPool } from "@/lib/types";
 
 import { useEgressIp } from "../../_components/egress-ip-banner";
+import { NoiseProfileCard } from "./noise-profile-card";
 import { BackupCard } from "./_components/backup-card";
 import { BasicAuthCard } from "./_components/basic-auth-card";
 import { McpServerCard } from "./_components/mcp-server-card";
@@ -770,6 +771,7 @@ export default function SystemSettingsPage() {
             {isSettingVisible("system", "settings.keywords.backup") ? <BackupCard /> : null}
             {isSettingVisible("system", "settings.keywords.basicAuth") ? <BasicAuthCard /> : null}
             {isSettingVisible("system", "settings.keywords.mcpServer") ? <McpServerCard /> : null}
+            {isSettingVisible("system", "settings.keywords.noise") ? <NoiseProfileCard /> : null}
 
             <Card
               className={`${isSettingVisible("traffic", "settings.keywords.trafficCapture") ? "" : "hidden"} mb-4 break-inside-avoid md:mb-6`}

@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"log"
 	"net/http"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -77,6 +79,8 @@ type Config struct {
 	// 空 = 不发送。值由 transcript.WithSessionID 挂在请求 context 上,由 RoundTripper
 	// 读取填入,因此同一共享 provider 也能按会话发出不同的头值。
 	SessionHeaderKey string
+	// CustomHeaders are static Bedrock gateway headers, one Name: Value per line.
+	CustomHeaders string
 	// Retry 是该配置解析后的重试参数(profile 覆盖 → 全局策略 → 内置默认,由
 	// server 侧解析)。三层的含义见 RetryConfig;零值 = 完全沿用内置默认。
 	Retry RetryConfig
@@ -101,6 +105,32 @@ type RetryConfig struct {
 	StreamAttempts int
 	StreamInterval time.Duration
 }
+
+// FormatOllama is a local Ollama server. On the wire it speaks OpenAI Chat
+// Completions; the sentinel exists so a profile is usable without an API key.
+const FormatOllama llm.Format = "ollama"
+
+// FormatBedrockGateway is an HTTPS Bedrock-compatible gateway. AWS event-stream
+// decoding stays inside agent/bedrock_gateway.go. This build does not add an
+// S3 archive client.
+const FormatBedrockGateway llm.Format = "bedrock-gateway"
+
+const DefaultOllamaBaseURL = "http://127.0.0.1:11434/v1"
+const ollamaPlaceholderKey = "ollama"
+
+func normalizeOllamaBaseURL(raw string) string {
+	b := strings.TrimRight(strings.TrimSuffix(strings.TrimSpace(raw), "/chat/completions"), "/")
+	if b == "" {
+		return DefaultOllamaBaseURL
+	}
+	if !strings.HasSuffix(b, "/v1") {
+		b += "/v1"
+	}
+	return b
+}
+
+// NeedsAPIKey reports whether the format requires an API key. Ollama is keyless.
+func (c Config) NeedsAPIKey() bool { return c.Format != FormatOllama }
 
 // compaction window resolution bounds (in K tokens). Below the floor the
 // threshold math (window − summary reserve − buffer) would go non-positive and
@@ -140,13 +170,13 @@ func compactionConfig(windowTokens int) *compaction.Config {
 
 // FromEnv resolves the LLM provider config:
 //
-//	ARTEX_LLM_PROVIDER = anthropic|openai|openai-responses|gemini (default: inferred from keys)
+//	ARTEX_LLM_PROVIDER = anthropic|openai|openai-responses|gemini|ollama|bedrock-gateway (default: inferred from keys)
 //	ARTEX_LLM_MODEL    = model id        (default: per provider)
 //	ARTEX_LLM_BASE_URL = endpoint        (optional)
 //	ARTEX_LLM_PROXY    = proxy URL        (optional; http/https/socks5)
 //	ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY = credentials
 func FromEnv() (Config, bool) {
-	prov := os.Getenv("ARTEX_LLM_PROVIDER")
+	prov := strings.ToLower(strings.TrimSpace(os.Getenv("ARTEX_LLM_PROVIDER")))
 	anthKey := os.Getenv("ANTHROPIC_API_KEY")
 	oaiKey := os.Getenv("OPENAI_API_KEY")
 	geminiKey := os.Getenv("GEMINI_API_KEY")
@@ -194,6 +224,19 @@ func FromEnv() (Config, bool) {
 		if c.Model == "" {
 			c.Model = defaultGeminiModel
 		}
+	case "ollama":
+		c.Format = FormatOllama
+		c.BaseURL = normalizeOllamaBaseURL(c.BaseURL)
+		if c.Model == "" {
+			c.Model = "llama3.2"
+		}
+	case "bedrock-gateway":
+		c.Format = FormatBedrockGateway
+		c.APIKey = strings.TrimSpace(os.Getenv("ARTEX_LLM_API_KEY"))
+		c.CustomHeaders = os.Getenv("ARTEX_LLM_CUSTOM_HEADERS")
+		if c.BaseURL == "" || c.Model == "" {
+			return Config{}, false
+		}
 	default:
 		c.Format = llm.FormatAnthropic
 		c.APIKey = anthKey
@@ -201,7 +244,7 @@ func FromEnv() (Config, bool) {
 			c.Model = "claude-opus-4-8"
 		}
 	}
-	if c.APIKey == "" {
+	if c.NeedsAPIKey() && c.APIKey == "" {
 		return Config{}, false
 	}
 	return c, true
@@ -245,6 +288,15 @@ func ConfigFrom(provider, model, baseURL, apiKey, proxy string) Config {
 		if c.Model == "" {
 			c.Model = defaultGeminiModel
 		}
+	case "ollama":
+		c.Format = FormatOllama
+		c.BaseURL = normalizeOllamaBaseURL(c.BaseURL)
+		if c.Model == "" {
+			c.Model = "llama3.2"
+		}
+	case "bedrock-gateway":
+		c.Format = FormatBedrockGateway
+		c.BaseURL = strings.TrimRight(strings.TrimSuffix(strings.TrimSuffix(c.BaseURL, "/invoke-with-response-stream"), "/invoke"), "/")
 	default:
 		c.Format = llm.FormatAnthropic
 		// provider appends "/v1/messages".
@@ -266,7 +318,7 @@ func isFalsy(s string) bool {
 	return false
 }
 
-// Provider returns the short provider name ("anthropic"/"openai"/"openai-responses"/"gemini"/"jev").
+// Provider returns the short provider name ("anthropic"/"openai"/"openai-responses"/"gemini"/"jev"/"ollama"/"bedrock-gateway").
 func (c Config) Provider() string {
 	if c.Jev {
 		return "jev"
@@ -278,6 +330,10 @@ func (c Config) Provider() string {
 		return "openai-responses"
 	case FormatGemini:
 		return "gemini"
+	case FormatOllama:
+		return "ollama"
+	case FormatBedrockGateway:
+		return "bedrock-gateway"
 	}
 	return "anthropic"
 }
@@ -308,14 +364,40 @@ func (c Config) newProvider(client *http.Client, limiter *RequestLimiter) (llm.P
 	if err := limiter.configure(c.RatePerSecond, c.RatePerMinute); err != nil {
 		return nil, err
 	}
+	wireFormat := c.Format
+	baseURL := c.BaseURL
+	apiKey := c.APIKey
+	if wireFormat == FormatOllama {
+		wireFormat = llm.FormatOpenAI
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = DefaultOllamaBaseURL
+		}
+		if strings.TrimSpace(apiKey) == "" {
+			apiKey = ollamaPlaceholderKey
+		}
+	}
+	if wireFormat == FormatBedrockGateway {
+		headers, err := validateBedrockGateway(baseURL, apiKey, c.Model, c.CustomHeaders)
+		if err != nil {
+			return nil, err
+		}
+		wireFormat = llm.FormatAnthropic
+		qt, ok := client.Transport.(quotaAwareTransport)
+		if !ok {
+			return nil, fmt.Errorf("bedrock gateway transport is not initialized")
+		}
+		qt.base = &bedrockGatewayTransport{base: qt.base, baseURL: baseURL, token: apiKey, model: c.Model, headers: headers}
+		client.Transport = qt
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
 	client.Transport = rateLimitedTransport{base: client.Transport, limiter: limiter}
 	if c.Format == FormatGemini {
 		return newGeminiProvider(c, client)
 	}
 	lc := llm.Config{
-		Format:     c.Format,
-		BaseURL:    c.BaseURL,
-		APIKey:     c.APIKey,
+		Format:     wireFormat,
+		BaseURL:    baseURL,
+		APIKey:     apiKey,
 		Model:      c.Model,
 		HTTPClient: client,
 	}
@@ -518,17 +600,29 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	// 就撞到输出上限(finish=length)、被截断,连接测试虽仍算通(err=nil)但显示成
 	// "已中断/length/resume" 一团糟。给足预算让它把 OK 干净吐完(finish=stop)。
 	// EscalateMaxTokens 保持 false:不因截断而抬额重试,避免 resume 循环空烧。
+	probe := &connTestProvider{inner: prov}
+	maxTokens := 8192
+	if c.MaxTokens > 0 {
+		maxTokens = c.MaxTokens
+	}
 	reply, err := agentcore.Run(ctx, agentcore.Options{
-		Provider:       prov,
+		Provider:       probe,
 		SystemPrompt:   []string{"你是连接测试。直接输出两个字符 OK 即可，不要思考、不要解释、不要别的。"},
+		Tools:          []actool.CoreTool{}, // nil would install the SDK's file and shell tools
 		PermissionMode: acperm.ModeBypass,
 		MaxTurns:       1,
-		MaxTokens:      8192,
+		MaxTokens:      maxTokens,
 		NonStreaming:   !c.Stream, // 用该 profile 的真实收发模式做连接测试
+		// Keep TaskOutput/TaskStop/TaskList/Monitor out of the probe. The output
+		// cap still travels under MaxTokensField (max_tokens or max_completion_tokens).
+		DisableBackgroundTasks: true,
 	}, "ping")
 	lat := time.Since(start)
 	if err != nil {
 		return lat, "", err
+	}
+	if probe.sawToolCall || isToolCallStopReason(probe.stopReason) {
+		return lat, "", fmt.Errorf("模型返回了工具调用而不是文本（finish_reason=%q）", probe.stopReason)
 	}
 	// err==nil 还不够：请求通了但模型一个字都不吐的情况真实存在(思考把预算烧光、
 	// 正文被安全策略吞掉、兼容层把 content 丢了)。这种配置在会话里就是"不回话",
@@ -538,4 +632,50 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 		return lat, "", fmt.Errorf("模型无回复内容（请求已通，但未返回任何文本）")
 	}
 	return lat, reply, nil
+}
+
+type connTestProvider struct {
+	inner       llm.Provider
+	sawToolCall bool
+	stopReason  string
+}
+
+func (p *connTestProvider) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
+	return func(yield func(llm.StreamEvent, error) bool) {
+		for ev, err := range p.inner.Stream(ctx, req) {
+			if err == nil {
+				if ev.Type == llm.SEToolUseStart {
+					p.sawToolCall = true
+				}
+				if ev.StopReason != "" {
+					p.stopReason = ev.StopReason
+				}
+			}
+			if !yield(ev, err) {
+				return
+			}
+		}
+	}
+}
+
+func (p *connTestProvider) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Message, string, llm.Usage, error) {
+	msg, stopReason, usage, err := p.inner.Complete(ctx, req)
+	if err == nil {
+		if len(msg.ToolUses()) > 0 {
+			p.sawToolCall = true
+		}
+		if stopReason != "" {
+			p.stopReason = stopReason
+		}
+	}
+	return msg, stopReason, usage, err
+}
+
+func isToolCallStopReason(stopReason string) bool {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "tool_use", "tool_calls":
+		return true
+	default:
+		return false
+	}
 }

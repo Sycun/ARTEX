@@ -44,6 +44,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
+import { useActiveCompany } from "@/stores/company/company-store";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { SEVERITY_FILTER_OPTIONS, statusMeta } from "@/lib/status";
 import type {
@@ -143,6 +144,9 @@ export default function FindingsPage() {
   const [view, setView] = React.useState<FindingView>("cases");
   const [severity, setSeverity] = React.useState<"all" | Severity>("all");
   const [status, setStatus] = React.useState<"all" | FindingStatus>("all");
+  const [verification, setVerification] = React.useState("all");
+  const company = useActiveCompany();
+  const [bulkBusy, setBulkBusy] = React.useState(false);
   const [vulnclass, setVulnclass] = React.useState<string>("all");
   const [task, setTask] = React.useState<string>("all");
   const [sort, setSort] = React.useState<"severity" | "time">("severity");
@@ -183,6 +187,8 @@ export default function FindingsPage() {
     query,
     dateRange.from,
     dateRange.to,
+    company,
+    verification,
   ]);
   const activeFilterFingerprint = React.useRef(filterFingerprint);
   activeFilterFingerprint.current = filterFingerprint;
@@ -349,6 +355,8 @@ export default function FindingsPage() {
           sort,
           ...dateRange,
           assetScope: view === "asset" ? (assetScope ?? undefined) : undefined,
+          company,
+          verification: verification === "all" ? undefined : verification,
         },
         ids: [...selectedIds],
         includeOriginals,
@@ -397,6 +405,8 @@ export default function FindingsPage() {
           sort,
           assetScope: activeAssetScope ?? undefined,
           ...dateRange,
+          company,
+          verification: verification === "all" ? undefined : verification,
         },
         true,
       );
@@ -425,6 +435,8 @@ export default function FindingsPage() {
     task,
     query,
     sort,
+    company,
+    verification,
   ]);
 
   // loadAssetTree 取整棵资产树。树不随选中节点变化(否则选一下就塌成一条链),
@@ -435,7 +447,17 @@ export default function FindingsPage() {
     const request = ++assetTreeRequest.current;
     setAssetTree((current) => ({ ...current, loading: true }));
     try {
-      const result = await api.findingAssetTree({ severity, status, vulnclass, task, query, sort, ...dateRange });
+      const result = await api.findingAssetTree({
+        severity,
+        status,
+        vulnclass,
+        task,
+        query,
+        sort,
+        ...dateRange,
+        company,
+        verification: verification === "all" ? undefined : verification,
+      });
       if (request !== assetTreeRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setAssetTree({
         nodes: result.nodes ?? [],
@@ -467,6 +489,8 @@ export default function FindingsPage() {
         query,
         sort,
         ...dateRange,
+        company,
+        verification: verification === "all" ? undefined : verification,
       });
       if (request !== groupsRequest.current || activeFilterFingerprint.current !== requestFilter) return;
       setGroups(result.items);
@@ -507,6 +531,8 @@ export default function FindingsPage() {
             query,
             sort,
             ...dateRange,
+            company,
+            verification: verification === "all" ? undefined : verification,
           },
           true,
         );
@@ -657,8 +683,18 @@ export default function FindingsPage() {
   }, [flat.loaded, flat.total, flatPage, flatPageSize]);
 
   const statsQuery = React.useMemo(
-    () => ({ severity, status, vulnclass, task, query, ...dateRange, assetScope: activeAssetScope ?? undefined }),
-    [severity, status, vulnclass, task, query, dateRange, activeAssetScope],
+    () => ({
+      severity,
+      status,
+      vulnclass,
+      task,
+      query,
+      ...dateRange,
+      assetScope: activeAssetScope ?? undefined,
+      company,
+      verification: verification === "all" ? undefined : verification,
+    }),
+    [severity, status, vulnclass, task, query, dateRange, activeAssetScope, company, verification],
   );
   const statsFingerprint = JSON.stringify(statsQuery);
   const activeStatsFingerprint = React.useRef(statsFingerprint);
@@ -1043,6 +1079,20 @@ export default function FindingsPage() {
             </SelectContent>
           </Select>
 
+          <Select value={verification} onValueChange={setVerification}>
+            <SelectTrigger size="sm" className="w-36 shrink-0">
+              <SelectValue placeholder={t("findings.verification")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">{t("findings.verification.all")}</SelectItem>
+              {(["verified", "unverified", "blocked", "not_assessed", "false_positive"] as const).map((item) => (
+                <SelectItem key={item} value={item}>
+                  {t(`findings.verification.${item}`)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
           <Select value={vulnclass} onValueChange={setVulnclass}>
             <SelectTrigger size="sm" className="w-40 shrink-0">
               <SelectValue placeholder={ui("screen.5600494fad709b")} />
@@ -1124,6 +1174,36 @@ export default function FindingsPage() {
               {selectedIds.size}
               {ui("punctuation.f2e44c6c95")}
             </Button>
+            <Select
+              value=""
+              onValueChange={(next) => {
+                const ids = [...selectedIds].map((id) => Number(id)).filter((id) => id > 0);
+                if (ids.length === 0) {
+                  toast.error(t("findings.bulkStatusEmpty"));
+                  return;
+                }
+                setBulkBusy(true);
+                void api
+                  .bulkSetFindingStatus(ids, next as FindingStatus)
+                  .then((result) => {
+                    toast.success(t("findings.bulkStatusDone", { count: result.updated }));
+                    setSelectedIds(new Set());
+                  })
+                  .catch((error: Error) => toast.error(t("findings.bulkStatusFailed", { error: error.message })))
+                  .finally(() => setBulkBusy(false));
+              }}
+            >
+              <SelectTrigger size="sm" className="w-36" disabled={bulkBusy || selectedIds.size === 0}>
+                <SelectValue placeholder={t("findings.bulkStatus")} />
+              </SelectTrigger>
+              <SelectContent>
+                {FINDING_STATUSES.map((item) => (
+                  <SelectItem key={item} value={item}>
+                    {statusMeta("finding", item, t).label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Button size="sm" variant="outline" onClick={openExport}>
               <DownloadIcon /> {ui("screen.76420433f22d1c")}
             </Button>

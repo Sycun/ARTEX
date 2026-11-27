@@ -1968,6 +1968,29 @@ func (s *Server) pgSaveProfile(w http.ResponseWriter, r *http.Request) {
 	if p.Format != "openai" || p.MaxTokensField != llm.MaxTokensFieldCompletion {
 		p.MaxTokensField = ""
 	}
+	if p.ID != 0 {
+		existing, err := pg.ProfileByID(p.ID)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if existing != nil {
+			same := sameLLMEndpoint(p.Format, p.BaseURL, existing.Format, existing.BaseURL)
+			if !same && strings.TrimSpace(p.APIKey) == "" {
+				writeErr(w, http.StatusBadRequest, "changing the endpoint requires a new API key")
+				return
+			}
+			if !same {
+				p.CustomHeaders = ""
+			} else if strings.TrimSpace(p.CustomHeaders) == "" {
+				p.CustomHeaders = existing.CustomHeaders
+			}
+		}
+	}
+	if _, err := agent.ParseBedrockGatewayHeaders(p.CustomHeaders); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	id, err := pg.SaveProfile(&p)
 	if err != nil {
 		if errors.Is(err, db.ErrJevProfileJudgeOnly) {
@@ -2174,6 +2197,9 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	req.BaseURL = baseURL
+	if provider == "ollama" && apiKey == "" {
+		apiKey = "ollama"
+	}
 	if apiKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
 		return
@@ -2240,6 +2266,15 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 	case "gemini":
 		b := agent.GeminiBaseWithVersion(baseURL)
 		candidates = append(candidates, candidate{b + "/models?pageSize=1000", geminiHdr()})
+	case "ollama":
+		b := strings.TrimRight(strings.TrimSuffix(baseURL, "/chat/completions"), "/")
+		if b == "" {
+			b = "http://127.0.0.1:11434"
+		}
+		if !strings.HasSuffix(b, "/v1") {
+			b += "/v1"
+		}
+		candidates = append(candidates, candidate{b + "/models", bearerHdr()})
 	default: // anthropic
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com"

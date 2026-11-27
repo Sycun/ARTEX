@@ -40,6 +40,8 @@ func findingFilterFromQuery(q url.Values) db.FindingFilter {
 		From:          strings.TrimSpace(q.Get("from")),
 		To:            strings.TrimSpace(q.Get("to")),
 		AssetScope:    strings.TrimSpace(q.Get("asset_scope")),
+		Company:       strings.TrimSpace(q.Get("company")),
+		Verification:  strings.TrimSpace(q.Get("verification")),
 	}
 }
 

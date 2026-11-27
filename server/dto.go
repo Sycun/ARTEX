@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -366,6 +367,8 @@ type FindingDTO struct {
 	Name                 string `json:"name,omitempty"` // 漏洞名称;为空时前端回退展示 vulnclass
 	Severity             string `json:"severity"`       // critical | high | medium | low
 	Status               string `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
+	VerificationStatus   string `json:"verification_status,omitempty"`
+	PoeLevel             int    `json:"poe_level,omitempty"`
 	Summary              string `json:"summary"`
 	Evidence             string `json:"evidence"`
 	Report               string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
@@ -504,6 +507,8 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		Name:                 f.Name,
 		Severity:             f.Severity,
 		Status:               status,
+		VerificationStatus:   f.VerificationStatus,
+		PoeLevel:             f.PoeLevel,
 		Summary:              f.Summary,
 		Evidence:             f.Evidence,
 		Report:               f.Report,
@@ -672,6 +677,12 @@ type LLMProfileDTO struct {
 	// 自定义会话头名：非空时每次请求带该 HTTP 头，头值=当前会话/意图的 session id。
 	// ''=不发送。用于按 session-id 头做提示缓存/粘性路由的网关。
 	SessionHeaderKey string `json:"session_header_key"`
+	// Header values stay on the server. The UI only learns whether any are stored.
+	CustomHeadersSet    bool    `json:"custom_headers_set"`
+	PriceInputPerM      float64 `json:"price_input_per_m,omitempty"`
+	PriceOutputPerM     float64 `json:"price_output_per_m,omitempty"`
+	PriceCacheReadPerM  float64 `json:"price_cache_read_per_m,omitempty"`
+	PriceCacheWritePerM float64 `json:"price_cache_write_per_m,omitempty"`
 	// 本配置对重试的覆盖(建连/空响应/同 provider 安全窗口)。每项 attempts:
 	// 0=继承全局策略 | -1=关闭该层重试 | >0=次数；interval_ms: 0=用默认指数退避 |
 	// >0=改用该固定毫秒间隔。全 0 = 完全跟随全局，即历史行为。
@@ -680,26 +691,31 @@ type LLMProfileDTO struct {
 
 func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 	return LLMProfileDTO{
-		ID:               i64s(p.ID),
-		Name:             p.Name,
-		Format:           p.Format,
-		BaseURL:          p.BaseURL,
-		Proxy:            p.Proxy,
-		Model:            p.Model,
-		APIKeyHint:       p.APIKeyHint,
-		RatePerSecond:    p.RatePerSecond,
-		RatePerMinute:    p.RatePerMinute,
-		ContextWindowK:   p.ContextWindowK,
-		ThinkingType:     p.ThinkingType,
-		ReasoningEffort:  p.ReasoningEffort,
-		IsDefault:        p.IsDefault,
-		Priority:         p.Priority,
-		PoolExclude:      p.PoolExclude,
-		Streaming:        p.Streaming,
-		MaxTokens:        p.MaxTokens,
-		MaxTokensField:   p.MaxTokensField,
-		SessionHeaderKey: p.SessionHeaderKey,
-		Retry:            p.Retry,
+		ID:                  i64s(p.ID),
+		Name:                p.Name,
+		Format:              p.Format,
+		BaseURL:             p.BaseURL,
+		Proxy:               p.Proxy,
+		Model:               p.Model,
+		APIKeyHint:          p.APIKeyHint,
+		RatePerSecond:       p.RatePerSecond,
+		RatePerMinute:       p.RatePerMinute,
+		ContextWindowK:      p.ContextWindowK,
+		ThinkingType:        p.ThinkingType,
+		ReasoningEffort:     p.ReasoningEffort,
+		IsDefault:           p.IsDefault,
+		Priority:            p.Priority,
+		PoolExclude:         p.PoolExclude,
+		Streaming:           p.Streaming,
+		MaxTokens:           p.MaxTokens,
+		MaxTokensField:      p.MaxTokensField,
+		SessionHeaderKey:    p.SessionHeaderKey,
+		CustomHeadersSet:    strings.TrimSpace(p.CustomHeaders) != "",
+		PriceInputPerM:      p.PriceInputPerM,
+		PriceOutputPerM:     p.PriceOutputPerM,
+		PriceCacheReadPerM:  p.PriceCacheReadPerM,
+		PriceCacheWritePerM: p.PriceCacheWritePerM,
+		Retry:               p.Retry,
 	}
 }
 

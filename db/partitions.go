@@ -358,6 +358,7 @@ func ledgerIndexes(table string) []ledgerIndex {
 			{[]string{"exploration_id", "main_seg", "id", "worker"}, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_act_main_seg ON %s (exploration_id, main_seg, id) WHERE worker='mainagent'`, t)},
 			{[]string{"exploration_id", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "kind"}, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_act_result_usage ON %s (exploration_id) INCLUDE (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens) WHERE kind='result'`, t)},
 			{[]string{"exploration_id", "created_at"}, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_act_latest ON %s (exploration_id, created_at DESC)`, t)},
+			{[]string{"created_at", "input_tokens", "output_tokens", "cache_read_tokens", "kind"}, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_act_result_created ON %s (created_at) INCLUDE (input_tokens, output_tokens, cache_read_tokens) WHERE kind = 'result'`, t)},
 		}
 	case "ent_audit":
 		return []ledgerIndex{

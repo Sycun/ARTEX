@@ -72,6 +72,8 @@ type Server struct {
 
 	entMode      bool
 	ent          *enterprise.Service
+	readyPG      readyCache
+	chatBridges  *chatBridgeRunner
 	oidc         OIDCProvider
 	publicOrigin string
 
@@ -393,6 +395,10 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 		s.startTaskArchiveWorker()
 		if m.pg != nil {
 			go newNotifier(s).Run(s.ctx)
+			// Chat Bridge is a separate inbound poller. It does not share the
+			// enterprise notification pipeline and stays idle until a row is enabled.
+			s.chatBridges = newChatBridgeRunner(m.pg)
+			go s.chatBridges.Run(s.ctx)
 		}
 	}
 	return s
@@ -510,8 +516,9 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	if cfg.NeedsAPIKey() && cfg.APIKey == "" {
 		return cfg, false
 	}
 	s.cfgMu.Lock()
@@ -539,6 +546,9 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var maxTokens int
 	var maxTokensField string
 	var sessionHeaderKey string
+	var customHeaders string
+	var storedFormat, storedBase string
+	var priceIn, priceOut, priceCacheRead, priceCacheWrite float64
 	var retry db.RetryOverride
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
@@ -546,10 +556,16 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
+				customHeaders = p.CustomHeaders
+				storedFormat, storedBase = p.Format, p.BaseURL
+				priceIn, priceOut, priceCacheRead, priceCacheWrite = p.PriceInputPerM, p.PriceOutputPerM, p.PriceCacheReadPerM, p.PriceCacheWritePerM
 				retry = p.Retry
 				break
 			}
 		}
+	}
+	if storedBase != "" && !sameLLMEndpoint(format, cfg.BaseURL, storedFormat, storedBase) {
+		customHeaders = ""
 	}
 	newID, err := s.m.pg.SaveProfile(&db.LLMProfile{
 		ID: id, Name: "default", Format: format, Model: cfg.Model, BaseURL: cfg.BaseURL, Proxy: cfg.Proxy,
@@ -557,6 +573,8 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey,
+		CustomHeaders: customHeaders, PriceInputPerM: priceIn, PriceOutputPerM: priceOut,
+		PriceCacheReadPerM: priceCacheRead, PriceCacheWritePerM: priceCacheWrite,
 		Retry: retry,
 	})
 	if err != nil {
@@ -699,8 +717,9 @@ func (s *Server) profileConfig(p *db.LLMProfile) (agent.Config, bool) {
 	cfg.Stream = p.Streaming
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
-	if cfg.APIKey == "" {
+	if cfg.NeedsAPIKey() && cfg.APIKey == "" {
 		return cfg, false
 	}
 	return cfg, true
@@ -912,6 +931,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings/basic-auth", s.saveBasicAuthSettings)
 
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/ready", s.ready)
 	mux.HandleFunc("GET /api/workers", s.listWorkers)
 	mux.HandleFunc("POST /api/batches", s.createBatch)
 	mux.HandleFunc("GET /api/batches/{id}", s.getBatch)
@@ -1070,6 +1090,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/exploration/findings/retests/active", s.listActiveFindingRetests)
 	mux.HandleFunc("POST /api/exploration/findings/{id}/retests", s.startFindingRetest)
 	mux.HandleFunc("PATCH /api/exploration/findings/{id}", s.patchFinding)
+	mux.HandleFunc("POST /api/exploration/findings/bulk-status", s.bulkPatchFindingStatus)
+	mux.HandleFunc("GET /api/chat-bridges", s.chatBridgeList)
+	mux.HandleFunc("PUT /api/chat-bridges/{kind}", s.chatBridgeSave)
+	mux.HandleFunc("POST /api/chat-bridges/{kind}/test", s.chatBridgeTest)
+	mux.HandleFunc("GET /api/llm/context", s.pgLLMContextSummary)
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
 	mux.HandleFunc("GET /api/exploration/graph", s.explorationGraph)
@@ -1799,16 +1824,18 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 // testLLM makes a real minimal completion to verify the config works.
 func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Provider         string `json:"provider"`
-		Model            string `json:"model"`
-		BaseURL          string `json:"base_url"`
-		Proxy            string `json:"proxy"`
-		APIKey           string `json:"api_key"`
-		ThinkingType     string `json:"thinking_type"`
-		ReasoningEffort  string `json:"reasoning_effort"`
-		ProfileID        *int64 `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
-		Streaming        *bool  `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
-		SessionHeaderKey string `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		Provider         string  `json:"provider"`
+		Model            string  `json:"model"`
+		BaseURL          string  `json:"base_url"`
+		Proxy            string  `json:"proxy"`
+		APIKey           string  `json:"api_key"`
+		ThinkingType     string  `json:"thinking_type"`
+		ReasoningEffort  string  `json:"reasoning_effort"`
+		ProfileID        *int64  `json:"profile_id"`         // 测已存 profile 时传入：api_key 为空则用它存的 key
+		Streaming        *bool   `json:"streaming"`          // 省略=流式，与保存 profile 时同一套默认
+		SessionHeaderKey string  `json:"session_header_key"` // 非空=测试时也带该自定义会话头，值为一次性随机 session id
+		CustomHeaders    string  `json:"custom_headers"`
+		MaxTokensField   *string `json:"max_tokens_field"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1876,6 +1903,10 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 见 TestConnection)。opencode zen 等强制要求 x-opencode-session 的端点，缺了它
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
 	cfg.SessionHeaderKey = req.SessionHeaderKey
+	cfg.CustomHeaders = req.CustomHeaders
+	if req.MaxTokensField != nil {
+		cfg.MaxTokensField = strings.TrimSpace(*req.MaxTokensField)
+	}
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
 	// 已存的 key 只发往保存时的 provider + 归一化 base_url。表单留空表示沿用
 	// 已存配置；显式填了别的地址时不把已存密钥带过去。
@@ -1886,20 +1917,42 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			if strings.TrimSpace(req.Provider) == "" {
 				req.Provider = p.Format
 			}
+			if strings.TrimSpace(req.Model) == "" {
+				req.Model = p.Model
+			}
 			if strings.TrimSpace(req.BaseURL) == "" {
 				req.BaseURL = p.BaseURL
-				cfg = agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
-				cfg.ThinkingType = req.ThinkingType
-				cfg.ReasoningEffort = req.ReasoningEffort
-				if req.Streaming != nil {
-					cfg.Stream = *req.Streaming
-				}
-				cfg.SessionHeaderKey = req.SessionHeaderKey
+			}
+			cfg = agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+			cfg.ThinkingType = req.ThinkingType
+			cfg.ReasoningEffort = req.ReasoningEffort
+			if req.Streaming == nil {
+				st := p.Streaming
+				req.Streaming = &st
+			}
+			cfg.Stream = *req.Streaming
+			cfg.SessionHeaderKey = req.SessionHeaderKey
+			cfg.CustomHeaders = req.CustomHeaders
+			if req.MaxTokensField != nil {
+				cfg.MaxTokensField = strings.TrimSpace(*req.MaxTokensField)
 			}
 			if cfg.SessionHeaderKey == "" {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
 			}
+			if req.MaxTokensField == nil {
+				cfg.MaxTokensField = p.MaxTokensField
+			}
+			if cfg.CustomHeaders == "" {
+				cfg.CustomHeaders = p.CustomHeaders
+			}
 		}
+	}
+	if cfg.Format != llm.FormatOpenAI || cfg.MaxTokensField != llm.MaxTokensFieldCompletion {
+		cfg.MaxTokensField = ""
+	}
+	if _, err := agent.ParseBedrockGatewayHeaders(cfg.CustomHeaders); err != nil {
+		writeErr(w, 400, err.Error())
+		return
 	}
 	withheld := false
 	if strings.TrimSpace(req.APIKey) == "" && stored != nil {
@@ -1920,7 +1973,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			withheld = true
 		}
 	}
-	if cfg.APIKey == "" {
+	if cfg.NeedsAPIKey() && cfg.APIKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": withheldLLMKeyMessage(withheld)})
 		return
 	}
@@ -2905,6 +2958,65 @@ func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"nodes": taskNodeDTOs(nodes), "edges": edgeDTOs(edges)})
+}
+
+const maxBulkFindingStatus = 500
+
+// bulkPatchFindingStatus sets one triage status on up to 500 findings in a
+// single transaction. Enterprise callers must already be allowed to write each
+// finding; this does not touch report issuance or finding-case folders.
+func (s *Server) bulkPatchFindingStatus(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs    []int64 `json:"ids"`
+		Status string  `json:"status"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, 400, "bad json: "+err.Error())
+		return
+	}
+	if !db.ValidFindingStatus(body.Status) {
+		writeErr(w, 400, "bad status: "+body.Status)
+		return
+	}
+	ids, overflow := normalizeFindingIDs(body.IDs, maxBulkFindingStatus)
+	if overflow {
+		writeErr(w, 400, "at most 500 findings per request")
+		return
+	}
+	if len(ids) == 0 {
+		writeErr(w, 400, "no finding ids")
+		return
+	}
+	if actor, ok := currentActor(r); ok {
+		for _, id := range ids {
+			if _, err := s.ent.FindingAccess(r.Context(), actor, id, true); err != nil {
+				writeEnt(w, err)
+				return
+			}
+		}
+	}
+	updated, err := s.m.pg.SetFindingStatusesWithNotify(r.Context(), ids, body.Status)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"updated": updated})
+}
+
+func normalizeFindingIDs(ids []int64, capN int) ([]int64, bool) {
+	seen := make(map[int64]bool, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if capN > 0 && len(out) >= capN {
+			return nil, true
+		}
+		out = append(out, id)
+	}
+	return out, false
 }
 
 // patchFinding partially updates a finding: any subset of {status, severity}.

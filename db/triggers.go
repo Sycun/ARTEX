@@ -189,13 +189,27 @@ ORDER BY n.id`, lastID)
 	return out, rows.Err()
 }
 
+// TimedOutTasks returns every live task in status='timeout', ordered by id.
+// Timeouts happen in deadline order, not id order, so the scheduler consumes
+// them with a persisted id set instead of an id watermark.
+func (d *DB) TimedOutTasks() ([]TaskEvent, error) {
+	return d.scanTimeoutTasks(`
+SELECT id, description, goal FROM tasks
+WHERE status='timeout' AND deleted_at IS NULL
+ORDER BY id`)
+}
+
 // TimedOutTasksSince returns tasks that reached status='timeout' with id > lastID,
 // ordered by id (monotonic watermark → no double-fire across restarts).
 func (d *DB) TimedOutTasksSince(lastID int64) ([]TaskEvent, error) {
-	rows, err := d.Query(`
+	return d.scanTimeoutTasks(`
 SELECT id, description, goal FROM tasks
 WHERE status='timeout' AND deleted_at IS NULL AND id > $1
 ORDER BY id`, lastID)
+}
+
+func (d *DB) scanTimeoutTasks(query string, args ...any) ([]TaskEvent, error) {
+	rows, err := d.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
