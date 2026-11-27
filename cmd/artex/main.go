@@ -51,6 +51,11 @@ func printBanner(addr string) {
 // whether to relaunch us (see selfupdate.ExitRestart) — so the body has to live
 // in a function that can *return* rather than os.Exit past its own defers.
 func main() {
+	// Before any listener or child exists. On Linux this re-execs once so the
+	// kernel environment block drops the startup secrets; the values are restored
+	// into this process and scrubbed after New has copied them into memory.
+	// macOS has no /proc environ, so SealProcessEnv logs and returns.
+	server.SealProcessEnv()
 	os.Exit(run())
 }
 
@@ -199,6 +204,13 @@ func run() int {
 		defer shutdown(agent.AbortShutdown)
 	}
 
+	// Worker identity is already in cfg. NewManager reads ARTEX_PG_DSN,
+	// ARTEX_TRAFFIC_STORE and ARTEX_S3_* into the stores before any scrub.
+	trusted, err := server.ParseTrustedProxies(os.Getenv("ARTEX_TRUSTED_PROXIES"))
+	if err != nil {
+		log.Printf("[config] ARTEX_TRUSTED_PROXIES: %v", err)
+		return 1
+	}
 	mgr, err := server.NewManagerWithMode(cfg.DataDir, cfg.Proxy, cfg.Mode)
 	if err != nil {
 		log.Fatalf("open stores: %v", err)
@@ -212,12 +224,16 @@ func run() int {
 	defer settle.Stop()
 
 	log.Printf("[config] skill 目录: %s", skillDir)
+	// NewRuntime reads ARTEX_EVENT_BUS, the LLM credentials and the enterprise
+	// OIDC/S3 settings, then scrubs secretEnv. ARTEX_WORKER_* stay in cfg and in
+	// the environment, so --mode=worker keeps its identity and does not hand
+	// the database or OIDC secrets to a child process.
 	srv := server.NewRuntime(srvCtx, mgr, skillDir, cfg.DataDir, config.BaseDir(), server.Runtime{
 		Mode:        cfg.Mode,
 		WorkerID:    cfg.WorkerID,
 		Zone:        cfg.WorkerZone,
 		Concurrency: cfg.WorkerConcurrency,
-	})
+	}, server.WithSecretScrub(), server.WithTrustedProxies(trusted))
 	defer srv.Close()
 	if cfg.Mode == "worker" {
 		log.Printf("ARTEX %s worker %s zone=%s concurrency=%d (data=%s)", version, cfg.WorkerID, cfg.WorkerZone, cfg.WorkerConcurrency, cfg.DataDir)

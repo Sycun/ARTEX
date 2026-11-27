@@ -43,5 +43,7 @@ COPY skills/ /app/skills/
 # data/（SQLite + jwt.key）持久化点
 VOLUME ["/app/data"]
 EXPOSE 8787 8788
+# 容器内仍监听全部接口，否则 Compose 的端口映射到不了进程。
+# 宿主机侧默认只发布 127.0.0.1，见 docker-compose.yml 的 ARTEX_BIND_ADDR。
 ENTRYPOINT ["/app/start.sh"]
 CMD ["-addr", ":8787", "-proxy", ":8788"]

@@ -393,7 +393,7 @@ func (s *Server) wsUpload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if err := saveUpload(hdr, destAbs); err != nil {
-			writeErr(w, 500, err.Error())
+			writeErr(w, 500, safeFSErr(err))
 			return
 		}
 		saved++
@@ -407,13 +407,32 @@ func saveUpload(hdr *multipart.FileHeader, dest string) error {
 		return err
 	}
 	defer src.Close()
-	out, err := os.Create(dest)
+	if err := refuseUploadSymlink(dest); err != nil {
+		return err
+	}
+	out, err := openUploadFileNoFollow(dest)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 	_, err = io.Copy(out, src)
 	return err
+}
+
+// refuseUploadSymlink rejects a destination that is already a symlink. os.Create
+// would follow it and write outside the work directory.
+func refuseUploadSymlink(dest string) error {
+	fi, err := os.Lstat(dest)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to write through a symlink")
+	}
+	return nil
 }
 
 // sanitizeFilename strips characters unsafe for a Content-Disposition filename token.

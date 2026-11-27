@@ -105,9 +105,16 @@ export const messages = {
     "The backend or database is temporarily unavailable. Setup is disabled to protect any existing password. Restore the service and try again.",
   ],
   "auth.setupWelcome": [
-    "首次使用 ARTEX，请为账户设置一个登录密码（至少 8 位）",
-    "Welcome to ARTEX. Set a sign-in password with at least 8 characters.",
+    "首次使用 ARTEX，请填写服务启动时在控制台打印的安装口令，并设置登录密码（至少 8 位）",
+    "Welcome to ARTEX. Enter the setup token printed in the server console at startup, then set a sign-in password with at least 8 characters.",
   ],
+  "auth.setupToken": ["安装口令", "Setup token"],
+  "auth.setupTokenPlaceholder": ["控制台中的一次性安装口令", "One-time token from the server console"],
+  "auth.setupTokenHint": [
+    "口令只打印在服务进程的标准错误，不会写入日志页面。企业登录不需要安装口令。",
+    "The token is printed on the server's stderr and is not stored in the log page. Enterprise sign-in does not use a setup token.",
+  ],
+  "auth.setupTokenRequired": ["请填写安装口令", "Enter the setup token"],
   "auth.minPlaceholder": ["至少 8 位", "At least 8 characters"],
   "auth.confirmPassword": ["确认密码", "Confirm password"],
   "auth.reenterPassword": ["再次输入密码", "Enter your password again"],

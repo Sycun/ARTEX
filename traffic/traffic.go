@@ -178,11 +178,16 @@ type Traffic struct {
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
 func Open(dir, addr string) (*Traffic, error) {
-	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_blobs"), filepath.Join(dir, "_ca")} {
+	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_ca")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, err
 		}
 	}
+	blobsRoot := filepath.Join(dir, "_blobs")
+	if err := os.MkdirAll(blobsRoot, 0o700); err != nil {
+		return nil, err
+	}
+	tightenBlobPerms(blobsRoot)
 	// busy_timeout is a per-connection setting, so it belongs in the DSN rather
 	// than in a one-off Exec: the pool opens connections on demand, and an Exec
 	// only configures whichever one happened to serve it — leaving every other
@@ -638,6 +643,38 @@ type storedBody struct {
 	index  string
 }
 
+// tightenBlobPerms restricts existing spilled blob directories to 0700 and
+// regular blob files to 0600 on startup so pre-existing 0755/0644 artifacts
+// from earlier versions do not stay world-readable. Symlinks are left untouched.
+func tightenBlobPerms(root string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if info.Mode().Perm() != 0o700 {
+				if err := os.Chmod(path, 0o700); err != nil {
+					log.Printf("[traffic] 收紧 blob 目录权限失败 %s：%v", path, err)
+				}
+			}
+			return nil
+		}
+		if info.Mode().IsRegular() && info.Mode().Perm() != 0o600 {
+			if err := os.Chmod(path, 0o600); err != nil {
+				log.Printf("[traffic] 收紧 blob 权限失败 %s：%v", path, err)
+			}
+		}
+		return nil
+	})
+}
+
 // spill decides where one body lives. Small bodies stay inline. Large ones are
 // written to the content-addressed store and keep a readable preview inline so a
 // reader can identify them without fetching the blob. Either way, text bodies
@@ -663,15 +700,21 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 	// One bucket level (256 buckets) is enough to keep any single directory small;
 	// the store only ever holds bodies above maxInlineBody, deduplicated by hash.
 	blobDir := filepath.Join(t.dir, "_blobs", "sha256", h[:2])
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+	if err := os.MkdirAll(blobDir, 0o700); err != nil {
 		log.Printf("[traffic] 创建 blob 目录失败：%v", err)
 		return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
 	}
+	if err := os.Chmod(blobDir, 0o700); err != nil {
+		log.Printf("[traffic] 收紧 blob 目录权限失败：%v", err)
+	}
 	blobPath := filepath.Join(blobDir, h+".bin")
 	if _, err := os.Stat(blobPath); os.IsNotExist(err) {
-		if err := os.WriteFile(blobPath, body, 0o644); err != nil {
+		if err := os.WriteFile(blobPath, body, 0o600); err != nil {
 			log.Printf("[traffic] 写 blob %s 失败：%v", h, err)
 			return storedBody{inline: clipBytes(body, blobPreview), index: indexText()}
+		}
+		if err := os.Chmod(blobPath, 0o600); err != nil {
+			log.Printf("[traffic] 收紧 blob 权限失败：%v", err)
 		}
 	}
 	sb := storedBody{hash: h, index: indexText()}

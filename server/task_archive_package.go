@@ -584,6 +584,12 @@ func writeTaskArchivePackage(path, payloadDir string, snapshot *pgdb.TaskArchive
 			log.Printf("[task-archive] 跳过符号链接（归档不支持，不影响其它文件）：%s", current)
 			return nil
 		}
+		if !entry.IsDir() && !info.Mode().IsRegular() {
+			// 命令留下的命名管道、套接字或设备文件：打开管道会一直阻塞到有写入端，
+			// tar 拒绝套接字，解包端也拒绝其余类型。跳过，不让整个归档停住。
+			log.Printf("[task-archive] 跳过非常规文件（归档不支持，不影响其它文件）：%s", current)
+			return nil
+		}
 		header, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			return err

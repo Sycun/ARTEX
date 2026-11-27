@@ -2,6 +2,7 @@ package server
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -67,7 +70,7 @@ var reAgentKey = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // pgReady returns the PG handle, or writes 503 and returns nil if unavailable.
 func (s *Server) pg(w http.ResponseWriter) *db.DB {
-	if s.m.pg == nil {
+	if s == nil || s.m == nil || s.m.pg == nil {
 		writeErr(w, 503, "管理后台数据源(PostgreSQL)未连接")
 		return nil
 	}
@@ -80,6 +83,95 @@ func pathInt(r *http.Request, name string) (int64, bool) {
 }
 
 func decode(r *http.Request, v any) error { return json.NewDecoder(r.Body).Decode(v) }
+
+// decodeMaxBytes is the default JSON body cap. Multipart uploads get the larger
+// multipartBodyLimit instead; upload handlers set their own tighter limit. A
+// smaller MaxBytesReader installed by a handler still wins, because it sits
+// inside this one.
+const decodeMaxBytes = 32 << 20
+
+// multipartBodyLimit is the largest upload this server accepts (workspace
+// files). Chat attachments and skill zips are smaller and install their own
+// MaxBytesReader. Backup restore streams a full archive and is exempt.
+func multipartBodyLimit() int64 {
+	n := int64(maxWorkspaceUpload)
+	if int64(maxChatUpload) > n {
+		n = int64(maxChatUpload)
+	}
+	return n + (1 << 20)
+}
+
+// limitedBody records a MaxBytesError so a later 400 can be answered as 413.
+type limitedBody struct {
+	io.ReadCloser
+	tooLarge bool
+}
+
+func (b *limitedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		b.tooLarge = true
+	}
+	return n, err
+}
+
+type bodyLimitWriter struct {
+	http.ResponseWriter
+	tooLarge func() bool
+}
+
+func (b *bodyLimitWriter) WriteHeader(code int) {
+	if code == http.StatusBadRequest && b.tooLarge != nil && b.tooLarge() {
+		code = http.StatusRequestEntityTooLarge
+	}
+	b.ResponseWriter.WriteHeader(code)
+}
+
+func (b *bodyLimitWriter) Flush() {
+	if f, ok := b.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (b *bodyLimitWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := b.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("hijack not supported")
+	}
+	return h.Hijack()
+}
+
+func (b *bodyLimitWriter) Unwrap() http.ResponseWriter { return b.ResponseWriter }
+
+// limitRequestBody caps a non-multipart body at decodeMaxBytes. A handler that
+// then answers 400 for that read is rewritten to 413. A multipart body gets the
+// upload-sized cap. POST /api/system/backup/restore streams a full archive and
+// is left uncapped here; the handler writes it to disk.
+func limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil || r.Body == http.NoBody || r.URL.Path == "/api/system/backup/restore" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isMultipart(r) {
+			r.Body = http.MaxBytesReader(w, r.Body, multipartBodyLimit())
+			next.ServeHTTP(w, r)
+			return
+		}
+		body := &limitedBody{ReadCloser: http.MaxBytesReader(w, r.Body, decodeMaxBytes)}
+		r.Body = body
+		next.ServeHTTP(&bodyLimitWriter{ResponseWriter: w, tooLarge: func() bool { return body.tooLarge }}, r)
+	})
+}
+
+func isMultipart(r *http.Request) bool {
+	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(media, "multipart/")
+}
 
 // ---------- tasks (delete) ----------
 
@@ -993,7 +1085,7 @@ type skillFileNode struct {
 
 func (s *Server) fsListSkills(w http.ResponseWriter, r *http.Request) {
 	_ = os.MkdirAll(s.skillDir, 0o755)
-	allReg, _ := skill.LoadDir(s.skillDir)
+	allReg, _ := loadSkillsConfined(s.skillDir)
 	metaByDir := map[string]skill.Skill{}
 	if allReg != nil {
 		for _, sk := range allReg.List() {
@@ -1118,7 +1210,7 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := os.MkdirAll(skillPath, 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	// Build a spec-compliant SKILL.md (agentskills.io format):
@@ -1150,7 +1242,7 @@ func (s *Server) fsCreateSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := os.WriteFile(filepath.Join(skillPath, "SKILL.md"), []byte(sb.String()), 0o644); err != nil {
 		_ = os.RemoveAll(skillPath)
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 201, map[string]any{"name": body.Name})
@@ -1189,7 +1281,7 @@ func (s *Server) fsUpdateSkillMeta(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := os.WriteFile(skillMD, updated, 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1357,7 +1449,7 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 	// derive + validate the skill name from the SKILL.md frontmatter.
 	md, err := readZipEntry(skillMD.f)
 	if err != nil {
-		writeErr(w, 400, "读取 SKILL.md 失败："+err.Error())
+		writeErr(w, 400, "读取 SKILL.md 失败："+safeFSErr(err))
 		return
 	}
 	name := skillNameFromFrontmatter(md)
@@ -1386,7 +1478,7 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 	_ = os.MkdirAll(s.skillDir, 0o755)
 	tmp, err := os.MkdirTemp(s.skillDir, ".upload-*")
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	defer os.RemoveAll(tmp) // no-op after a successful rename
@@ -1418,25 +1510,25 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		}
 		dst := filepath.Join(tmp, clean)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			writeErr(w, 500, err.Error())
+			writeErr(w, 500, safeFSErr(err))
 			return
 		}
 		rc, err := f.Open()
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeErr(w, 500, safeFSErr(err))
 			return
 		}
-		out, err := os.Create(dst)
+		out, err := openUploadFileNoFollow(dst)
 		if err != nil {
 			rc.Close()
-			writeErr(w, 500, err.Error())
+			writeErr(w, 500, safeFSErr(err))
 			return
 		}
 		n, err := io.Copy(out, io.LimitReader(rc, maxSkillFileBytes+1))
 		out.Close()
 		rc.Close()
 		if err != nil {
-			writeErr(w, 500, err.Error())
+			writeErr(w, 500, safeFSErr(err))
 			return
 		}
 		total += n
@@ -1454,7 +1546,7 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 		_ = os.RemoveAll(skillPath)
 	}
 	if err := os.Rename(tmp, skillPath); err != nil {
-		writeErr(w, 500, "安装失败："+err.Error())
+		writeErr(w, 500, "安装失败："+safeFSErr(err))
 		return
 	}
 	writeJSON(w, 201, map[string]any{"name": name, "files": entries})
@@ -1486,7 +1578,7 @@ func (s *Server) fsDeleteSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := os.RemoveAll(filepath.Join(s.skillDir, name)); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": name})
@@ -1559,6 +1651,25 @@ func skillRelPath(file string) (string, string) {
 	return clean, ""
 }
 
+// confinedSkillPath resolves a skill-relative path and refuses a symlink that
+// leaves the skill directory. create allows a path that does not exist yet.
+func (s *Server) confinedSkillPath(name, rel string, create bool) (string, int, string) {
+	skillExists, cp, err := resolveSkillFile(s.skillDir, name, rel)
+	if err != nil {
+		return "", 400, "invalid path"
+	}
+	if !skillExists {
+		return "", 404, "skill not found"
+	}
+	if !create && !cp.exists {
+		return "", 404, "file not found"
+	}
+	if cp.entryPath != "" {
+		return cp.entryPath, 0, ""
+	}
+	return cp.realPath, 0, ""
+}
+
 // walkSkillFiles returns all files under root (relative to root), sorted,
 // including files in subdirectories (scripts/, references/, assets/, etc.).
 // walkSkillFiles returns all entries under root relative to root.
@@ -1594,14 +1705,18 @@ func (s *Server) fsListFiles(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "invalid skill name")
 		return
 	}
-	dirPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+	dirCP, err := resolveSkillDir(s.skillDir, name)
+	if err != nil {
+		writeErr(w, 400, "invalid path")
+		return
+	}
+	if !dirCP.exists {
 		writeErr(w, 404, "skill not found")
 		return
 	}
-	files, err := walkSkillFiles(dirPath)
+	files, err := walkSkillFiles(dirCP.realPath)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	if files == nil {
@@ -1621,13 +1736,18 @@ func (s *Server) fsReadFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	data, err := os.ReadFile(filepath.Join(s.skillDir, name, file))
+	target, status, msg := s.confinedSkillPath(name, file, false)
+	if status != 0 {
+		writeErr(w, status, msg)
+		return
+	}
+	data, err := os.ReadFile(target)
 	if os.IsNotExist(err) {
 		writeErr(w, 404, "file not found")
 		return
 	}
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"content": string(data), "file": file})
@@ -1651,19 +1771,25 @@ func (s *Server) fsWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
-		writeErr(w, 404, "skill not found")
+	fullPath, status, msg := s.confinedSkillPath(name, file, true)
+	if status != 0 {
+		writeErr(w, status, msg)
 		return
 	}
-	fullPath := filepath.Join(skillPath, file)
 	// create parent subdirectory if needed (e.g. scripts/, references/, assets/)
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
-	if err := os.WriteFile(fullPath, []byte(body.Content), 0o644); err != nil {
-		writeErr(w, 500, err.Error())
+	out, err := openUploadFileNoFollow(fullPath)
+	if err != nil {
+		writeErr(w, 500, safeFSErr(err))
+		return
+	}
+	_, err = out.Write([]byte(body.Content))
+	closeErr := out.Close()
+	if err = errors.Join(err, closeErr); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -1687,13 +1813,13 @@ func (s *Server) fsCreateDir(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	skillPath := filepath.Join(s.skillDir, name)
-	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
-		writeErr(w, 404, "skill not found")
+	fullPath, status, msg := s.confinedSkillPath(name, dir, true)
+	if status != 0 {
+		writeErr(w, status, msg)
 		return
 	}
-	if err := os.MkdirAll(filepath.Join(skillPath, dir), 0o755); err != nil {
-		writeErr(w, 500, err.Error())
+	if err := os.MkdirAll(fullPath, 0o755); err != nil {
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 201, map[string]any{"dir": dir})
@@ -1710,13 +1836,13 @@ func (s *Server) fsDeletePath(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, errMsg)
 		return
 	}
-	fullPath := filepath.Join(s.skillDir, name, file)
-	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-		writeErr(w, 404, "not found")
+	fullPath, status, msg := s.confinedSkillPath(name, file, false)
+	if status != 0 {
+		writeErr(w, status, msg)
 		return
 	}
 	if err := os.RemoveAll(fullPath); err != nil {
-		writeErr(w, 500, err.Error())
+		writeErr(w, 500, safeFSErr(err))
 		return
 	}
 	writeJSON(w, 200, map[string]any{"deleted": file})
@@ -2026,13 +2152,28 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provider := strings.TrimSpace(req.Provider)
-	// Resolve API key: form input > profile stored key.
+	baseURL := strings.TrimSpace(req.BaseURL)
+	// Resolve API key: form input > profile stored key, and only when the
+	// request is for that profile's provider and normalized base URL.
 	apiKey := strings.TrimSpace(req.APIKey)
-	if apiKey == "" && req.ProfileID != nil {
+	if req.ProfileID != nil && s.m != nil && s.m.pg != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			apiKey = p.APIKey
+			if provider == "" {
+				provider = p.Format
+			}
+			if baseURL == "" {
+				baseURL = p.BaseURL
+			}
+			if apiKey == "" {
+				if !sameLLMEndpoint(provider, baseURL, p.Format, p.BaseURL) {
+					writeJSON(w, 200, map[string]any{"ok": false, "error": withheldLLMKeyMessage(true)})
+					return
+				}
+				apiKey = strings.TrimSpace(p.APIKey)
+			}
 		}
 	}
+	req.BaseURL = baseURL
 	if apiKey == "" {
 		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
 		return
@@ -2059,7 +2200,7 @@ func (s *Server) pgListModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	baseURL = strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
 
 	// Candidate endpoints to try in order. Some Anthropic-compatible providers
 	// (e.g. DeepSeek) implement /v1/messages under an /anthropic path but expose

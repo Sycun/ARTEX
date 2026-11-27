@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -60,6 +61,13 @@ type Server struct {
 	skillDir  string // root directory for skill subdirectories
 	jwtKey    []byte // HS256 signing key loaded from / generated into dataDir/jwt.key
 	basicAuth basicAuthGate
+
+	scrubSecrets   bool
+	setupMu        sync.Mutex
+	setupToken     string         // one-time token POST /api/auth/init requires; empty when none is active
+	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
+	pwdLimit       *loginLimiter  // attempt limit on POST /api/auth/change-password
+	trustedProxies []netip.Prefix // ARTEX_TRUSTED_PROXIES; see clientIP
 
 	entMode      bool
 	ent          *enterprise.Service
@@ -183,11 +191,11 @@ type triggeredRun struct {
 	mergeable bool   // true for finding/goal event triggers (merge by taskID)
 }
 
-func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string) *Server {
-	return NewRuntime(ctx, m, skillDir, dataDir, keyDir, Runtime{})
+func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, opts ...Option) *Server {
+	return NewRuntime(ctx, m, skillDir, dataDir, keyDir, Runtime{}, opts...)
 }
 
-func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, rt Runtime) *Server {
+func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDir string, rt Runtime, opts ...Option) *Server {
 	mode := rt.Mode
 	if mode == "" {
 		mode = ModeAll
@@ -212,7 +220,11 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 		triggerActive: map[string]int{}, triggerCfg: map[string]triggerBehavior{}, proxyPoolWake: make(chan struct{}, 1), proxyPoolProbeSem: make(chan struct{}, proxyPoolMaxProbeConcurrency),
 		profChatAgents: map[int64]*agent.ChatAgent{},
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
-		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), credentialWake: make(chan struct{}, 1)}
+		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1), credentialWake: make(chan struct{}, 1),
+		loginLimit: newLoginLimiter(time.Now), pwdLimit: newLoginLimiter(time.Now)}
+	for _, opt := range opts {
+		opt(s)
+	}
 	m.SetTaskControlMutex(&s.concMu)
 	s.initSideQuestions()
 	if m.pg != nil {
@@ -309,11 +321,7 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 		}
 		go s.evidenceStore().RunGC(s.ctx)
 		s.seedPythonInterpreter() // 自定义脚本工具:开机检测 python 解释器入库(仅空时)
-		// Calendar scheduler starts after persisted tasks are restored.
-		// Fill the tool cache for any enabled MCP that has none yet (notably the
-		// seeded browser MCP on first run). Async so it never blocks startup.
-		go s.discoverEmptyMCPsOnStartup()
-		logSink.SetDB(ctx, m.pg) // restore last 100 log rows and enable async persistence
+		logSink.SetDB(ctx, m.pg)  // restore last 100 log rows and enable async persistence
 	}
 	// precedence: persisted DB config > env.
 	if cfg, ok := s.loadLLMConfig(); ok {
@@ -330,6 +338,23 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 		}
 	} else {
 		log.Printf("[engine] no LLM provider configured — engine idle until set via /api/llm or env")
+	}
+	// Enterprise and distributed settings are in memory now: the event bus was
+	// opened above, NewManager already consumed ARTEX_PG_DSN / ARTEX_TRAFFIC_STORE
+	// / ARTEX_S3_*, FromEnv consumed the LLM credentials, and bootEnterprise
+	// consumes ARTEX_OIDC_CLIENT_SECRET and the S3 settings again. Scrub before
+	// any child can start. Worker identity stays in the Runtime value and in
+	// the environment; those names are not secrets.
+	s.bootEnterprise()
+	s.initSetupToken()
+	if s.scrubSecrets {
+		ScrubSecretEnv()
+	}
+	if m.pg != nil {
+		// Fill the tool cache for any enabled MCP that has none yet (notably the
+		// seeded browser MCP on first run). Async so it never blocks startup.
+		// This can spawn stdio servers, so it runs only after the scrub.
+		go s.discoverEmptyMCPsOnStartup()
 	}
 	s.restoreTaskRuntimes()
 	schedulerDone := make(chan struct{})
@@ -363,7 +388,6 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 		go s.runCredentialProcessor()
 	}
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
-	s.bootEnterprise()
 	if mode != ModeWorker {
 		s.startTaskArchiveWorker()
 		if m.pg != nil {
@@ -1254,14 +1278,22 @@ func (s *Server) Handler() http.Handler {
 	api := s.cors(s.requireAuth(mux))
 	root := http.NewServeMux()
 	root.Handle("/api/", api)
-	root.Handle("/", s.webuiHandler())
+	webui := s.webuiHandler()
+	root.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Document-only headers. OIDC redirects, SSE and /mcp do not pass through
+		// this route, so they do not receive COOP or CORP.
+		consoleHeaders(w.Header())
+		webui.ServeHTTP(w, r)
+	})
 	// /mcp sits outside the Basic Auth gate on purpose: an external MCP client has
 	// one Authorization header and it carries the access token, so it could never
 	// satisfy both. The endpoint authenticates with access tokens only.
+	// securityHeaders still wraps it: nosniff, frame-ancestors and referrer policy
+	// do not affect Streamable HTTP. COOP/CORP stay on the console route above.
 	top := http.NewServeMux()
 	top.HandleFunc(mcpEndpointPath, s.serveMCP)
 	top.Handle("/", s.requireBasicAuth(root))
-	return top
+	return s.securityHeaders(limitRequestBody(top))
 }
 
 // --- handlers ---
@@ -1756,21 +1788,30 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.Provider) == "jev" {
 		apiKey := strings.TrimSpace(req.APIKey)
 		baseURL, model := strings.TrimSpace(req.BaseURL), strings.TrimSpace(req.Model)
-		if req.ProfileID != nil {
+		withheld := false
+		if req.ProfileID != nil && s.m != nil && s.m.pg != nil {
 			if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-				if apiKey == "" {
-					apiKey = p.APIKey
-				}
-				if baseURL == "" {
-					baseURL = p.BaseURL
+				prov, base := "jev", baseURL
+				if base == "" {
+					base = p.BaseURL
 				}
 				if model == "" {
 					model = p.Model
 				}
+				if apiKey == "" {
+					if sameLLMEndpoint(prov, base, p.Format, p.BaseURL) {
+						apiKey = strings.TrimSpace(p.APIKey)
+						baseURL = base
+					} else {
+						withheld = true
+					}
+				} else if baseURL == "" {
+					baseURL = p.BaseURL
+				}
 			}
 		}
 		if apiKey == "" {
-			writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
+			writeJSON(w, 200, map[string]any{"ok": false, "error": withheldLLMKeyMessage(withheld)})
 			return
 		}
 		if model == "" {
@@ -1807,25 +1848,51 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	// 直接 400，必须在测试路径上也带上，否则"对话通、测试 400"。
 	cfg.SessionHeaderKey = req.SessionHeaderKey
 	// API Key 解析优先级：表单输入 > 指定 profile 存的 key > 全局配置的 key。
-	// 已存 profile 的 key 不回传浏览器，所以测试已存配置时表单为空，需从 DB 取。
-	// 会话头名同理：表单未带时用已存 profile 的值兜底。
-	if req.ProfileID != nil && (cfg.APIKey == "" || cfg.SessionHeaderKey == "") {
+	// 已存的 key 只发往保存时的 provider + 归一化 base_url。表单留空表示沿用
+	// 已存配置；显式填了别的地址时不把已存密钥带过去。
+	var stored *db.LLMProfile
+	if req.ProfileID != nil && s.m != nil && s.m.pg != nil {
 		if p, err := s.m.pg.ProfileByID(*req.ProfileID); err == nil && p != nil {
-			if cfg.APIKey == "" {
-				cfg.APIKey = p.APIKey
+			stored = p
+			if strings.TrimSpace(req.Provider) == "" {
+				req.Provider = p.Format
+			}
+			if strings.TrimSpace(req.BaseURL) == "" {
+				req.BaseURL = p.BaseURL
+				cfg = agent.ConfigFrom(req.Provider, req.Model, req.BaseURL, req.APIKey, req.Proxy)
+				cfg.ThinkingType = req.ThinkingType
+				cfg.ReasoningEffort = req.ReasoningEffort
+				if req.Streaming != nil {
+					cfg.Stream = *req.Streaming
+				}
+				cfg.SessionHeaderKey = req.SessionHeaderKey
 			}
 			if cfg.SessionHeaderKey == "" {
 				cfg.SessionHeaderKey = p.SessionHeaderKey
 			}
 		}
 	}
-	if cfg.APIKey == "" {
-		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey
-		s.cfgMu.Unlock()
+	withheld := false
+	if strings.TrimSpace(req.APIKey) == "" && stored != nil {
+		if sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+			cfg.APIKey = strings.TrimSpace(stored.APIKey)
+		} else {
+			cfg.APIKey = ""
+			withheld = true
+		}
 	}
 	if cfg.APIKey == "" {
-		writeJSON(w, 200, map[string]any{"ok": false, "error": "未提供 API Key"})
+		s.cfgMu.Lock()
+		global := s.llmCfg
+		s.cfgMu.Unlock()
+		if global.APIKey != "" && sameLLMEndpoint(req.Provider, req.BaseURL, global.Provider(), global.BaseURL) {
+			cfg.APIKey = global.APIKey
+		} else if global.APIKey != "" {
+			withheld = true
+		}
+	}
+	if cfg.APIKey == "" {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": withheldLLMKeyMessage(withheld)})
 		return
 	}
 	// 重试参数【不】带进连接测试:测试有 30s 硬超时,把配置的重试次数/长间隔叠上去
@@ -1840,6 +1907,26 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"ok": true, "latency_ms": lat.Milliseconds(), "model": cfg.Model, "reply": truncateReply(reply),
 	})
+}
+
+// sameLLMEndpoint reports whether two provider/base URL pairs resolve to the same
+// endpoint after ConfigFrom's normalization (trimmed, endpoint suffix stripped;
+// an empty base URL means the provider's canonical host). A saved API key may only
+// be sent when the request's endpoint matches the one it was saved for.
+func sameLLMEndpoint(provA, baseA, provB, baseB string) bool {
+	a := agent.ConfigFrom(provA, "", baseA, "", "")
+	b := agent.ConfigFrom(provB, "", baseB, "", "")
+	if a.Jev || b.Jev {
+		return a.Jev && b.Jev && a.BaseURL == b.BaseURL
+	}
+	return a.Format == b.Format && a.BaseURL == b.BaseURL
+}
+
+func withheldLLMKeyMessage(withheld bool) string {
+	if withheld {
+		return "未提供 API Key：已保存的密钥只会发往保存时的服务商和地址，测试其它地址请重新输入密钥"
+	}
+	return "未提供 API Key"
 }
 
 // truncateReply clips a connection-test reply for display. A model told to answer

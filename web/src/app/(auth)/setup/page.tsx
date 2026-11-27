@@ -18,6 +18,7 @@ export default function SetupPage() {
   const router = useRouter();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [setupToken, setSetupToken] = useState("");
   const [error, setError] = useState<unknown>("");
   const [loading, setLoading] = useState(false);
   const [checking, setChecking] = useState(true);
@@ -26,20 +27,36 @@ export default function SetupPage() {
   const [unavailable, setUnavailable] = useState(false);
 
   useEffect(() => {
-    api
-      .authStatus()
-      .then(({ initialized }) => {
-        if (initialized) router.replace("/login");
+    let leave = false;
+    fetch("/api/enterprise/status")
+      .then((response) => (response.ok ? response.json() : { enterprise: false }))
+      .then(async (status: { enterprise?: boolean }) => {
+        if (status.enterprise) {
+          leave = true;
+          router.replace("/login");
+          return;
+        }
+        const { initialized } = await api.authStatus();
+        if (initialized) {
+          leave = true;
+          router.replace("/login");
+        }
       })
       .catch((err) => {
         setError(err);
         setUnavailable(true);
       })
-      .finally(() => setChecking(false));
+      .finally(() => {
+        if (!leave) setChecking(false);
+      });
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!setupToken.trim()) {
+      setError("auth.setupTokenRequired");
+      return;
+    }
     if (password !== confirm) {
       setError("auth.passwordMismatch");
       return;
@@ -51,7 +68,7 @@ export default function SetupPage() {
     setLoading(true);
     setError("");
     try {
-      const { token } = await api.initPassword(password);
+      const { token } = await api.initPassword(password, setupToken.trim());
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
@@ -97,6 +114,19 @@ export default function SetupPage() {
           ) : (
             <form onSubmit={handleSubmit} className="flex flex-col gap-4">
               <div className="space-y-1.5">
+                <Label htmlFor="setup-token">{t("auth.setupToken")}</Label>
+                <Input
+                  id="setup-token"
+                  value={setupToken}
+                  onChange={(e) => setSetupToken(e.target.value)}
+                  placeholder={t("auth.setupTokenPlaceholder")}
+                  autoFocus
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <p className="text-muted-foreground text-xs">{t("auth.setupTokenHint")}</p>
+              </div>
+              <div className="space-y-1.5">
                 <Label htmlFor="password">{t("account.newPassword")}</Label>
                 <Input
                   id="password"
@@ -104,7 +134,6 @@ export default function SetupPage() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder={t("auth.minPlaceholder")}
-                  autoFocus
                   autoComplete="new-password"
                 />
               </div>
@@ -120,7 +149,11 @@ export default function SetupPage() {
                 />
               </div>
               {Boolean(error) && <p className="text-sm text-destructive">{localizedError(error, t)}</p>}
-              <Button type="submit" className="w-full" disabled={loading || !password || !confirm}>
+              <Button
+                type="submit"
+                className="w-full"
+                disabled={loading || !setupToken.trim() || !password || !confirm}
+              >
                 {loading ? t("auth.saving") : t("auth.setupAndLogin")}
               </Button>
             </form>

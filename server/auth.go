@@ -3,13 +3,17 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -232,7 +236,94 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
 }
 
+// setupTokenOut is where the setup token is printed: the stderr of the process.
+// It is a variable so that tests can capture it. The log sink keeps every line
+// for /api/logs, so the token itself must not go through the standard logger.
+var setupTokenOut io.Writer = os.Stderr
+
+// enterpriseSkipsSetupToken is true when the enterprise SSO chain is the
+// primary login. A setup token must not block that mode, including a worker
+// that was started with ARTEX_ENTERPRISE=1 before bootEnterprise set entMode.
+func (s *Server) enterpriseSkipsSetupToken() bool {
+	if s != nil && s.entMode {
+		return true
+	}
+	return os.Getenv("ARTEX_ENTERPRISE") == "1"
+}
+
+// initSetupToken generates the one-time setup token when no admin password is
+// set and prints it on the server console. Without it, anyone who can reach
+// the port before the operator could claim the instance through POST /api/auth/init.
+func (s *Server) initSetupToken() {
+	if s == nil || s.m == nil || s.m.pg == nil || s.enterpriseSkipsSetupToken() {
+		return
+	}
+	var hash string
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		var ok bool
+		hash, ok, err = s.m.pg.GetSetting(authPassKey)
+		if err == nil {
+			if ok && hash != "" {
+				return
+			}
+			break
+		}
+		log.Printf("[auth] password lookup attempt %d/3: %v", attempt, err)
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+	}
+	if err != nil {
+		log.Printf("[auth] password lookup failed; not issuing a setup token: %v", err)
+		return
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		log.Fatalf("[auth] generate setup token: %v", err)
+	}
+	token := hex.EncodeToString(buf)
+	s.setupMu.Lock()
+	s.setupToken = token
+	s.setupMu.Unlock()
+	fmt.Fprintln(setupTokenOut, time.Now().Format("2006/01/02 15:04:05"), "[auth] no admin password is set. Setup token for the /setup page:", token)
+	log.Printf("[auth] no admin password is set. The setup token for the /setup page was printed on the server console (stderr); it is not kept in this log")
+}
+
+// checkSetupToken compares got with the active setup token in constant time.
+// It fails when no token is active.
+func (s *Server) checkSetupToken(got string) bool {
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	return s.setupToken != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.setupToken)) == 1
+}
+
+func (s *Server) loginWait(r *http.Request) time.Duration {
+	if s == nil || s.loginLimit == nil {
+		return 0
+	}
+	return s.loginLimit.allow(clientIP(r, s.trustedProxies))
+}
+
+func (s *Server) passwordChangeWait(r *http.Request) time.Duration {
+	if s == nil || s.pwdLimit == nil {
+		return 0
+	}
+	return s.pwdLimit.allow(clientIP(r, s.trustedProxies) + "|" + s.extractToken(r))
+}
+
+func writeRateLimited(w http.ResponseWriter, wait time.Duration) {
+	secs := int((wait + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	writeProductError(w, 429, "rate_limited", fmt.Sprintf("尝试过于频繁，请在 %d 秒后重试", secs), map[string]any{"seconds": secs})
+}
+
 // POST /api/auth/init — sets the password for the first time; rejected if already set.
+// Standalone mode requires the setup token printed at startup. Enterprise mode
+// (ARTEX_ENTERPRISE=1) does not.
 func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 	pg := s.pg(w)
 	if pg == nil {
@@ -248,10 +339,16 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Password string `json:"password"`
+		Password   string `json:"password"`
+		SetupToken string `json:"setup_token"`
 	}
 	if err := decode(r, &req); err != nil || req.Password == "" {
 		writeProductError(w, 400, "password_required", "密码不能为空", nil)
+		return
+	}
+	// 403, not 401: the frontend treats any 401 as an expired session and redirects to /login.
+	if !s.enterpriseSkipsSetupToken() && !s.checkSetupToken(req.SetupToken) {
+		writeProductError(w, 403, "invalid_setup_token", "安装口令不正确。服务启动时会在控制台打印一次性安装口令。", nil)
 		return
 	}
 	if msg := validatePassword(req.Password); msg != "" {
@@ -276,6 +373,9 @@ func (s *Server) authInit(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 403, "password_already_set", "密码已设置", nil)
 		return
 	}
+	s.setupMu.Lock()
+	s.setupToken = ""
+	s.setupMu.Unlock()
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
 		writeProductError(w, 500, "token_failed", "token 生成失败", nil)
@@ -294,6 +394,10 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if !verifyJWT(s.extractToken(r), s.jwtKey) {
 		writeProductError(w, 401, "unauthorized", "未授权", nil)
+		return
+	}
+	if wait := s.passwordChangeWait(r); wait > 0 {
+		writeRateLimited(w, wait)
 		return
 	}
 	var req struct {
@@ -335,6 +439,9 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeProductError(w, 500, "save_failed", "保存失败: "+err.Error(), nil)
 		return
 	}
+	if s.pwdLimit != nil {
+		s.pwdLimit.reset(clientIP(r, s.trustedProxies) + "|" + s.extractToken(r))
+	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -342,6 +449,10 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if s.entMode {
 		writeProductError(w, 403, "enterprise_sso", "企业账号登录已开启，密码登录已关闭。请使用企业账号登录。", nil)
+		return
+	}
+	if wait := s.loginWait(r); wait > 0 {
+		writeRateLimited(w, wait)
 		return
 	}
 	pg := s.pg(w)
@@ -377,6 +488,9 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeProductError(w, 500, "token_failed", "token 生成失败", nil)
 		return
+	}
+	if s.loginLimit != nil {
+		s.loginLimit.reset(clientIP(r, s.trustedProxies))
 	}
 	writeJSON(w, 200, map[string]any{"token": tok})
 }

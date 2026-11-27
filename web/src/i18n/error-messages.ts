@@ -43,6 +43,14 @@ export const errorMessages = {
   "error.password_not_initialized": ["密码未初始化，请先设置密码", "Set up a password first"],
   "error.current_password_incorrect": ["当前密码错误", "The current password is incorrect"],
   "error.invalid_credentials": ["用户名或密码错误", "Incorrect username or password"],
+  "error.invalid_setup_token": [
+    "安装口令不正确。服务启动时会在控制台打印一次性安装口令。",
+    "The setup token is incorrect. The server prints a one-time token on its console at startup.",
+  ],
+  "error.rate_limited": [
+    "尝试过于频繁，请在 {{seconds}} 秒后重试",
+    "Too many attempts. Try again in {{seconds}} seconds.",
+  ],
   "update.available": ["新版本", "Update available"],
   "update.hint": ["发现新版本 {{version}}，点击前往更新", "Version {{version}} is available. Click to update."],
 } satisfies Record<string, readonly [string, string]>;
