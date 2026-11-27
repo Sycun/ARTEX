@@ -60,11 +60,13 @@ var (
 	colHookVerMatchers  = secretColumn{"traffic_tamper_hook_versions", "matchers", true}
 	colHookVerSource    = secretColumn{"traffic_tamper_hook_versions", "source", false}
 	colChatBridgeConfig = secretColumn{"chat_bridges", "config", true}
+	colCredPass         = secretColumn{"task_credentials", "password", false}
 	secretColumns       = []secretColumn{
 		colRewriteMatchers, colRewriteActions,
 		colHookMatchers, colHookSource,
 		colHookVerMatchers, colHookVerSource,
 		colChatBridgeConfig,
+		colCredPass,
 	}
 )
 

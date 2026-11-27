@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/toolguard"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -13,6 +14,9 @@ import (
 // agent test suite so cross-package DELETE cleanup races with db/server
 // packages are avoided when running `go test ./...`.
 func TestMain(m *testing.M) {
+	if code, handled := toolguard.BackgroundHelper(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	dsn, _, err := db.DSN()
 	if err != nil {
 		os.Exit(m.Run())

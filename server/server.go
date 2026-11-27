@@ -66,6 +66,8 @@ type Server struct {
 	basicAuth basicAuthGate
 
 	scrubSecrets   bool
+	execPriv       ExecPrivilege
+	isolation      IsolationStatus
 	setupMu        sync.Mutex
 	setupToken     string         // one-time token POST /api/auth/init requires; empty when none is active
 	loginLimit     *loginLimiter  // per-IP attempt limit on POST /api/auth/login
@@ -240,6 +242,7 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
+	s.applyTriageThreshold()
 	// Every task uses a stable task router. An empty explicit chain is resolved by
 	// that router through Agent bindings and then the global provider, so adding a
 	// first chain to a running task takes effect on its very next LLM call.
@@ -316,7 +319,7 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
-		wireAgentAugment(m.pg, s.skillDir, m.dir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
+		wireAgentAugment(m.pg, s.skillDir, m.dir, s.hostTools, s.execPriv) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
@@ -1147,6 +1150,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/records/tasks", s.pgLLMTasks)
 	mux.HandleFunc("GET /api/llm/records/by-model", s.pgTokenByModel) // 按模型聚合本任务 token 用量
 	mux.HandleFunc("GET /api/llm/records/{id}", s.pgGetLLMRecord)
+	mux.HandleFunc("GET /api/skill-gaps", s.skillGaps)
+	mux.HandleFunc("GET /api/tasks/{id}/outcome", s.taskOutcome)
+	mux.HandleFunc("GET /api/tasks/{id}/lessons", s.taskLessons)
+	mux.HandleFunc("POST /api/tasks/{id}/lessons/extract", s.extractTaskLessons)
+	mux.HandleFunc("GET /api/tasks/{id}/credentials", s.listTaskCredentials)
+	mux.HandleFunc("POST /api/tasks/{id}/credentials", s.addTaskCredential)
+	mux.HandleFunc("DELETE /api/tasks/{id}/credentials/{cid}", s.deleteTaskCredential)
 	mux.HandleFunc("GET /api/tasks/{id}/intelligence", s.listIntelligence)
 	mux.HandleFunc("GET /api/tasks/{id}/intelligence/{intelID}", s.getIntelligence)
 	mux.HandleFunc("PATCH /api/tasks/{id}/intelligence/{intelID}", s.updateIntelligence)
@@ -1365,7 +1375,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 // version is protected by the normal JWT middleware and optional Basic Auth gate.
 func (s *Server) version(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, map[string]any{"version": BuildVersion})
+	out := map[string]any{"version": BuildVersion}
+	if s.isolation.Mode != "" {
+		out["isolation"] = s.isolation
+	}
+	writeJSON(w, 200, out)
 }
 
 func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
@@ -2074,6 +2088,7 @@ type createTaskReq struct {
 	Zone                 string           `json:"zone,omitempty"`             // 执行网段;空=default
 	// InterceptRules 任务级资产拦截/允许规则(创建时录入,存 task_intercept_rules,不进全局表)。
 	InterceptRules []taskInterceptRuleReq `json:"intercept_rules,omitempty"`
+	Credentials    []taskCredentialReq    `json:"credentials,omitempty"`
 }
 
 // taskCreateError is a rejected task creation: an HTTP-style status plus a
@@ -2187,6 +2202,15 @@ func (s *Server) createTaskFromRequest(req createTaskReq) (*Task, *taskCreateErr
 		return nil, &taskCreateError{500, err.Error()}
 	}
 	log.Printf("[task] 新建任务 #%s «%s» 目标: %s", t.ID, req.Description, req.Goal)
+	if taskNum, parseErr := strconv.ParseInt(t.ID, 10, 64); parseErr == nil && taskNum > 0 {
+		for _, c := range req.Credentials {
+			if _, credErr := s.m.PG().UpsertTaskCredential(taskNum, db.TaskCredentialInput{
+				Domain: c.Domain, Username: c.Username, Password: c.Password, Source: "user", Note: c.Note,
+			}); credErr != nil {
+				log.Printf("[task] #%s 初始测试账号保存失败 (%s): %v", t.ID, c.Domain, credErr)
+			}
+		}
+	}
 	// 共享的建后流程(seed + 种子意图 + 后台目标分解 + engine.Run),与 spawn_task 复用同一段。
 	// launchTask 内部异步,不阻塞 UI —— 目标分解在后台可见地进行。
 	if schedule == nil || schedule.StartImmediately {
@@ -4459,6 +4483,8 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
 		"noise_profile":              egress.CurrentProfile().Name,
+		"triage_profile_id":          s.triageProfileID(),
+		"triage_min_confidence":      s.triageMinConfidence(),
 	}
 }
 
@@ -4553,6 +4579,8 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
 		NoiseProfile     *string `json:"noise_profile"`
+		TriageProfileID     *int64   `json:"triage_profile_id"`
+		TriageMinConfidence *float64 `json:"triage_min_confidence"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -4570,6 +4598,34 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		egress.SetProfile(profile)
+	}
+	if req.TriageProfileID != nil {
+		if *req.TriageProfileID < 0 {
+			writeErr(w, 400, "triage_profile_id 不能为负数")
+			return
+		}
+		if *req.TriageProfileID > 0 {
+			p, err := s.m.pg.ProfileByID(*req.TriageProfileID)
+			if err != nil || p == nil {
+				writeErr(w, 400, "triage_profile_id 指定的 LLM 配置不存在")
+				return
+			}
+		}
+		if err := s.m.pg.SetSetting(settingTriageProfile, strconv.FormatInt(*req.TriageProfileID, 10)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TriageMinConfidence != nil {
+		if *req.TriageMinConfidence < 0 || *req.TriageMinConfidence > 1 {
+			writeErr(w, 400, "triage_min_confidence 必须在 0 到 1 之间")
+			return
+		}
+		if err := s.m.pg.SetSetting(settingTriageMinConfidence, strconv.FormatFloat(*req.TriageMinConfidence, 'f', -1, 64)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		s.applyTriageThreshold()
 	}
 	if req.EgressProbeURL != nil {
 		value := strings.TrimSpace(*req.EgressProbeURL)
@@ -5110,7 +5166,7 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 			resume := func() { s.reviveTask(t) } // set_goals 新增目标 → 把任务拉回 running
 			// 把上传附件的【绝对路径】清单拼进发给 agent 的消息,它据此用 Read/Bash 打开文件。
 			// taskDir = agent 的工作目录(CWD),与 chatUpload 落盘、ensureRunDir 一致。
-			taskDir := filepath.Join(s.m.dir, "tasks", t.ID)
+			taskDir := agent.EnsureRunDir(s.m.dir, maTaskID, 0)
 			agentMsg := composeAgentMessage(agentMessage, req.Attachments, taskDir)
 			s.engine.BeginLLMCall(t.ID)
 			_, err := ma.Chat(ctx, maTaskID, mainSeg, s.m.Assets(), t.Store, t.Goal, agentMsg, emit, t.Notify, resume, t.NotifyGoal, t.NotifyHint)
@@ -5208,6 +5264,22 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "no active task")
 		return
 	}
+	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	var quality map[int64]db.FindingQuality
+	var ledger *db.CoverageLedger
+	if s.m.pg != nil && taskID > 0 {
+		var err error
+		quality, err = s.m.pg.FindingQualityByNodeID(taskID)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if t.CoverageEnabled && s.m.Assets() != nil {
+			if l, covErr := s.m.Assets().CoverageLedger(taskID); covErr == nil {
+				ledger = l
+			}
+		}
+	}
 	findings, _ := t.Store.ListByKind(db.KindFinding, 1000) // 纯漏洞（事实是独立的 KindFact，不进报告）
 	counts := map[string]int{}
 	for _, ty := range []string{"root_domain", "ip", "subdomain", "app", "service", "endpoint"} {
@@ -5218,7 +5290,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	}
 	md := report.Markdown(report.Input{
 		Title: t.Description, Goal: t.Goal, GeneratedAt: time.Now(),
-		AssetCounts: counts, Findings: findings,
+		AssetCounts: counts, Findings: findings, Quality: quality, Coverage: ledger,
 	})
 	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
 	w.WriteHeader(200)

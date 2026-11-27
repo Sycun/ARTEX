@@ -187,7 +187,7 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 	}
 	prov, cfg, ok := r.s.globalProvider()
 	if !ok {
-		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
+		return sel, fmt.Errorf("task %s has no available fallback LLM provider: %w", r.taskID, agent.ErrGoalDecompositionNoProvider)
 	}
 	sel.provider, sel.retry = prov, cfg.Retry
 	return sel, nil
@@ -491,7 +491,7 @@ func isRetryableStreamError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if isQuotaExhaustedError(err) {
+	if isQuotaExhaustedError(err) || errors.Is(err, agent.ErrNoaBudget) {
 		return false
 	}
 	s := strings.ToLower(err.Error())
@@ -628,6 +628,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	window := workerRuntime.CompactionWindow()
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
 	wk.SetFindingRecorder(s.evidenceStore())
+	s.applyTriageThreshold()
+	wk.SetTriageClient(s.triageClient())
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
@@ -639,6 +641,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
 	pl.SetFindingRecorder(s.evidenceStore())
+	pl.SetTriageClient(s.triageClient())
+	s.wireTaskLessons(t, wk, pl)
 	pl.SetCompactionWindowResolver(plannerRuntime.CompactionWindow)
 	pl.SetNonStreaming(plannerRuntime.nonStreaming)
 	pl.SetMaxTokens(plannerRuntime.maxTokens)
@@ -701,6 +705,8 @@ func (s *Server) workerForTaskSlot(t *Task, slot WorkerSlot) (*agent.Worker, err
 	tx := transcript.NewStore(filepath.Join(s.m.dir, "transcripts"))
 	worker := agent.NewWorker(runtime, cfg.Model, s.m.dir, tx, runtime.CompactionWindow(), s.agentMaxTurns("worker"))
 	worker.SetFindingRecorder(s.evidenceStore())
+	worker.SetTriageClient(s.triageClient())
+	s.wireTaskLessons(t, worker, nil)
 	worker.SetCompactionWindowResolver(runtime.CompactionWindow)
 	worker.SetNonStreaming(runtime.nonStreaming)
 	worker.SetMaxTokens(runtime.maxTokens)

@@ -2597,3 +2597,36 @@ CREATE TABLE IF NOT EXISTS chat_bridges (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Per-task dedicated test accounts (passwords sealed at rest via db/secrets.go colCredPass).
+CREATE TABLE IF NOT EXISTS task_credentials (
+    id         BIGSERIAL PRIMARY KEY,
+    task_id    BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    domain     TEXT NOT NULL,
+    username   TEXT NOT NULL,
+    password   TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user','agent')),
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, domain, username)
+);
+CREATE INDEX IF NOT EXISTS idx_task_credentials_task ON task_credentials(task_id);
+DROP TRIGGER IF EXISTS trg_task_credentials_upd ON task_credentials;
+CREATE TRIGGER trg_task_credentials_upd BEFORE UPDATE ON task_credentials
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+ALTER TABLE rsi_lesson_evidence ADD COLUMN IF NOT EXISTS id BIGSERIAL;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'rsi_lesson_evidence'::regclass
+          AND contype = 'p'
+          AND conname = 'rsi_lesson_evidence_pkey'
+          AND array_length(conkey, 1) > 1
+    ) THEN
+        ALTER TABLE rsi_lesson_evidence DROP CONSTRAINT rsi_lesson_evidence_pkey;
+        ALTER TABLE rsi_lesson_evidence ADD PRIMARY KEY (id);
+    END IF;
+END $$;

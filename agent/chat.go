@@ -2,8 +2,6 @@ package agent
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -118,14 +116,13 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 
 	// Per-session working directory: <workDir>/sessions/<sessionID>/
 	// Isolates file writes across conversations, mirroring how workers use i<intentID>/.
-	sessionWorkDir := filepath.Join(c.workDir, "sessions", sessionID)
-	_ = os.MkdirAll(sessionWorkDir, 0o755)
+	sessionWorkDir := EnsureSessionDir(c.workDir, sessionID)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, sessionWorkDir)
 
 	// Pure assistant: DefaultTools as the base; AugmentTools layers in the key's
 	// visible skills/MCP and lets the DB tools table filter/override. DefaultTools
 	// have no tools-table rows, so they always pass through.
-	base := guardedDefaultTools()
+	base := guardedDefaultTools(c.workDir)
 	ctx = WithRunInfo(ctx, RunInfo{SessionID: sessionID, WorkDir: sessionWorkDir})
 	tools, def, cleanup := AugmentTools(ctx, agentKey, base)
 	defer cleanup()
@@ -159,9 +156,9 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 		MaxDuration:        maxDuration,
 		Compaction:         compactionConfig(c.window),
 		Todos:              actool.NewTodoStore(),
-		// large tool output spills to cmd-output/ under the session dir.
+		// large tool output spills to cmd-output/ under the session dir (or server-owned spill dir).
 		// 截断上限用 SDK 默认(tool.Capture 的 30000 字符)。
-		ToolOutputDir: filepath.Join(sessionWorkDir, "cmd-output"),
+		ToolOutputDir: SessionToolOutputDir(c.workDir, sessionID, sessionWorkDir),
 		// 命中预算(步数)→ SDK 跑收尾:输出一句总结。Prompt 与收尾轮数按本 agent key 后台可编辑
 		// (自定义 agent 各自一份;留空/0 用通用默认:10 轮)。
 		Settlement:              wrapupSettlement(agentKey, nil),
@@ -172,6 +169,7 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	if c.guard != nil {
 		opts.Hooks = c.guard.Hooks()
 	}
+	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
 	if c.tx != nil { // persist raw human↔AI conversation; one accumulating file per thread
 		opts.Transcript = c.tx
 		opts.SessionID = sessionID
@@ -184,7 +182,9 @@ func (c *ChatAgent) Chat(ctx context.Context, agentKey, sessionID, message strin
 	// reload prior conversation so the agent has context across turns (each Chat is
 	// a fresh session). First turn: no file yet → Resume loads nothing and proceeds.
 	if c.tx != nil {
-		_ = s.Resume(sessionID)
+		if err := resumeSession(s, sessionID); err != nil {
+			return "", err
+		}
 	}
 	// re-unlock skill-gated MCPs from prior Skill() calls in the reloaded history so
 	// revealed tools stay callable across the fresh session.

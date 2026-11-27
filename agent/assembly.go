@@ -81,9 +81,10 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	return out, def, cleanup
 }
 
-// Install the guarded handler before ToolResolve decorates it with DB defaults.
-func guardedDefaultTools() []actool.CoreTool {
-	tools := actool.DefaultTools()
+// Install the confined file tools and guarded Bash handler before ToolResolve
+// decorates them with DB defaults.
+func guardedDefaultTools(base string) []actool.CoreTool {
+	tools := defaultTools(base)
 	for i, t := range tools {
 		if t.Name() == "Bash" {
 			tools[i] = toolguard.NewBash()

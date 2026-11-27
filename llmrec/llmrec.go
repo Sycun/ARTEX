@@ -36,6 +36,27 @@ func usageSinkFrom(ctx context.Context) func(llm.Usage) {
 	return sink
 }
 
+type stopSinkContextKey struct{}
+
+// WithStopSink attaches a callback that receives the stop reason of every call
+// made under ctx that completes normally, once per call, after the provider's
+// last event ("" when the provider reported none).
+func WithStopSink(ctx context.Context, sink func(stopReason string)) context.Context {
+	if sink == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, stopSinkContextKey{}, sink)
+}
+
+func reportStop(ctx context.Context, stopReason string) {
+	if ctx == nil {
+		return
+	}
+	if sink, _ := ctx.Value(stopSinkContextKey{}).(func(string)); sink != nil {
+		sink(stopReason)
+	}
+}
+
 // WithTaskID attaches the owning task registry id to an LLM call. Session ids
 // are based on exploration ids, which are not interchangeable with task ids.
 func WithTaskID(ctx context.Context, taskID string) context.Context {
@@ -189,6 +210,9 @@ func (r *Recorder) Stream(ctx context.Context, req llm.CompletionRequest) iter.S
 				status = "error"
 			}
 			// Lightweight metering row — always written.
+			if err == nil {
+				reportStop(ctx, stopReason)
+			}
 			if sink := usageSinkFrom(ctx); sink != nil {
 				sink(usage)
 			}
@@ -277,6 +301,8 @@ func (r *Recorder) Complete(ctx context.Context, req llm.CompletionRequest) (llm
 	status := "ok"
 	if err != nil {
 		status = "error"
+	} else {
+		reportStop(ctx, stopReason)
 	}
 	if sink := usageSinkFrom(ctx); sink != nil {
 		sink(usage)

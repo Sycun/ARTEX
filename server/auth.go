@@ -202,7 +202,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 					}
 					return
 				}
-				if r.Method == http.MethodGet && p == "/api/workers" {
+				if r.Method == http.MethodGet && (p == "/api/workers" || p == "/api/skill-gaps") {
 					if !actor.Platform() {
 						writeProductError(w, http.StatusForbidden, "forbidden", "仅平台管理员可访问", nil)
 						return

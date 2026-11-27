@@ -11,7 +11,7 @@ import (
 // same memory/timeout guards and proxy/TLS settings.
 func newAgentSession(opts agentcore.Options) *agentcore.Session {
 	if opts.Tools == nil {
-		opts.Tools = guardedDefaultTools()
+		opts.Tools = guardedDefaultTools(opts.WorkingDir)
 	} else if opts.EnableWebFetch {
 		opts.Tools = append([]actool.CoreTool{}, opts.Tools...)
 	}

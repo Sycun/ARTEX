@@ -79,8 +79,10 @@ var errWorkControlConflict = errors.New("work control conflict")
 // retryableWorkerModelError excludes errors already handled by the task router.
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
+// A NOA budget refusal is deterministic and never reached the provider, so a
+// rerun would only fail the same way.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !errors.Is(err, agent.ErrNoaBudget)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -642,6 +644,10 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 	// inner 已经决定硬停、或已经要注入自己的续跑消息 → 尊重它，不再叠加。
 	// limit<=0 = 用户把「空响应重试次数」配成了 -1，即显式关掉这层。
 	if prevent || len(blocking) > 0 || h.nudges == nil || h.limit <= 0 || !isThinkingOnlyTurn(messages) {
+		return prevent, blocking, msg
+	}
+	if stop := agent.LastStopReason(ctx); agent.IsRefusalStop(stop) {
+		log.Printf("[work %s] 供应商拒绝了本回合 (stop_reason=%s)，不注入空转续跑指令", h.label, stop)
 		return prevent, blocking, msg
 	}
 	n := h.nudges.Add(1)

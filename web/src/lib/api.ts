@@ -93,7 +93,11 @@ import type {
   SSTask,
   Stats,
   SystemMetrics,
+  TamperDryRunRequest,
+  TamperDryRunResult,
   TamperHook,
+  TamperHookInput,
+  TamperHooksListResp,
   TamperHookVersion,
   Task,
   TaskArchive,
@@ -102,6 +106,8 @@ import type {
   TaskAssetScopeMutation,
   TaskCategory,
   TaskConstraint,
+  TaskCredential,
+  TaskCredentialInput,
   TaskFileListing,
   TaskGoal,
   TaskIntelligence,
@@ -117,8 +123,10 @@ import type {
   TrafficDetail,
   TrafficEvidenceRef,
   TrafficEvidenceRole,
+  TrafficHARExportMeta,
   TrafficHARImportResult,
   TrafficHost,
+  TrafficReplayRequest,
   TrafficReplayResult,
   TrafficResp,
   TrafficStreamDirection,
@@ -235,6 +243,7 @@ export class ApiError extends Error {
     message: string,
     public readonly code?: string,
     public readonly params?: Record<string, unknown>,
+    public readonly status?: number,
   ) {
     super(message);
     this.name = "ApiError";
@@ -275,7 +284,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       else auth.clearToken();
       window.location.href = "/login";
     }
-    throw new ApiError(message, code, params);
+    throw new ApiError(message, code, params, r.status);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -485,6 +494,7 @@ export const api = {
     coverageEnabled?: boolean;
     workerCount?: number;
     interceptRules?: AssetInterceptRuleInput[];
+    credentials?: TaskCredentialInput[];
     schedule?: ScheduleInput;
   }) =>
     post<Task>("/tasks", {
@@ -506,8 +516,15 @@ export const api = {
       coverage_enabled: input.coverageEnabled ?? true, // 默认开;false=关闭资产覆盖度功能
       worker_count: input.workerCount ?? 0, // 0 = 用全局默认 workers
       intercept_rules: input.interceptRules ?? [], // 任务级资产拦截规则
+      credentials: input.credentials ?? [],
       schedule: input.schedule ? schedulePayload(input.schedule) : undefined,
     }),
+  taskCredentials: (taskId: string) =>
+    get<TaskCredential[]>(`/tasks/${encodeURIComponent(taskId)}/credentials`).then((r) => arr(r)),
+  addTaskCredential: (taskId: string, body: TaskCredentialInput) =>
+    post<TaskCredential>(`/tasks/${encodeURIComponent(taskId)}/credentials`, body),
+  deleteTaskCredential: (taskId: string, cid: number) =>
+    del<{ ok: boolean }>(`/tasks/${encodeURIComponent(taskId)}/credentials/${cid}`),
   schedules: () => get<{ schedules: TaskSchedule[] }>("/schedules").then((r) => arr(r.schedules)),
   renameSchedule: (id: number, name: string) => patch<TaskSchedule>(`/schedules/${id}/metadata`, { name }),
   updateScheduleRemark: (id: number, remark: string) => patch<TaskSchedule>(`/schedules/${id}/remark`, { remark }),
@@ -1204,25 +1221,32 @@ export const api = {
     get<TrafficStreamPage>(
       `/traffic/stream?exchange=${encodeURIComponent(id)}&offset=${offset}&limit=${limit}${direction ? `&direction=${encodeURIComponent(direction)}` : ""}`,
     ),
-  trafficReplay: (req: {
-    method: string;
-    url: string;
-    headers?: { name: string; value: string }[];
-    body?: string;
-    apply_rules?: boolean;
-  }) => post<TrafficReplayResult>("/traffic/replay", req),
+  trafficBlob: async (hash: string) => {
+    if (MOCK) throw new Error("Blob download is not available in demo mode");
+    const token = getToken();
+    const r = await apiFetch(`/api/traffic/blob?hash=${encodeURIComponent(hash)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!r.ok) throw new ApiError(`GET /traffic/blob: ${r.status}`, undefined, undefined, r.status);
+    return new Uint8Array(await r.arrayBuffer());
+  },
+  trafficReplay: (req: TrafficReplayRequest) => post<TrafficReplayResult>("/traffic/replay", req),
   trafficImportHAR: (rawJSON: string) =>
     http<TrafficHARImportResult>("/traffic/import/har", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: rawJSON,
     }),
-  trafficExportHAR: async (query: string) => {
+  trafficExportHAR: async (query: string): Promise<TrafficHARExportMeta> => {
     const token = getToken();
     const r = await apiFetch(`/api/traffic/export/har${query ? `?${query}` : ""}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`export: ${r.status}`);
+    if (!r.ok) throw new ApiError(`GET /traffic/export/har: ${r.status}`, undefined, undefined, r.status);
+    const exported = Number.parseInt(r.headers.get("X-ARTEX-HAR-Exported") ?? "0", 10) || 0;
+    const matched = Number.parseInt(r.headers.get("X-ARTEX-HAR-Matched") ?? "0", 10) || 0;
+    const truncated = r.headers.get("X-ARTEX-HAR-Truncated") === "1";
+    const truncatedReason = r.headers.get("X-ARTEX-HAR-Truncated-Reason") ?? undefined;
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1232,19 +1256,17 @@ export const api = {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    return { exported, matched, truncated, truncatedReason };
   },
-  trafficHooks: () => get<{ hooks: TamperHook[]; enabled_by_env: boolean }>("/traffic/hooks"),
-  createTrafficHook: (body: { name: string; phase: string; priority: number; source: string; note: string }) =>
-    post<TamperHook>("/traffic/hooks", { ...body, enabled: false, matchers: {} }),
+  trafficHooks: () => get<TamperHooksListResp>("/traffic/hooks"),
+  createTrafficHook: (body: TamperHookInput) =>
+    post<TamperHook>("/traffic/hooks", { ...body, enabled: false }),
+  updateTrafficHook: (id: number, body: TamperHookInput) => put<TamperHook>(`/traffic/hooks/${id}`, body),
+  deleteTrafficHook: (id: number) => del<{ deleted: boolean }>(`/traffic/hooks/${id}`),
   toggleTrafficHook: (id: number, enabled: boolean) => post<TamperHook>(`/traffic/hooks/${id}/toggle`, { enabled }),
   trafficHookVersions: (id: number) => get<{ versions: TamperHookVersion[] }>(`/traffic/hooks/${id}/versions`),
   rollbackTrafficHook: (id: number, version: number) => post<TamperHook>(`/traffic/hooks/${id}/rollback`, { version }),
-  dryRunTrafficHook: (body: {
-    source: string;
-    phase: string;
-    request: { method: string; url: string; headers: Record<string, string[]>; body: string };
-    response: { status: number; headers: Record<string, string[]>; body: string };
-  }) => post<Record<string, unknown>>("/traffic/hooks/dry-run", body),
+  dryRunTrafficHook: (body: TamperDryRunRequest) => post<TamperDryRunResult>("/traffic/hooks/dry-run", body),
 
   // ---- app settings (runtime toggles) ----
   intelligence: (scope: "tasks" | "assets", id: string, query: URLSearchParams) =>

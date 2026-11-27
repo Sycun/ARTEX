@@ -995,7 +995,10 @@ export interface TrafficStreamMessage {
   ts: number;
   direction: string;
   type: string;
+  kind?: number;
   event?: string;
+  event_id?: string;
+  retry?: number;
   size: number;
   payload: string;
   encoding?: string;
@@ -1014,6 +1017,15 @@ export interface TrafficReplayHeader {
   value: string;
 }
 
+export interface TrafficReplayRequest {
+  method: string;
+  url: string;
+  headers?: TrafficReplayHeader[];
+  body?: string;
+  body_base64?: boolean;
+  apply_rules?: boolean;
+}
+
 export interface TrafficReplayResult {
   status: number;
   headers: TrafficReplayHeader[];
@@ -1023,23 +1035,71 @@ export interface TrafficReplayResult {
   recorded: boolean;
 }
 
+export interface TrafficHARImportError {
+  index: number;
+  url?: string;
+  reason: string;
+}
+
 export interface TrafficHARImportResult {
   imported: number;
   skipped: number;
-  errors?: string[];
+  failed?: number;
+  truncated?: boolean;
+  errors?: TrafficHARImportError[];
+}
+
+export interface TrafficHARExportMeta {
+  exported: number;
+  matched: number;
+  truncated: boolean;
+  truncatedReason?: string;
+}
+
+export type TamperHookPhase = "request" | "response";
+
+export interface TamperHookHeaderMatcher {
+  name: string;
+  value_regex?: string;
+}
+
+export interface TamperHookMatchers {
+  methods?: string[];
+  host?: string;
+  url_regex?: string;
+  headers?: TamperHookHeaderMatcher[];
+  body_regex?: string;
+  status?: string[];
+  resp_headers?: TamperHookHeaderMatcher[];
+  resp_body_regex?: string;
+}
+
+export interface TamperHookLastError {
+  class: string;
+  at: string;
+  count: number;
 }
 
 export interface TamperHook {
   id: number;
   name: string;
   enabled: boolean;
-  phase: string;
+  phase: TamperHookPhase;
   priority: number;
+  matchers: TamperHookMatchers;
   source: string;
+  source_sha256: string;
   version: number;
   note: string;
+  created_at: string;
+  updated_at: string;
   load_error?: string;
-  last_error?: { class?: string; message?: string };
+  last_error?: TamperHookLastError | null;
+}
+
+export interface TamperHooksListResp {
+  hooks: TamperHook[];
+  enabled_by_env: boolean;
 }
 
 export interface TamperHookVersion {
@@ -1047,10 +1107,89 @@ export interface TamperHookVersion {
   hook_id: number;
   version: number;
   name: string;
-  phase: string;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
   source: string;
+  source_sha256: string;
   note: string;
   created_at: string;
+}
+
+export interface TamperHookInput {
+  name: string;
+  enabled?: boolean;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
+  source: string;
+  note?: string;
+}
+
+export interface TamperDryRunIO {
+  request: {
+    method: string;
+    url: string;
+    headers: Record<string, string[]>;
+    body: string;
+  };
+  response: {
+    status: number;
+    headers: Record<string, string[]>;
+    body: string;
+  };
+}
+
+export interface TamperDryRunRequest {
+  hook_id?: number;
+  name?: string;
+  phase?: TamperHookPhase;
+  matchers?: TamperHookMatchers;
+  source?: string;
+  request: TamperDryRunIO["request"];
+  response: TamperDryRunIO["response"];
+}
+
+export interface TamperTraceLine {
+  Phase: string;
+  SourceKind: string;
+  RuleID?: number;
+  HookID?: number;
+  HookVersion?: number;
+  RuleSnapshot?: string;
+  Action: string;
+  Field: string;
+  Outcome: string;
+  Reason?: string;
+  BeforeHash: string;
+  AfterHash: string;
+  After: string | null;
+}
+
+export interface TamperDryRunResult {
+  changed: boolean;
+  request: TamperDryRunIO["request"];
+  response: TamperDryRunIO["response"];
+  lines: TamperTraceLine[];
+}
+
+export interface TaskCredentialInput {
+  domain: string;
+  username: string;
+  password?: string;
+  note?: string;
+}
+
+export interface TaskCredential {
+  id: number;
+  task_id: number;
+  domain: string;
+  username: string;
+  password: string;
+  source: "user" | "agent";
+  note: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // One distinct recorded host with its exchange count (target picker).
@@ -1068,6 +1207,8 @@ export interface Settings {
   browser_screenshot_timestamp_enabled?: boolean;
   /** 是否向 Agent 注入统一 OPSEC 准则。默认关闭。 */
   opsec_enabled?: boolean;
+  triage_profile_id?: number;
+  triage_min_confidence?: number;
   credential_agent_enabled: boolean;
   credential_traffic_binding: boolean;
   task_intelligence_enabled: boolean; // 默认开启；关闭不注入情报工具或提示

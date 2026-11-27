@@ -52,6 +52,7 @@ func printBanner(addr string) {
 // whether to relaunch us (see selfupdate.ExitRestart) — so the body has to live
 // in a function that can *return* rather than os.Exit past its own defers.
 func main() {
+	server.RunExecShimIfRequested(os.Args)
 	if code, handled := toolguard.BackgroundHelper(os.Args[1:]); handled {
 		os.Exit(code)
 	}
@@ -71,6 +72,10 @@ type runtimeConfig struct {
 	WorkerID          string
 	WorkerZone        string
 	WorkerConcurrency int
+	ExecUID           int
+	ExecGID           int
+	ExecExplicit      bool
+	DevNoIsolation    bool
 }
 
 func parseRuntimeConfig(fs *flag.FlagSet, args []string, getenv func(string) string) (runtimeConfig, error) {
@@ -81,9 +86,18 @@ func parseRuntimeConfig(fs *flag.FlagSet, args []string, getenv func(string) str
 	workerID := fs.String("worker-id", "", "worker identity (default: hostname plus a short suffix)")
 	workerZone := fs.String("worker-zone", "default", "execution zone this worker claims")
 	workerConcurrency := fs.Int("worker-concurrency", 4, "maximum jobs claimed at once")
+	execUID := fs.Int("exec-uid", server.DefaultExecUID, "UID agent subprocesses drop to on Linux when running as root (-1 to disable)")
+	execGID := fs.Int("exec-gid", server.DefaultExecGID, "GID agent subprocesses drop to on Linux when running as root")
+	devNoIsolation := fs.Bool(server.DevNoIsolationFlag, false, "DEVELOPMENT ONLY: allow startup on Linux as root if the agent isolation self-test fails")
 	if err := fs.Parse(args); err != nil {
 		return runtimeConfig{}, err
 	}
+	execExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "exec-uid" || f.Name == "exec-gid" {
+			execExplicit = true
+		}
+	})
 	cfg := runtimeConfig{
 		Addr:              *addr,
 		DataDir:           *dataDir,
@@ -92,6 +106,10 @@ func parseRuntimeConfig(fs *flag.FlagSet, args []string, getenv func(string) str
 		WorkerID:          *workerID,
 		WorkerZone:        *workerZone,
 		WorkerConcurrency: *workerConcurrency,
+		ExecUID:           *execUID,
+		ExecGID:           *execGID,
+		ExecExplicit:      execExplicit,
+		DevNoIsolation:    *devNoIsolation,
 	}
 	if v := getenv("ARTEX_MODE"); v != "" {
 		cfg.Mode = v
@@ -215,6 +233,35 @@ func run() int {
 		log.Printf("[config] ARTEX_TRUSTED_PROXIES: %v", err)
 		return 1
 	}
+
+	keyDir := config.KeyDir()
+	priv, err := server.ResolveExecPrivilege(cfg.ExecUID, cfg.ExecGID, cfg.ExecExplicit)
+	if err != nil {
+		log.Printf("[exec] %v", err)
+		return 1
+	}
+	if err := server.PrepareExecPrivilege(&priv, cfg.DataDir, keyDir, cfgPath); err != nil {
+		log.Printf("[exec] %v", err)
+		return 1
+	}
+	if err := server.InstallBashShim(priv); err != nil {
+		log.Printf("[exec] %v", err)
+		return 1
+	}
+	dsn, _, _ := config.PostgresDSN()
+	selfTestErr := server.IsolationSelfTest(priv, server.IsolationTargets{
+		DataDir:    cfg.DataDir,
+		KeyDir:     keyDir,
+		ConfigPath: cfgPath,
+		SkillDir:   skillDir,
+		DSN:        dsn,
+	})
+	isoStatus, err := server.EnforceIsolation(runtime.GOOS, priv, selfTestErr, cfg.DevNoIsolation)
+	if err != nil {
+		log.Printf("[isolation] %v", err)
+		return 1
+	}
+
 	mgr, err := server.NewManagerWithMode(cfg.DataDir, cfg.Proxy, cfg.Mode)
 	if err != nil {
 		log.Fatalf("open stores: %v", err)
@@ -233,12 +280,12 @@ func run() int {
 	// OIDC/S3 settings, then scrubs secretEnv. ARTEX_WORKER_* stay in cfg and in
 	// the environment, so --mode=worker keeps its identity and does not hand
 	// the database or OIDC secrets to a child process.
-	srv := server.NewRuntime(srvCtx, mgr, skillDir, cfg.DataDir, config.KeyDir(), server.Runtime{
+	srv := server.NewRuntime(srvCtx, mgr, skillDir, cfg.DataDir, keyDir, server.Runtime{
 		Mode:        cfg.Mode,
 		WorkerID:    cfg.WorkerID,
 		Zone:        cfg.WorkerZone,
 		Concurrency: cfg.WorkerConcurrency,
-	}, server.WithSecretScrub(), server.WithTrustedProxies(trusted))
+	}, server.WithSecretScrub(), server.WithTrustedProxies(trusted), server.WithExecPrivilege(priv), server.WithIsolationStatus(isoStatus))
 	defer srv.Close()
 	if cfg.Mode == "worker" {
 		log.Printf("ARTEX %s worker %s zone=%s concurrency=%d (data=%s)", version, cfg.WorkerID, cfg.WorkerZone, cfg.WorkerConcurrency, cfg.DataDir)

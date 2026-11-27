@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/Autumn-27/artex/db"
@@ -107,6 +108,12 @@ func HintTrafficSchema() map[string]any {
 	return map[string]any{"type": "array", "description": "可选：已核实且对应本提示中具体漏洞的流量引用，保留顺序；交接后 report_finding 可传 evidence_hint_id 携带这些引用。", "items": obj(map[string]any{"traffic_id": str("真实流量 ID"), "role": str("baseline / proof / verification / supporting"), "note": str("该流量支持什么结论")}, "traffic_id")}
 }
 
+// errEvidenceHintNotFound marks an evidence_hint_id that does not resolve to a
+// local hint node of the current task (e.g. stale/deleted ID, inherited hint, or
+// non-hint node ID). report_finding degrades cleanly instead of discarding the
+// finding (#550).
+var errEvidenceHintNotFound = errors.New("evidence_hint_id is not a local hint node")
+
 func (t *ToolSet) findingRefsFromHint(hintID int64, explicit []db.TrafficRef) ([]db.TrafficRef, error) {
 	if hintID <= 0 {
 		return db.NormalizeTrafficRefs(explicit)
@@ -116,7 +123,7 @@ func (t *ToolSet) findingRefsFromHint(hintID int64, explicit []db.TrafficRef) ([
 		return nil, err
 	}
 	if n == nil || n.Kind != db.KindHint {
-		return nil, fmt.Errorf("evidence_hint_id=%d 必须是本任务的提示节点（继承提示不可直接用于绑定）", hintID)
+		return nil, fmt.Errorf("%w: evidence_hint_id=%d 必须是本任务的提示节点（继承提示不可直接用于绑定）", errEvidenceHintNotFound, hintID)
 	}
 	var payload struct {
 		Refs []db.TrafficRef `json:"traffic_refs"`

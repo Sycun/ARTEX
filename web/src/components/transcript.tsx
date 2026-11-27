@@ -25,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { localizedError } from "@/i18n/errors";
 import { useLiveTranslation } from "@/i18n/use-live-translation";
+import { useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
 import { formatToolDetail, type ToolDetailPart, toolInputText } from "@/lib/execution-display";
 import type { Activity, InterceptPending } from "@/lib/types";
@@ -565,12 +566,23 @@ type MsgAttachment = { name: string; path: string; size: number };
 // parseUserBody splits a user turn's body into text + attachments. The backend stores
 // Detail as JSON {text, attachments} when files were uploaded, else plain text — so we
 // parse defensively and fall back to treating the whole body as text.
-function parseUserBody(body: string): { text: string; attachments: MsgAttachment[] } {
+function parseUserBody(body: string): {
+  text: string;
+  attachments: MsgAttachment[];
+  targetDerivedHosts?: string[];
+} {
   if (body.startsWith("{")) {
     try {
       const p = JSON.parse(body);
       if (p && Array.isArray(p.attachments)) {
-        return { text: typeof p.text === "string" ? p.text : "", attachments: p.attachments };
+        const derived = Array.isArray(p.target_derived_hosts)
+          ? p.target_derived_hosts.filter((h: unknown): h is string => typeof h === "string" && h.trim() !== "")
+          : undefined;
+        return {
+          text: typeof p.text === "string" ? p.text : "",
+          attachments: p.attachments,
+          targetDerivedHosts: derived?.length ? derived : undefined,
+        };
       }
     } catch {
       /* plain text that merely starts with "{" */
@@ -588,6 +600,7 @@ function UserRow({
   intent?: boolean;
   getDetail: (seq: number) => Promise<string>;
 }) {
+  const { ui } = useUITranslation();
   const Icon = intent ? CrosshairIcon : UserIcon;
   const [ref, inView] = useInView();
   // Optimistic echoes carry their detail inline; persisted rows lazy-load it on scroll.
@@ -608,10 +621,20 @@ function UserRow({
       live = false;
     };
   }, [inView, step.seq, getDetail, step.summary, inline]);
-  const { text, attachments } = parseUserBody(full ?? step.summary);
+  const { text, attachments, targetDerivedHosts } = parseUserBody(full ?? step.summary);
   return (
     <div ref={ref} className="mt-3 mb-2 flex w-full min-w-0 justify-end gap-2">
       <div className="flex min-w-0 max-w-[85%] flex-col items-end gap-1.5">
+        {targetDerivedHosts && targetDerivedHosts.length > 0 && (
+          <Badge
+            variant="outline"
+            className="gap-1 border-amber-500/50 bg-amber-500/10 font-mono text-[11px] text-amber-700 dark:text-amber-400"
+            title={ui("chatUI.askOperator.targetDerivedTitle")}
+          >
+            <ShieldAlertIcon className="size-3 shrink-0" />
+            {ui("chatUI.askOperator.targetDerivedLabel", { hosts: targetDerivedHosts.join(", ") })}
+          </Badge>
+        )}
         {attachments.length > 0 && (
           <div className="flex min-w-0 max-w-full flex-wrap justify-end gap-1.5">
             {attachments.map((a) => (

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -377,7 +378,12 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	for _, g := range goals {
 		var p map[string]any
 		_ = json.Unmarshal(g.Payload, &p)
-		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
+		text, _ := p["text"].(string)
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": text})
 	}
 	out["goals"] = gsum
 	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
@@ -528,7 +534,16 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// the original task (root) so the planner always has it, not just the
 	// decomposed goals.
 	if description, goal, err := t.ts.Root(); err == nil {
-		out["task"] = map[string]any{"description": description, "goal": goal}
+		task := map[string]any{}
+		if d := strings.TrimSpace(description); d != "" {
+			task["description"] = d
+		}
+		if g := strings.TrimSpace(goal); g != "" {
+			task["goal"] = g
+		}
+		if len(task) > 0 {
+			out["task"] = task
+		}
 	}
 	// Direct source tasks are a live, read-only blackboard view. Keep their
 	// summaries in a separate field so their intents never enter this task's
@@ -565,6 +580,10 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 				out["coverage"] = m
 			}
 		}
+	}
+	if creds := t.taskCredentialOverview(); len(creds) > 0 {
+		out["task_credentials"] = creds
+		out["task_credentials_note"] = "本任务的测试账号：做鉴权测试时优先复用对应域名的账号，避免重复注册；密码为空表示需先用强随机密码注册该账号并通过 save_task_credential 写回；任何你在测试中自行注册的账号也必须用 save_task_credential 记录"
 	}
 	return out
 }
@@ -1328,12 +1347,25 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if !findingTrafficBindingEnabled() {
 			a.TrafficRefs, a.EvidenceHintID = nil, nil
 		}
-		if len(a.EvidenceHintID) > 0 && pid(a.EvidenceHintID) <= 0 {
-			return actool.Errorf("evidence_hint_id 必须为有效的提示节点 ID；无交接提示时省略"), nil
-		}
-		refs, err := t.findingRefsFromHint(pid(a.EvidenceHintID), a.TrafficRefs)
+		// Models routinely emit "evidence_hint_id": 0/null/"" meaning "absent", or pass
+		// a stale/non-hint node ID. Degrade stale or non-local hint IDs cleanly to any
+		// valid explicit traffic_refs (including none) instead of discarding the finding (#550).
+		hintID := pid(a.EvidenceHintID)
+		var ignoredHintNote string
+		refs, err := t.findingRefsFromHint(hintID, a.TrafficRefs)
 		if err != nil {
-			return actool.Errorf(err.Error()), nil
+			if errors.Is(err, errEvidenceHintNotFound) {
+				degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs)
+				if derr != nil {
+					return actool.Errorf(derr.Error()), nil
+				}
+				refs = degraded
+				ignoredHintNote = fmt.Sprintf("已忽略失效或非本任务的 evidence_hint_id=%d，漏洞已正常登记。", hintID)
+			} else if degraded, derr := db.NormalizeTrafficRefs(a.TrafficRefs); derr == nil && len(degraded) > 0 {
+				refs = degraded
+			} else {
+				return actool.Errorf(err.Error()), nil
+			}
 		}
 		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: pid(a.IntentID), VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs)}
 		if !a.ForceRegister {
@@ -1399,6 +1431,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"
 			if !findingTrafficBindingEnabled() {
 				result.EvidenceNote = "漏洞已保存。Agent 自动绑定流量已关闭，可在页面人工关联流量。"
+			}
+		}
+		if ignoredHintNote != "" {
+			if result.EvidenceNote != "" {
+				result.EvidenceNote = ignoredHintNote + " " + result.EvidenceNote
+			} else {
+				result.EvidenceNote = ignoredHintNote
 			}
 		}
 		raw, _ := json.Marshal(result)

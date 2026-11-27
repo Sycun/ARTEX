@@ -33,10 +33,17 @@ func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessio
 	if opts.OnWarn == nil {
 		opts.OnWarn = onWarn
 	}
-	if err := noaadapter.Enable(opts, noaadapter.Options{
-		ArchiveBaseDir: filepath.Join(archiveRoot, "noa"),
-		SessionID:      sessionID,
-		OnWarn:         onWarn,
+	// noa sizes its thresholds to the window this agent is configured for, read
+	// before Compaction is cleared below; without it noa assumes its own default.
+	window := defaultWindowK * 1000
+	if opts.Compaction != nil && opts.Compaction.ContextWindow > 0 {
+		window = opts.Compaction.ContextWindow
+	}
+	if err := noaEnable(opts, noaadapter.Options{
+		ArchiveBaseDir:    filepath.Join(archiveRoot, "noa"),
+		SessionID:         sessionID,
+		OnWarn:            onWarn,
+		ModelContextLimit: window,
 	}); err != nil {
 		if onWarn != nil {
 			onWarn("noa 压缩启用失败,回退内置压缩:" + err.Error())
@@ -45,4 +52,9 @@ func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessio
 	}
 	// Compactor 覆盖 Compaction,但两者并存时 agentcore 每次会告警;明确清掉。
 	opts.Compaction = nil
+	// noa 只能裁剪可丢弃历史;当受保护部分(system/近期轮次/输出预算)本身已超窗口时直接拒绝,避免发往供应商空烧。
+	opts.Provider = &noaBudgetProvider{Provider: opts.Provider, window: window}
 }
+
+// noaEnable is noaadapter.Enable; tests replace it to observe the options.
+var noaEnable = noaadapter.Enable

@@ -49,6 +49,8 @@ services:
     mem_limit: ${ARTEX_MEMORY_LIMIT:-4g}
     memswap_limit: ${ARTEX_MEMORY_LIMIT:-4g}
     pids_limit: ${ARTEX_PIDS_LIMIT:-512}
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
 volumes:

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/agent"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/klauspost/compress/zstd"
 )
@@ -78,7 +79,10 @@ func writeArchiveJournal(path string, value any) error {
 		_ = file.Close()
 		return err
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 func taskArchiveRoot(dataDir string) string {
@@ -120,6 +124,12 @@ func stageTaskArchiveFiles(dataDir string, archiveID int64, taskID string, explo
 	taskDir := filepath.Join(dataDir, "tasks", taskID)
 	if _, err := os.Lstat(taskDir); err == nil {
 		targets = append(targets, archiveFileMove{Source: taskDir, Relative: filepath.Join("files", "tasks", taskID)})
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	spillDir := agent.TaskSpillDir(dataDir, taskID)
+	if _, err := os.Lstat(spillDir); err == nil {
+		targets = append(targets, archiveFileMove{Source: spillDir, Relative: filepath.Join("files", "spill", "tasks", taskID)})
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -227,7 +237,8 @@ func (s *taskArchiveFileStage) commit() error {
 	return os.RemoveAll(s.root)
 }
 
-func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int64) (*taskArchiveRestoreFiles, error) {
+func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int64, priv ...ExecPrivilege) (*taskArchiveRestoreFiles, error) {
+	ep := firstExecPriv(priv)
 	stage := &taskArchiveRestoreFiles{extracted: extractedDir}
 	numericTaskID, err := strconv.ParseInt(taskID, 10, 64)
 	if err != nil || numericTaskID <= 0 {
@@ -235,8 +246,20 @@ func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int
 	}
 	sources := []restoredArchivePath{}
 	workspace := filepath.Join(extractedDir, "files", "tasks", taskID)
+	taskDir := filepath.Join(dataDir, "tasks", taskID)
+	hasWorkspace := false
 	if _, err := os.Lstat(workspace); err == nil {
-		sources = append(sources, restoredArchivePath{Source: workspace, Destination: filepath.Join(dataDir, "tasks", taskID)})
+		sources = append(sources, restoredArchivePath{Source: workspace, Destination: taskDir})
+		hasWorkspace = true
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	spill := filepath.Join(extractedDir, "files", "spill", "tasks", taskID)
+	spillDir := agent.TaskSpillDir(dataDir, taskID)
+	hasSpill := false
+	if _, err := os.Lstat(spill); err == nil {
+		sources = append(sources, restoredArchivePath{Source: spill, Destination: spillDir})
+		hasSpill = true
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -270,6 +293,18 @@ func installTaskArchiveFiles(dataDir, extractedDir, taskID string, archiveID int
 		if err := os.Rename(move.Source, move.Destination); err != nil {
 			_ = stage.rollback()
 			return nil, err
+		}
+	}
+	if hasWorkspace {
+		if err := shareRestoredTaskDir(ep, taskDir); err != nil {
+			_ = stage.rollback()
+			return nil, fmt.Errorf("restore the run directory ownership of %s: %w", taskDir, err)
+		}
+	}
+	if hasSpill {
+		if err := shareRestoredSpillDir(ep, spillDir); err != nil {
+			_ = stage.rollback()
+			return nil, fmt.Errorf("restore the spill directory ownership of %s: %w", spillDir, err)
 		}
 	}
 	return stage, nil

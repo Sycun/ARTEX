@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
@@ -22,6 +24,8 @@ import (
 // into the frontier. It is the sole intent generator.
 type Planner struct {
 	findingRecorder   FindingRecorder
+	triage            TriageClient
+	lessonsBlock      string
 	prov              llm.Provider
 	model             string
 	tx                *transcript.Store                      // raw LLM conversation persistence (nil = off)
@@ -357,7 +361,53 @@ func plannerSystem(goal, dataDir, workDir string) string {
 // and/or finding(s) reported (may be several — the engine debounces a burst; empty
 // for time/heartbeat wakes). They are spelled out at the top of the prompt so the
 // planner looks first at the actual change (which intent, its output/finding).
+// ErrPlannerEmptyContext reports that Planner.Plan was called without usable
+// planning context (missing exploration store, or both task goal and goal nodes
+// are empty).
+var ErrPlannerEmptyContext = errors.New("planner refused to plan on empty context")
+
+func hasNonEmptyGoalNodes(ts *db.ExplorationStore) bool {
+	if ts == nil {
+		return false
+	}
+	nodes, err := ts.ListByKind(db.KindGoal, 100)
+	if err != nil {
+		return false
+	}
+	for _, n := range nodes {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(n.Payload, &payload) == nil && strings.TrimSpace(payload.Text) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, goal string, triggers []TriggerEvent, emit func(db.Activity)) (met bool, reason string, err error) {
+	if ts == nil {
+		msg := fmt.Sprintf("task %d: refusing to plan on empty context (exploration store is nil)", taskID)
+		log.Printf("[planner] %s", msg)
+		if emit != nil {
+			emit(db.Activity{Worker: "planner", Kind: "result", IsError: true, Summary: msg, Detail: msg})
+		}
+		return false, "", fmt.Errorf("%w: exploration store is nil", ErrPlannerEmptyContext)
+	}
+	rootDesc, rootGoal, _ := ts.Root()
+	effectiveGoal := strings.TrimSpace(goal)
+	if effectiveGoal == "" {
+		effectiveGoal = strings.TrimSpace(rootGoal)
+	}
+	if effectiveGoal == "" && !hasNonEmptyGoalNodes(ts) {
+		msg := fmt.Sprintf("task %d: refusing to plan on empty context (empty task goal and no goals; description=%q)", taskID, strings.TrimSpace(rootDesc))
+		log.Printf("[planner] %s", msg)
+		if emit != nil {
+			emit(db.Activity{Worker: "planner", Kind: "result", IsError: true, Summary: msg, Detail: msg})
+		}
+		return false, "", fmt.Errorf("%w: empty task goal and no goals", ErrPlannerEmptyContext)
+	}
+	goal = effectiveGoal
 	// cold-digest §2.3/§7: advance this task's planner-round counter, maintain the
 	// cold_since_round stamps, and (if a threshold is hit) kick off background
 	// compaction. Synchronous part is cheap (a few queries); the LLM compaction
@@ -365,6 +415,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	p.compactor.OnPlannerRound(ctx, ts)
 	tsx := NewToolSet(ts, "planner")
 	tsx.SetFindingRecorder(p.findingRecorder)
+	tsx.SetTriageClient(p.triage)
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
@@ -377,7 +428,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
-	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), guardedDefaultTools()...)
+	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), guardedDefaultTools(p.workDir)...)
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
@@ -400,6 +451,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
+	sysBody += frameLessonsBlock(p.lessonsBlock)
 	system, boundary := deferredSystem(sysBody, def)
 	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在
 	// 任务到点时进收尾(因超时→任务超时词,因步数→per-run 词)。
@@ -432,7 +484,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		WebSearchProxy:     p.webSearch.Proxy,
 		BashEnv:            proxyEnv(proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
 		WorkingDir:         taskDir,                            // 本任务工作目录 <workDir>/tasks/<taskID>
-		ToolOutputDir:      cmdOutDir(taskDir),
+		ToolOutputDir:      TaskToolOutputDir(p.workDir, taskID, taskDir),
 		MaxTurns:           p.maxTurns, // 0 = unlimited (configurable in agent management)
 		MaxDuration:        maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
 		Compaction:         compactionConfig(p.compactionWindow()),
@@ -446,6 +498,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		MaxTokens:               p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 		UntrustedOutputBoundary: untrustedBoundaryEnabled(),
 	}
+	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx
 		opts.SessionID = fmt.Sprintf("exp%d-planner", ts.ID())
@@ -479,3 +532,6 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		})
 	return tsx.GoalMet, tsx.Reason, err
 }
+
+// SetLessonsBlock attaches the RSI lessons block rendered for this task.
+func (p *Planner) SetLessonsBlock(block string) { p.lessonsBlock = block }

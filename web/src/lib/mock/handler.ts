@@ -2529,12 +2529,19 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/tokens/conversations") return D.convTokens;
 
   // ── traffic / audit / settings ──
+  if (seg[0] === "tasks" && seg[2] === "credentials") {
+    if (m === "GET") return [];
+    if (m === "POST") return { id: 1, task_id: Number(seg[1]) || 1, ...b, source: "user", created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    if (m === "DELETE") return { ok: true };
+  }
   if (path === "/audit") return D.audit;
   if (path === "/traffic" && m === "DELETE") return { deleted: 0 };
   if (path === "/traffic/hosts" && m === "DELETE") return { deleted: (b.hosts as unknown[])?.length ?? 0 };
   if (path === "/traffic/hosts") return { hosts: D.trafficHosts };
   if (path === "/traffic") return D.traffic;
   if (path === "/traffic/exchange") return D.trafficDetail;
+  if (path === "/traffic/stream") return { items: [], total: 0, message_total: 0 };
+  if (path === "/traffic/hooks" && m === "GET") return { hooks: [], enabled_by_env: false };
   if (path === "/settings" && m === "GET") return D.settings;
   if (path === "/settings" && m === "PUT") {
     const next = { ...D.settings, ...b };

@@ -14,8 +14,10 @@ import (
 )
 
 const (
-	backgroundArg     = "--artex-internal-background-tool"
-	backgroundExe     = "_ARTEX_BG_EXE"
+	BackgroundArg     = "--artex-internal-background-tool"
+	BackgroundExeEnv  = "_ARTEX_BG_EXE"
+	backgroundArg     = BackgroundArg
+	backgroundExe     = BackgroundExeEnv
 	backgroundCommand = "_ARTEX_BG_COMMAND"
 	backgroundTimeout = "_ARTEX_BG_TIMEOUT"
 	backgroundCgroup  = "_ARTEX_BG_CGROUP"
@@ -81,12 +83,24 @@ func runGuardedBashBackground(tc *actool.ToolContext, cfg Config, command string
 		t.ID, t.OutputPath, t.ID)), nil
 }
 
+// IsBackgroundTrampoline reports whether argv is Norma's outer shell invocation for
+// a toolguard background command before the trampoline execs BackgroundArg.
+func IsBackgroundTrampoline(argv []string) bool {
+	return len(argv) >= 2 && os.Getenv(backgroundExe) != "" && strings.Contains(argv[len(argv)-1], backgroundArg)
+}
+
 // BackgroundHelper handles the internal helper invocation before normal app
 // startup. The helper uses the task manager's cwd, environment, and output file.
 func BackgroundHelper(args []string) (exitCode int, handled bool) {
 	if len(args) != 1 || args[0] != backgroundArg {
 		return 0, false
 	}
+	return RunBackgroundFromEnv()
+}
+
+// RunBackgroundFromEnv executes the background command staged in _ARTEX_BG_*
+// environment variables and clears those variables before spawning the child shell.
+func RunBackgroundFromEnv() (exitCode int, handled bool) {
 	command, dir := os.Getenv(backgroundCommand), os.Getenv(backgroundCgroup)
 	timeout, err := time.ParseDuration(os.Getenv(backgroundTimeout))
 	for _, name := range []string{backgroundExe, backgroundCommand, backgroundTimeout, backgroundCgroup} {

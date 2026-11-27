@@ -44,6 +44,9 @@ var reasonHint = map[harness.TerminalReason]string{
 	harness.ReasonAbortedTools:      "运行在工具执行阶段被取消",
 }
 
+// refusalHint explains a turn the provider declined (see IsRefusalStop).
+const refusalHint = "供应商安全策略拒绝了本次请求，模型未产生任何输出；该意图未完成，原样重发同一请求预计仍会被拒。开启 LLM 录制时可在原始响应中查看供应商返回的停止详情"
+
 // terminalText renders a terminal event with no final text into a compact summary
 // and a Markdown detail block.
 func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (string, string) {
@@ -54,6 +57,8 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	if reason == "" && ctx.Err() != nil {
 		aborted = true
 	}
+	stop := LastStopReason(ctx)
+	refused := reason == harness.ReasonCompleted && IsRefusalStop(stop)
 
 	var sum string
 	if aborted {
@@ -71,6 +76,8 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 		sum = "（运行被中断：" + short + "；停在" + stage + progressSuffix(term, tr) + "，未完成）"
 	} else if reason == harness.ReasonMaxTurns || reason == harness.ReasonTimeout {
 		sum = "（达到运行预算上限(" + string(reason) + ")，已收尾写回事实" + progressSuffix(term, tr) + "；本次无文字总结）"
+	} else if refused {
+		sum = "（无文字总结，供应商拒绝 (stop_reason " + stop + ")：" + firstLine(refusalHint, 80) + "）"
 	} else {
 		hint := terminalReasonHint(reason)
 		sum = "（无文字总结，终态 " + terminalReasonLabel(reason) + "：" + firstLine(hint, 80) + "）"
@@ -80,7 +87,11 @@ func terminalText(ctx context.Context, term *harness.Terminal, tr *runTrace) (st
 	b.WriteString(sum)
 	b.WriteString("\n\n")
 	displayReason := terminalReasonLabel(reason)
-	fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, terminalReasonHint(reason))
+	if refused {
+		fmt.Fprintf(&b, "- **终态**: `%s`，但最后一轮模型调用以 stop_reason `%s` 结束 - %s\n", displayReason, stop, refusalHint)
+	} else {
+		fmt.Fprintf(&b, "- **终态**: `%s` - %s\n", displayReason, terminalReasonHint(reason))
+	}
 	if aborted {
 		code, _, why, ok := AbortReason(ctx)
 		if ok {

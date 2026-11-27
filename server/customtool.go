@@ -368,7 +368,7 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 		}
 		sessionEnv = tc.Env
 	}
-	body, err := execPython(ctx, interp, key, spec.Code, params, workDir, sessionEnv, toolguard.FromEnv().ResolveTimeout(spec.TimeoutMs))
+	body, err := execPython(ctx, interp, key, spec.Code, params, workDir, sessionEnv, toolguard.FromEnv().ResolveTimeout(spec.TimeoutMs), s.execPriv)
 	if err != nil {
 		out := actool.Capture(tc, body)
 		if out != "" {
@@ -379,13 +379,18 @@ func (s *Server) runScriptTool(ctx context.Context, key string, execRaw json.Raw
 	return actool.Text(actool.Capture(tc, body)), nil
 }
 
-// execPython writes the code to a temp .py under workDir/.tools, runs it via interp
-// with the params JSON on stdin + scalar params mirrored to TOOL_<NAME> env, and
-// returns combined stdout+stderr and any termination error.
-func execPython(ctx context.Context, interp, key, code string, params map[string]any, workDir string, sessionEnv []string, timeout time.Duration) (string, error) {
-	toolsDir := filepath.Join(workDir, ".tools")
-	if err := os.MkdirAll(toolsDir, 0o755); err != nil {
-		return "", err
+// execPython writes the code to a temp .py under ScriptDir (when executor privilege
+// drop is enabled) or workDir/.tools, runs it via interp with the params JSON on
+// stdin + scalar params mirrored to TOOL_<NAME> env, and returns combined
+// stdout+stderr and any termination error.
+func execPython(ctx context.Context, interp, key, code string, params map[string]any, workDir string, sessionEnv []string, timeout time.Duration, priv ...ExecPrivilege) (string, error) {
+	ep := firstExecPriv(priv)
+	toolsDir := ep.ScriptDir
+	if toolsDir == "" {
+		toolsDir = filepath.Join(workDir, ".tools")
+		if err := os.MkdirAll(toolsDir, 0o755); err != nil {
+			return "", err
+		}
 	}
 	f, err := os.CreateTemp(toolsDir, key+"-*.py")
 	if err != nil {
@@ -397,18 +402,24 @@ func execPython(ctx context.Context, interp, key, code string, params map[string
 		f.Close()
 		return "", err
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	if err := prepareExecScript(ep, tmp); err != nil {
+		return "", err
+	}
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	c := exec.Command(interp, tmp)
 	c.Dir = workDir
-	c.Env = append(os.Environ(), sessionEnv...) // 会话代理 env
-	for k, v := range params {                  // 标量参数镜像成 TOOL_<NAME>
+	c.Env = append(agentProcessEnv(ep), sessionEnv...) // 会话代理 env
+	for k, v := range params {                         // 标量参数镜像成 TOOL_<NAME>
 		if sv, ok := scalarStr(v); ok {
 			c.Env = append(c.Env, "TOOL_"+strings.ToUpper(k)+"="+sv)
 		}
 	}
+	applyExecCredential(c, ep)
 	pj, _ := json.Marshal(params)
 	c.Stdin = bytes.NewReader(pj) // 参数 JSON 走 stdin
 	res := toolguard.Run(runCtx, toolguard.FromEnv(), c)

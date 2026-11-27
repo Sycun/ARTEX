@@ -657,13 +657,19 @@ func (s *Server) seedOrchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, defaultOrchestrationToolBindings(t.Name()))
 	}
+	workerAgents, _ := json.Marshal([]string{"worker", "pentest"})
 	for _, t := range s.platformTools() {
 		schema, _ := json.Marshal(t.InputSchema())
-		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
+		agents := autoAgents
+		if t.Name() == "ask_operator" {
+			agents = workerAgents
+		}
+		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, agents)
 	}
 	s.refreshBuiltinToolSchemas()
 	s.seedAutoDefaultBindings()
 	s.seedTaskReopenBindings()
+	s.seedTaskCredentialBindings()
 	s.seedPlannerDefaultBindings()
 	s.seedPlannerListAssetsBinding()
 	s.seedCompanyScopeRebind()
@@ -1201,6 +1207,20 @@ func (s *Server) seedTaskReopenBindings() {
 	if err := s.m.pg.AddAgentToToolBinding("mainagent", []string{"resume_task"}); err != nil {
 		log.Printf("[mainagent] resume_task 默认绑定失败: %v", err)
 		return
+	}
+	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+func (s *Server) seedTaskCredentialBindings() {
+	const flag = "task_credential_bindings_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	for _, agentKey := range []string{"worker", "pentest"} {
+		if err := s.m.pg.AddAgentToToolBinding(agentKey, []string{"save_task_credential", "list_task_credentials"}); err != nil {
+			log.Printf("[%s] task_credentials 默认绑定失败: %v", agentKey, err)
+			return
+		}
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
 }

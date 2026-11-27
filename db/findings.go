@@ -37,6 +37,10 @@ type DBFinding struct {
 	Status               string
 	VerificationStatus   string
 	PoeLevel             int
+	VerificationNote     string
+	Counterevidence      string
+	ConfidenceRationale  string
+	ReportState          string
 	Remark               string // 人工备注
 	Report               string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
 	ReportConversationID *int64 `json:"report_conversation_id,omitempty"`
@@ -117,7 +121,8 @@ const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.n
 		f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), COALESCE(f.remark, ''), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
 	(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id),
-	COALESCE(f.verification_status, 'unverified'), COALESCE(f.poe_level, 0)`
+	COALESCE(f.verification_status, 'unverified'), COALESCE(f.poe_level, 0),
+	COALESCE(f.verification_note, ''), COALESCE(f.counterevidence, ''), COALESCE(f.confidence_rationale, ''), COALESCE(f.report_state, 'none')`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -130,7 +135,7 @@ func scanFindings(rows interface {
 		f := &DBFinding{}
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.Remark, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.Remark, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel, &f.VerificationNote, &f.Counterevidence, &f.ConfidenceRationale, &f.ReportState); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -585,7 +590,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.Remark, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel, &f.VerificationNote, &f.Counterevidence, &f.ConfidenceRationale, &f.ReportState, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -752,7 +757,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.Remark, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel, &f.Report, &reportConv)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.VerificationStatus, &f.PoeLevel, &f.VerificationNote, &f.Counterevidence, &f.ConfidenceRationale, &f.ReportState, &f.Report, &reportConv)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1112,6 +1117,58 @@ func (d *DB) FindingMetaByNodeID(taskID int64) (map[int64]FindingMeta, error) {
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &m.AssetIDs)
 		out[nid] = m
+	}
+	return out, rows.Err()
+}
+
+const findingTrafficCountCol = `(SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=findings.id)`
+
+// FindingQuality is the report-only view of one standalone row: triage meta
+// plus proof-strength fields, reporter body, and evidence versions.
+type FindingQuality struct {
+	FindingMeta
+
+	PoeLevel              int
+	VerificationStatus    string
+	VerificationNote      string
+	Counterevidence       string
+	ConfidenceRationale   string
+	Report                string
+	EvidenceVersion       int64
+	ReportEvidenceVersion int64
+}
+
+// ReportStale reports whether the stored report predates the evidence it describes.
+func (q FindingQuality) ReportStale() bool {
+	return q.Report != "" && q.EvidenceVersion != q.ReportEvidenceVersion
+}
+
+// FindingQualityByNodeID maps a task's finding node ids to everything the report renders about them.
+func (d *DB) FindingQualityByNodeID(taskID int64) (map[int64]FindingQuality, error) {
+	out := map[int64]FindingQuality{}
+	if taskID <= 0 {
+		return out, nil
+	}
+	rows, err := d.Query(`SELECT node_id, id, COALESCE(status,'pending'), COALESCE(remark,''), COALESCE(evidence,''), asset_ids, `+findingTrafficCountCol+`,
+			COALESCE(poe_level,0), COALESCE(verification_status,'unverified'), COALESCE(verification_note,''), COALESCE(counterevidence,''), COALESCE(confidence_rationale,''),
+			evidence_version, report_evidence_version, COALESCE(report,'')
+		FROM findings
+		WHERE task_id=$1 AND node_id IS NOT NULL`, taskID)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var nid int64
+		var q FindingQuality
+		var aidsJSON string
+		if err := rows.Scan(&nid, &q.ID, &q.Status, &q.Remark, &q.Evidence, &aidsJSON, &q.TrafficCount,
+			&q.PoeLevel, &q.VerificationStatus, &q.VerificationNote, &q.Counterevidence, &q.ConfidenceRationale,
+			&q.EvidenceVersion, &q.ReportEvidenceVersion, &q.Report); err != nil {
+			return out, err
+		}
+		_ = json.Unmarshal([]byte(aidsJSON), &q.AssetIDs)
+		out[nid] = q
 	}
 	return out, rows.Err()
 }

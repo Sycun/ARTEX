@@ -7,7 +7,7 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"path/filepath"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -230,7 +230,15 @@ func (s *Server) pgDeleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.removeConversationSpill(c.ID)
 	writeJSON(w, 200, map[string]any{"deleted": c.ID})
+}
+
+func (s *Server) removeConversationSpill(id int64) {
+	dir := agent.SessionSpillDir(s.m.dir, s.convBusyKey(id))
+	if err := os.RemoveAll(dir); err != nil {
+		log.Printf("[conv %d] remove the spill directory %s: %v", id, dir, err)
+	}
 }
 
 const maxConversationDeleteBatch = 100
@@ -294,6 +302,7 @@ func (s *Server) pgDeleteConversationsBatch(w http.ResponseWriter, r *http.Reque
 	deletedSet := make(map[int64]struct{}, len(deleted))
 	for _, id := range deleted {
 		deletedSet[id] = struct{}{}
+		s.removeConversationSpill(id)
 	}
 	items := make([]conversationDeleteItem, 0, len(ids))
 	for _, id := range ids {
@@ -516,7 +525,7 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 	// Read/Bash tools. baseDir = the agent's per-session CWD (<workDir>/sessions/
 	// conv-<id>/), matching chatUpload's landing dir and agent/chat.go's sessionWorkDir
 	// — busyKey == convBusyKey(c.ID) == "conv-<id>" == that session id.
-	baseDir := filepath.Join(s.m.dir, "sessions", busyKey)
+	baseDir := agent.EnsureSessionDir(s.m.dir, busyKey)
 	s.runConversation(c, composeAgentMessage(agentMessage, req.Attachments, baseDir), busyKey, msg)
 	writeJSON(w, 202, map[string]any{"status": "accepted"})
 }

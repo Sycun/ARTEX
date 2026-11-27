@@ -48,6 +48,7 @@ import { MAX_TASK_WORKER_COUNT, parseWorkerCountInput } from "@/lib/types";
 import { AssetsTab } from "./_tabs/assets-tab";
 import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
+import { CredentialsTab } from "./_tabs/credentials-tab";
 import { FilesTab } from "./_tabs/files-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
@@ -64,6 +65,7 @@ const TABS = (ui: UITranslate) => [
   { value: "broadcast", label: ui("screen.10542494b3437a") },
   { value: "findings", label: ui("screen.10493d06b90f6b") },
   { value: "intelligence", label: ui("screen.bfaee3ed1f063c") },
+  { value: "credentials", label: ui("taskCredentials.tab") },
   { value: "retests", label: ui("screen.d95315ddeb80c2") },
   { value: "traffic", label: ui("screen.81a9d0b5a2a24f") },
   { value: "files", label: ui("taskFiles.tab") },
@@ -641,6 +643,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="intelligence" className="mt-0">
           <IntelligencePanel scope="tasks" scopeId={id} />
+        </TabsContent>
+        <TabsContent value="credentials" className="mt-0">
+          <CredentialsTab taskId={id} />
         </TabsContent>
         <TabsContent value="findings" className="mt-0">
           <FindingsTab taskId={id} />

@@ -24,6 +24,7 @@ func (s *Server) platformTools() []actool.CoreTool {
 		s.toolCreateMCP(),
 		s.toolUpdateMCP(),
 		s.toolDeleteAssetsByHost(),
+		s.toolAskOperator(),
 	}
 }
 

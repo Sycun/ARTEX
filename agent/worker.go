@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -76,6 +77,8 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	triage      TriageClient
+	lessonsBlock string
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -106,6 +109,8 @@ func hasWorkerChatMessage(messages []llm.Message, requestID string) bool {
 // model path (true = non-streaming). nil/unset = streaming (default). Read per
 // run so a profile or task-chain toggle takes effect without rebuilding.
 func (w *Worker) SetNonStreaming(fn func() bool) { w.nonStreamingFn = fn }
+
+func (w *Worker) SetLessonsBlock(block string) { w.lessonsBlock = block }
 
 func (w *Worker) nonStreaming() bool { return w.nonStreamingFn != nil && w.nonStreamingFn() }
 
@@ -162,12 +167,12 @@ func writeIntentAutoScope(as *db.AssetStore, taskID int64, assets []*db.Asset, c
 	}
 }
 
-func defaultToolsExcept(exclude ...string) []actool.CoreTool {
+func defaultToolsExcept(base string, exclude ...string) []actool.CoreTool {
 	drop := make(map[string]bool, len(exclude))
 	for _, n := range exclude {
 		drop[n] = true
 	}
-	all := guardedDefaultTools()
+	all := guardedDefaultTools(base)
 	out := make([]actool.CoreTool, 0, len(all))
 	for _, t := range all {
 		if !drop[t.Name()] {
@@ -275,18 +280,70 @@ func workerArtifactSpec(runDir string) string {
 	return "\n\n**中间产物输出规约**：脚本、payload、抓到的响应体、临时数据等一切中间产物，**一律写到本次意图的专属工作目录 " + runDir + "**（已自动建好，直接用相对路径写在这里即可，无需再手动建目录）——**不要写 /tmp、不要用其它绝对路径**。"
 }
 
-// ensureRunDir builds and creates an agent's working directory under base:
-// <base>/tasks/<taskID> for planner/main; <base>/tasks/<taskID>/i<intentID> for a
-// worker (intentID<=0 → task dir only). The "tasks/" segment groups per-task dirs
-// symmetrically with the chat agent's "sessions/<sessionID>". Best-effort mkdir — on
-// failure, writes fail the same way an unwritable CWD would.
-func ensureRunDir(base string, taskID, intentID int64) string {
-	dir := filepath.Join(base, "tasks", strconv.FormatInt(taskID, 10))
-	if intentID > 0 {
-		dir = filepath.Join(dir, "i"+strconv.FormatInt(intentID, 10))
+// mainRunDirName is the run directory of a task's main agent and planner.
+const mainRunDirName = "main"
+
+// runDirMaker creates a run directory below the data directory with the ownership
+// the server wants. The server sets it when agent processes run as the executor
+// (server/execpriv_unix.go); nil keeps a plain MkdirAll.
+var runDirMaker func(base, leaf string) error
+
+// SetRunDirMaker sets how run directories are created. Call it before any agent runs.
+func SetRunDirMaker(f func(base, leaf string) error) { runDirMaker = f }
+
+func makeRunDir(base, leaf string) {
+	if runDirMaker == nil {
+		_ = os.MkdirAll(leaf, 0o775)
+		return
 	}
-	_ = os.MkdirAll(dir, 0o755)
+	if err := runDirMaker(base, leaf); err != nil {
+		log.Printf("[agent] run directory creation failed (%s): %v", leaf, err)
+	}
+}
+
+// ensureRunDir builds and creates an agent's working directory under base:
+// <base>/tasks/<taskID>/main for planner/main (intentID<=0);
+// <base>/tasks/<taskID>/i<intentID> for a worker. No run directory is an ancestor of
+// another: the task directory holds the leaves and is no agent's working directory.
+func ensureRunDir(base string, taskID, intentID int64) string {
+	leaf := mainRunDirName
+	if intentID > 0 {
+		leaf = "i" + strconv.FormatInt(intentID, 10)
+	}
+	dir := filepath.Join(base, "tasks", strconv.FormatInt(taskID, 10), leaf)
+	makeRunDir(base, dir)
 	return dir
+}
+
+// EnsureRunDir creates and returns the run directory for a task/intent.
+func EnsureRunDir(base string, taskID, intentID int64) string {
+	return ensureRunDir(base, taskID, intentID)
+}
+
+// EnsureSessionDir creates the chat run directory <base>/sessions/<sessionID> the
+// way ensureRunDir creates a task one, and returns it.
+func EnsureSessionDir(base, sessionID string) string {
+	dir := filepath.Join(base, "sessions", sessionID)
+	makeRunDir(base, dir)
+	return dir
+}
+
+// IsRunDirName reports whether name is a run directory inside a task directory:
+// main or i<intentID>.
+func IsRunDirName(name string) bool {
+	if name == mainRunDirName {
+		return true
+	}
+	digits, ok := strings.CutPrefix(name, "i")
+	if !ok || digits == "" {
+		return false
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // cmdOutDir is the SDK large-tool-output spill dir under an agent's run dir.
@@ -403,6 +460,7 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
+	tsx.SetTriageClient(w.triage)
 	tsx.SetTaskID(taskID)
 	tsx.SetWorkBase(w.workDir)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
@@ -419,7 +477,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	base := append(tsx.WorkerTools(), w.extraTools...)
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
-	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
+	base = append(base, defaultToolsExcept(w.workDir, "MultiEdit", "Glob", "Grep")...)
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
 	// The run-wide intent is not the current tool action. Do not forward it or
@@ -464,6 +522,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 			}
 		}
 	}
+	sysBody += frameLessonsBlock(w.lessonsBlock)
 	sysBody += "\n\n开始执行上面这条意图：只做它、只产生事实、assets、finding、做完即停。"
 	system, boundary := workerPrompt(sysBody, def, cachePrefixEnabled())
 	// 任务级 deadline(经 ctx 注入)夹逼本 run 的墙钟预算 + 决定收尾词(见 taskclock.go)。
@@ -506,7 +565,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		Settlement: settle,
 		// large tool output spills to cmd-output/ with a head + pointer (SDK tool.Capture);
 		// full output preserved on disk. 截断上限用 SDK 默认(30000 字符)。
-		ToolOutputDir:           cmdOutDir(runDir),
+		ToolOutputDir:           TaskToolOutputDir(w.workDir, taskID, runDir),
 		Compaction:              compactionConfig(w.compactionWindow()), // long tool-heavy runs stay within the window
 		Todos:                   actool.NewTodoStore(),                  // 会话级临时待办（TodoWrite），纯规划用，退出即丢
 		NonStreaming:            w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
@@ -516,6 +575,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}
+	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
 	if w.tx != nil { // persist raw LLM conversation; one file per worked intent
 		opts.Transcript = w.tx
 		opts.SessionID = WorkerSessionID(ts.ID(), intent.ID)

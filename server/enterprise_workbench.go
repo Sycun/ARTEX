@@ -106,6 +106,10 @@ func classifyWorkbench(method, path string, q url.Values) (kind, resource string
 			if sub == "" {
 				return "task", id, true
 			}
+		case http.MethodPost, http.MethodDelete:
+			if sub == "credentials" || strings.HasPrefix(sub, "credentials/") {
+				return "task", id, true
+			}
 		}
 		return "", "", false
 	}
@@ -154,6 +158,7 @@ func taskReadAllowed(sub string) bool {
 	case "scope", "goals", "constraints", "coverage", "coverage-graph",
 		"intercept-rules", "chat/status", "intent-assets", "asset-refs", "llm/resolution",
 		"topology-mapping/status", "asset-mapping/status",
+		"credentials", "outcome", "lessons",
 		"files", "files/all", "files/read", "files/download", "files/preview":
 		return true
 	default:

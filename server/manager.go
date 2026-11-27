@@ -2231,6 +2231,9 @@ func (m *Manager) SetTaskStatusGuardedReason(id, status, reason string) (won boo
 	if err := m.syncTaskRuntime(id, n); err != nil {
 		return true, err
 	}
+	if pgdb.IsTerminal(status) {
+		m.extractLessons(n)
+	}
 	return true, nil
 }
 
@@ -2276,7 +2279,23 @@ func (m *Manager) SetTaskStatus(id, status string) error {
 	if err := m.syncTaskRuntime(id, n); err != nil {
 		return err
 	}
+	if pgdb.IsTerminal(status) {
+		m.extractLessons(n)
+	}
 	return nil
+}
+
+// extractLessons derives RSI candidate lessons from a task that just reached a
+// terminal status. It is best-effort: a lesson failure must never fail a status
+// update. The extraction is idempotent (evidence unique key), so a restart or a
+// manual backfill cannot inflate support.
+func (m *Manager) extractLessons(taskID int64) {
+	if m == nil || m.pg == nil {
+		return
+	}
+	if _, err := m.pg.ExtractLessonsForTask(context.Background(), taskID); err != nil {
+		log.Printf("[rsi] lesson extraction failed for task %d: %v", taskID, err)
+	}
 }
 
 // DeleteTask removes a task and optionally its related global data. Traffic has
@@ -2429,6 +2448,12 @@ func stageTaskFiles(dataDir, taskID string, explorationID int64) (*taskFileDelet
 	taskDir := filepath.Join(dataDir, "tasks", taskID)
 	if _, err := os.Lstat(taskDir); err == nil {
 		targets = append(targets, taskDir)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	spillDir := agent.TaskSpillDir(dataDir, taskID)
+	if _, err := os.Lstat(spillDir); err == nil {
+		targets = append(targets, spillDir)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}

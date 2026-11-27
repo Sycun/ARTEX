@@ -99,4 +99,12 @@ export const chatUIMessages = {
   "chatUI.loadingApproval": ["正在加载审批详情…", "Loading approval details…"],
   "chatUI.includesThinking": ["· 含推理", "· Includes reasoning"],
   "chatUI.streaming": ["实时流式中…", "Streaming live…"],
+  "chatUI.askOperator.targetDerivedTitle": [
+    "该问题中包含未在任务目标中声明的主机，可能来自目标页面内容，请谨慎核实后再在本地执行。",
+    "This request mentions hosts outside the declared task goal (potentially derived from target content). Verify before running locally.",
+  ],
+  "chatUI.askOperator.targetDerivedLabel": [
+    "目标外主机：{{hosts}}",
+    "Non-goal hosts: {{hosts}}",
+  ],
 } satisfies Record<string, readonly [string, string]>;

@@ -11,7 +11,7 @@ func TestGuardedBashPreservesDecoratedDefaults(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell syntax")
 	}
-	for _, tool := range guardedDefaultTools() {
+	for _, tool := range guardedDefaultTools(t.TempDir()) {
 		if tool.Name() != "Bash" {
 			continue
 		}

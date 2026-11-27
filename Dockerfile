@@ -24,11 +24,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 预装 Playwright MCP 与 CLI（全局），运行时优先直接调用 playwright-mcp，无需 npx 联网下载。
 # 必须通过 playwright-mcp 自身的 install-browser 安装对应版本的 chromium 及其系统依赖，
 # 避免全局 playwright 与 @playwright/mcp 内置 playwright-core 版本不一致导致找不到浏览器可执行文件。
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN npm install -g @playwright/mcp@latest @playwright/cli@latest \
     && playwright-mcp --version \
     && playwright-cli --help \
     && playwright-mcp install-browser --with-deps chromium \
     && playwright-cli install-browser chromium \
+    && chmod -R a+rX /ms-playwright \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV TZ=Asia/Shanghai
@@ -38,7 +40,9 @@ COPY dist/${TARGETARCH}/artex /app/artex
 # 它同时负责把 SIGTERM 转发给 artex —— docker stop 只把信号发给 PID 1，
 # 不转发的话 artex 收不到、做不了优雅关闭，10 秒后被 SIGKILL 硬杀。
 COPY start.sh /app/start.sh
-RUN chmod +x /app/artex /app/start.sh
+RUN chmod +x /app/artex /app/start.sh \
+    && mkdir -p /app/keys && chmod 0700 /app/keys \
+    && find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true
 COPY skills/ /app/skills/
 # data/（SQLite + jwt.key）持久化点
 VOLUME ["/app/data"]

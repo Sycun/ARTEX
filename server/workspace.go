@@ -348,8 +348,17 @@ func (s *Server) archiveFindingScreenshots(taskID int64, markdown string) error 
 }
 
 func (s *Server) resolveSessionScreenshot(rel string) (string, bool) {
-	matches, err := filepath.Glob(filepath.Join(filepath.Clean(s.m.dir), "sessions", "*", rel))
-	if err != nil || len(matches) == 0 {
+	base := filepath.Clean(s.m.dir)
+	var matches []string
+	for _, pattern := range []string{
+		filepath.Join(base, "sessions", "*", rel),
+		filepath.Join(base, "tasks", "*", "*", rel),
+	} {
+		if m, err := filepath.Glob(pattern); err == nil {
+			matches = append(matches, m...)
+		}
+	}
+	if len(matches) == 0 {
 		return "", false
 	}
 	var newest string

@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -74,8 +76,22 @@ func (s *Server) chatUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		defer s.engine.decInflight(id)
 	}
-	dir := filepath.Join(s.m.dir, sub, id, "uploads")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	var baseDir string
+	switch sub {
+	case "tasks":
+		n, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			writeErr(w, 400, "非法任务 id")
+			return
+		}
+		baseDir = agent.EnsureRunDir(s.m.dir, n, 0)
+	case "sessions":
+		baseDir = agent.EnsureSessionDir(s.m.dir, id)
+	default:
+		baseDir = filepath.Join(s.m.dir, sub, id)
+	}
+	dir := filepath.Join(baseDir, "uploads")
+	if err := os.MkdirAll(dir, 0o775); err != nil {
 		writeErr(w, 500, "建目录失败: "+err.Error())
 		return
 	}

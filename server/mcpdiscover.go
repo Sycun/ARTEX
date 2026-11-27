@@ -70,14 +70,20 @@ func resolveStdioMCPCommand(command string, args []string) (string, []string) {
 
 // connectMCP dials one MCP server per its transport. Callers must Close the client.
 // workDir sets the subprocess working directory for stdio MCP servers when non-empty.
-func connectMCP(ctx context.Context, m *db.MCPServer, workDir string) (mcpClient, error) {
+func connectMCP(ctx context.Context, m *db.MCPServer, workDir string, priv ...ExecPrivilege) (mcpClient, error) {
+	ep := firstExecPriv(priv)
 	switch m.Transport {
 	case "stdio":
 		if m.Command == "" {
 			return nil, fmt.Errorf("stdio 传输缺少命令")
 		}
 		cmd, args := resolveStdioMCPCommand(m.Command, jsonStrSlice(m.Args))
-		return newStdioMCPClient(ctx, m.Name, workDir, cmd, jsonStrMap(m.Env), args...)
+		var err error
+		cmd, args, err = execDropCommand(ep, cmd, args)
+		if err != nil {
+			return nil, err
+		}
+		return newStdioMCPClient(ctx, m.Name, workDir, cmd, withExecKeep(ep, jsonStrMap(m.Env)), args...)
 	case "http":
 		if m.URL == "" {
 			return nil, fmt.Errorf("http 传输缺少 URL")
@@ -97,7 +103,7 @@ func connectMCP(ctx context.Context, m *db.MCPServer, workDir string) (mcpClient
 // discoverAndCacheMCP connects to one MCP, lists its tools, and persists the tool
 // names to mcp_tools_cache so the UI shows them without a live connection.
 func (s *Server) discoverAndCacheMCP(ctx context.Context, m *db.MCPServer) error {
-	cl, err := connectMCP(ctx, m, s.m.dir)
+	cl, err := connectMCP(ctx, m, s.m.dir, s.execPriv)
 	if err != nil {
 		return err
 	}

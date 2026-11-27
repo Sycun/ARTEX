@@ -24,10 +24,10 @@ import { LinkTrafficDialog } from "@/components/link-traffic-dialog";
 import { requestFromTraffic } from "@/components/repeater/repeater-http";
 import { seedFromEvidence } from "@/components/repeater/repeater-store";
 import {
+  ReplayPanel,
+  StreamMessagesPanel,
+  TamperHooksPanel,
   TrafficHarActions,
-  TrafficHooksButton,
-  TrafficReplayPanel,
-  TrafficStreamPanel,
 } from "@/components/traffic-capture-tools";
 import {
   AlertDialog,
@@ -49,6 +49,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { SortableHead } from "@/components/ui/sortable-head";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
@@ -185,6 +186,8 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
   const [selected, setSelected] = React.useState<TrafficExchange | null>(null);
   const [detail, setDetail] = React.useState<TrafficDetail | null>(null);
   const [detailLoading, setDetailLoading] = React.useState(false);
+  const [viewTab, setViewTab] = React.useState<"exchanges" | "hooks">("exchanges");
+  const [detailTab, setDetailTab] = React.useState<"packet" | "stream" | "replay">("packet");
 
   const [hosts, setHosts] = React.useState<TrafficHost[]>([]); // target picker
   const [selectedHosts, setSelectedHosts] = React.useState<string[]>([]); // checked in picker
@@ -377,10 +380,16 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
     let alive = true;
     setDetailLoading(true);
     setDetail(null);
+    setDetailTab("packet");
     api
       .trafficExchange(selected.id)
       .then((d) => {
-        if (alive) setDetail(d);
+        if (alive) {
+          setDetail(d);
+          if (d.stream_kind === "websocket" || d.stream_kind === "sse") {
+            setDetailTab("stream");
+          }
+        }
       })
       .catch(() => {
         if (alive) setDetail({ req: liveUI("screen.68bf9e536ea4fb"), resp: "" });
@@ -453,6 +462,18 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
           ) : null}
         </div>
         <div className="flex items-center gap-4 text-sm">
+          {!taskScoped && (
+            <Tabs value={viewTab} onValueChange={(v) => setViewTab(v as "exchanges" | "hooks")}>
+              <TabsList className="h-8">
+                <TabsTrigger value="exchanges" className="text-xs">
+                  {ui("traffic.tabExchanges")}
+                </TabsTrigger>
+                <TabsTrigger value="hooks" className="text-xs">
+                  {ui("traffic.tabHooks")}
+                </TabsTrigger>
+              </TabsList>
+            </Tabs>
+          )}
           <span
             className={cn(
               "inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs font-medium",
@@ -472,7 +493,11 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
         </div>
       </div>
 
-      {/* Toolbar */}
+      {!taskScoped && viewTab === "hooks" ? (
+        <TamperHooksPanel recentExchanges={exchanges} />
+      ) : (
+        <>
+          {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2">
         {!taskScoped && (
           <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
@@ -730,12 +755,20 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
         </Select>
         <TrafficHarActions
           query={new URLSearchParams({
+            ...(taskId ? { task_id: taskId } : {}),
             ...(hostQ ? { host: hostQ } : {}),
+            ...(method !== "all" ? { method } : {}),
+            ...(queryQ ? { q: queryQ } : {}),
+            ...(bodyQ ? { body: bodyQ } : {}),
+            ...(pathQ ? { path: pathQ } : {}),
+            ...(statusFilter !== "all" ? { status: statusFilter } : {}),
             ...(rewritten !== "all" ? { rewritten } : {}),
+            ...(respMinQ ? { resp_min: respMinQ } : {}),
+            ...(respMaxQ ? { resp_max: respMaxQ } : {}),
           }).toString()}
+          allowImport={!taskScoped}
           onImported={() => setReloadTick((tick) => tick + 1)}
         />
-        <TrafficHooksButton />
         {hasAdvancedFilter ? (
           <Button variant="ghost" size="sm" className="h-8" onClick={resetAdvancedFilters}>
             <FilterXIcon className="size-3.5" />
@@ -878,6 +911,8 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
           </div>
         </Card>
       </div>
+        </>
+      )}
 
       {linking ? (
         <LinkTrafficDialog
@@ -904,36 +939,91 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
                   {ui("screen.426b811ca45fb8")}
                   <TrafficID id={selected.id} />
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="mt-2 w-fit"
-                  disabled={importing}
-                  onClick={() => void openRepeater([selected])}
-                >
-                  {importing ? ui("screen.73a589a315aab8") : ui("screen.f69052b85f5594")}
-                </Button>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-fit"
+                    disabled={importing}
+                    onClick={() => void openRepeater([selected])}
+                  >
+                    {importing ? ui("screen.73a589a315aab8") : ui("screen.f69052b85f5594")}
+                  </Button>
+                </div>
               </SheetHeader>
-              <TrafficReplayPanel detail={detail} />
-              <TrafficStreamPanel exchangeId={selected.id} kind={detail?.stream_kind} />
-              <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-hidden p-2 sm:grid-cols-2">
-                {[
-                  ["request", ui("screen.719dd828ca88c8"), requestWithHost(detail?.req ?? "", selected)],
-                  ["response", ui("screen.946902266aa212"), detail?.resp ?? ""],
-                ].map(([key, label, raw]) => (
-                  <div key={key} className="flex min-h-0 min-w-0 flex-col gap-1 overflow-hidden">
-                    <span className="px-1 text-[11px] font-medium text-muted-foreground">{label}</span>
-                    {detailLoading ? (
-                      <div className="flex min-h-0 flex-1 items-center justify-center gap-2 rounded-md border bg-muted/10 text-xs text-muted-foreground">
-                        <Loader2Icon className="size-3.5 animate-spin" />
-                        {ui("screen.8382563d05503e")}
+              {(() => {
+                const streamKind =
+                  detail?.stream_kind === "websocket" || detail?.stream_kind === "sse" ? detail.stream_kind : null;
+                const activeTab =
+                  detailTab === "stream" && !streamKind
+                    ? "packet"
+                    : detailTab === "replay" && streamKind
+                      ? "packet"
+                      : detailTab;
+                return (
+                  <Tabs
+                    value={activeTab}
+                    onValueChange={(v) => setDetailTab(v as "packet" | "stream" | "replay")}
+                    className="flex min-h-0 flex-1 flex-col gap-0 overflow-hidden"
+                  >
+                    <div className="border-b px-5 py-2">
+                      <TabsList className="h-8">
+                        <TabsTrigger value="packet" className="text-xs">
+                          {ui("traffic.detailTabPacket")}
+                        </TabsTrigger>
+                        {streamKind ? (
+                          <TabsTrigger value="stream" className="text-xs">
+                            {ui("traffic.detailTabStream")}
+                            {detail?.stream_count ? ` (${detail.stream_count})` : ""}
+                          </TabsTrigger>
+                        ) : (
+                          <TabsTrigger value="replay" className="text-xs">
+                            {ui("traffic.detailTabReplay")}
+                          </TabsTrigger>
+                        )}
+                      </TabsList>
+                    </div>
+                    <TabsContent value="packet" className="mt-0 flex min-h-0 flex-1 flex-col overflow-hidden">
+                      <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-hidden p-2 sm:grid-cols-2">
+                        {[
+                          ["request", ui("screen.719dd828ca88c8"), requestWithHost(detail?.req ?? "", selected)],
+                          ["response", ui("screen.946902266aa212"), detail?.resp ?? ""],
+                        ].map(([key, label, raw]) => (
+                          <div key={key} className="flex min-h-0 min-w-0 flex-col gap-1 overflow-hidden">
+                            <span className="px-1 text-[11px] font-medium text-muted-foreground">{label}</span>
+                            {detailLoading ? (
+                              <div className="flex min-h-0 flex-1 items-center justify-center gap-2 rounded-md border bg-muted/10 text-xs text-muted-foreground">
+                                <Loader2Icon className="size-3.5 animate-spin" />
+                                {ui("screen.8382563d05503e")}
+                              </div>
+                            ) : (
+                              <HttpCodeBlock raw={raw} />
+                            )}
+                          </div>
+                        ))}
                       </div>
+                    </TabsContent>
+                    {streamKind ? (
+                      <TabsContent value="stream" className="mt-0 flex min-h-0 flex-1 flex-col overflow-hidden">
+                        <StreamMessagesPanel exchangeId={selected.id} kind={streamKind} />
+                      </TabsContent>
                     ) : (
-                      <HttpCodeBlock raw={raw} />
+                      <TabsContent
+                        value="replay"
+                        forceMount
+                        className="mt-0 flex min-h-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"
+                      >
+                        <ReplayPanel
+                          exchange={selected}
+                          raw={requestWithHost(detail?.req ?? "", selected)}
+                          methods={METHODS}
+                          onRecorded={() => setReloadTick((n) => n + 1)}
+                        />
+                      </TabsContent>
                     )}
-                  </div>
-                ))}
-              </div>
+                  </Tabs>
+                );
+              })()}
             </>
           )}
         </SheetContent>
