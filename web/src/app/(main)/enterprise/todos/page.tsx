@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
 
 import { OriginalApproval } from "@/components/enterprise/original-approval";
 import { Page } from "@/components/enterprise/shell";
@@ -15,6 +14,7 @@ import {
   type OriginalRequest,
   projectPath,
   setProject,
+  useEntParams,
 } from "@/lib/enterprise-api";
 
 type Todo = {
@@ -30,7 +30,7 @@ type Todo = {
 type Join = { id: string; receipt_no: string; purpose?: string; status_label: string; project_code: string };
 
 export default function TodosPage() {
-  const params = useParams<{ projectId?: string }>();
+  const params = useEntParams<{ projectId?: string }>();
   const project = params.projectId || currentProject();
   const [items, setItems] = useState<Todo[] | null>(null);
   const [error, setError] = useState("");

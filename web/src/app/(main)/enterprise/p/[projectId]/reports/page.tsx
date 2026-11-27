@@ -3,11 +3,10 @@
 import { useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
-import { ent, projectPath } from "@/lib/enterprise-api";
+import { ent, projectPath, useEntParams } from "@/lib/enterprise-api";
 
 type Report = {
   id: string;
@@ -20,11 +19,12 @@ type Report = {
 };
 
 export default function ReportsPage() {
-  const projectId = useParams<{ projectId: string }>().projectId;
+  const projectId = useEntParams<{ projectId: string }>().projectId;
   const [items, setItems] = useState<Report[] | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
+    if (!projectId) return;
     void ent<{ items: Report[] }>(`/projects/${projectId}/reports`)
       .then((data) => setItems(data.items))
       .catch((reason: Error) => setError(reason.message));

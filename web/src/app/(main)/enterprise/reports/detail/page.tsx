@@ -3,13 +3,13 @@
 import { Suspense, useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { apiFetch } from "@/lib/api";
-import { currentProject, EntError, ent, projectPath, sha256 } from "@/lib/enterprise-api";
+import { currentProject, EntError, ent, projectPath, sha256, useEntParams } from "@/lib/enterprise-api";
 
 type Version = {
   id: string;
@@ -46,7 +46,7 @@ type Report = {
 };
 
 function ReportDetail() {
-  const params = useParams<{ projectId?: string; reportId?: string }>();
+  const params = useEntParams<{ projectId?: string; reportId?: string }>();
   const search = useSearchParams();
   const id = params.reportId || search.get("id") || "";
   const [report, setReport] = useState<Report | null>(null);

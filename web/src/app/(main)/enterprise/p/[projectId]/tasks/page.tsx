@@ -3,12 +3,12 @@
 import { Suspense, useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ent, projectPath } from "@/lib/enterprise-api";
+import { ent, projectPath, useEntParams } from "@/lib/enterprise-api";
 
 type Task = {
   id: number;
@@ -30,7 +30,7 @@ const STATUSES = [
 ];
 
 function TaskList() {
-  const projectId = useParams<{ projectId: string }>().projectId;
+  const projectId = useEntParams<{ projectId: string }>().projectId;
   const search = useSearchParams();
   const router = useRouter();
   const q = search.get("q") ?? "";

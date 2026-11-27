@@ -3,12 +3,11 @@
 import { useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { currentProject, ent, type Me, projectPath } from "@/lib/enterprise-api";
+import { currentProject, ent, type Me, projectPath, useEntParams } from "@/lib/enterprise-api";
 
 type Hit = { id: string; name: string; addable: boolean; reason?: string };
 type Member = { id: string; name: string; role: string; duties: string[] };
@@ -21,7 +20,7 @@ const ROLES = [
 ];
 
 export default function MembersPage() {
-  const params = useParams<{ projectId?: string }>();
+  const params = useEntParams<{ projectId?: string }>();
   const project = params.projectId || currentProject();
   const [owner, setOwner] = useState<boolean | null>(null);
   const [query, setQuery] = useState("");

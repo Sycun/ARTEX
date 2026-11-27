@@ -3,11 +3,11 @@
 import { Suspense, useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
-import { currentProject, ent, projectPath } from "@/lib/enterprise-api";
+import { currentProject, ent, projectPath, useEntParams } from "@/lib/enterprise-api";
 
 type Finding = {
   id: number;
@@ -24,7 +24,7 @@ type Finding = {
 };
 
 function Detail() {
-  const params = useParams<{ projectId?: string; findingId?: string }>();
+  const params = useEntParams<{ projectId?: string; findingId?: string }>();
   const search = useSearchParams();
   const id = params.findingId || search.get("id") || "";
   const [finding, setFinding] = useState<Finding | null>(null);

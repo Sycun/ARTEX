@@ -3,11 +3,10 @@
 import { useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
-import { ent, projectPath } from "@/lib/enterprise-api";
+import { ent, projectPath, useEntParams } from "@/lib/enterprise-api";
 
 type Home = {
   name: string;
@@ -24,12 +23,13 @@ type Home = {
 };
 
 export default function ProjectHomePage() {
-  const projectId = useParams<{ projectId: string }>().projectId;
+  const projectId = useEntParams<{ projectId: string }>().projectId;
   const [home, setHome] = useState<Home | null>(null);
   const [error, setError] = useState("");
   const [platform, setPlatform] = useState(false);
 
   useEffect(() => {
+    if (!projectId) return;
     void ent<{ platform: boolean }>("/me")
       .then((me) => setPlatform(me.platform))
       .catch(() => setPlatform(false));

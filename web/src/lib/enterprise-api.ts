@@ -1,3 +1,4 @@
+import { useParams, usePathname } from "next/navigation";
 import { toast } from "sonner";
 
 import { apiFetch } from "@/lib/api";
@@ -101,7 +102,34 @@ export function currentProject(): string {
 }
 
 export function setProject(id: string) {
+  if (!id || id === "_") return;
   localStorage.setItem(PROJECT_KEY, id);
+}
+
+export function useEntParams<T extends Record<string, string | undefined>>(): T {
+  const raw = useParams() as Record<string, string | undefined>;
+  const pathname = usePathname() || (typeof window !== "undefined" ? window.location.pathname : "");
+  const out: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (v && v !== "_") out[k] = v;
+  }
+  const clean = pathname.replace(/\/+$/, "");
+  const projMatch = clean.match(/^\/enterprise\/p\/([^/]+)(?:\/[^/]+)*$/);
+  if (projMatch && !out.projectId && projMatch[1] !== "_") {
+    out.projectId = decodeURIComponent(projMatch[1]);
+  }
+  const subMatch = clean.match(/^\/enterprise\/p\/[^/]+\/(findings|reports|tasks)\/([^/]+)$/);
+  if (subMatch && subMatch[2] !== "_") {
+    const decoded = decodeURIComponent(subMatch[2]);
+    if (subMatch[1] === "findings" && !out.findingId) out.findingId = decoded;
+    if (subMatch[1] === "reports" && !out.reportId) out.reportId = decoded;
+    if (subMatch[1] === "tasks" && !out.taskId) out.taskId = decoded;
+  }
+  const conclMatch = clean.match(/^\/enterprise\/conclusions\/([^/]+)$/);
+  if (conclMatch && !out.reportId && conclMatch[1] !== "_") {
+    out.reportId = decodeURIComponent(conclMatch[1]);
+  }
+  return out as T;
 }
 
 export function clearProject() {

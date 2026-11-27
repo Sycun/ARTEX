@@ -3,12 +3,11 @@
 import { useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
 import { apiFetch } from "@/lib/api";
-import { currentProject, ent, type Me, projectPath, sha256 } from "@/lib/enterprise-api";
+import { currentProject, ent, type Me, projectPath, sha256, useEntParams } from "@/lib/enterprise-api";
 
 type Event = {
   id: string;
@@ -25,7 +24,7 @@ type Event = {
 };
 
 export default function AuditPage() {
-  const params = useParams<{ projectId?: string }>();
+  const params = useEntParams<{ projectId?: string }>();
   const project = params.projectId || currentProject();
   const [allowed, setAllowed] = useState<boolean | null>(null);
   const [items, setItems] = useState<Event[] | null>(null);

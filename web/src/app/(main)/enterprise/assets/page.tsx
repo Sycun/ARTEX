@@ -2,16 +2,14 @@
 
 import { useEffect, useState } from "react";
 
-import { useParams } from "next/navigation";
-
 import { Page } from "@/components/enterprise/shell";
-import { currentProject, ent } from "@/lib/enterprise-api";
+import { currentProject, ent, useEntParams } from "@/lib/enterprise-api";
 
 type Asset = { name: string; observation: string; observed_at: string };
 type Summary = { findings: number };
 
 export default function AssetsPage() {
-  const params = useParams<{ projectId?: string }>();
+  const params = useEntParams<{ projectId?: string }>();
   const project = params.projectId || currentProject();
   const [items, setItems] = useState<Asset[] | null>(null);
   const [findings, setFindings] = useState<number | null>(null);

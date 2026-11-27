@@ -3,12 +3,12 @@
 import { Suspense, useEffect, useState } from "react";
 
 import Link from "next/link";
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import { Page } from "@/components/enterprise/shell";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { currentProject, ent, projectPath } from "@/lib/enterprise-api";
+import { currentProject, ent, projectPath, useEntParams } from "@/lib/enterprise-api";
 
 type Finding = {
   id: number;
@@ -21,7 +21,7 @@ type Finding = {
 type PageData = { items: Finding[]; total: number; page: number; page_size: number };
 
 function Findings() {
-  const params = useParams<{ projectId?: string }>();
+  const params = useEntParams<{ projectId?: string }>();
   const project = params.projectId || currentProject();
   const search = useSearchParams();
   const router = useRouter();

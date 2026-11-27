@@ -34,14 +34,33 @@ func (s *Server) webuiHandler() http.Handler {
 		// 1) exact file (assets: _next/*, favicon.ico, ...)
 		// 2) route dir → <p>/index.html (trailingSlash export)
 		// 3) <p>.html
-		// 4) SPA 兜底 → index.html（交给客户端路由）
+		// 4) dynamic static-export shell (e.g. enterprise/p/_/tasks/_/index.html)
+		// 5) SPA 兜底 → index.html（交给客户端路由）
 		for _, cand := range []string{p, p + "/index.html", p + ".html"} {
 			if serveFileIfExists(w, r, root, cand) {
 				return
 			}
 		}
+		if shell := dynamicExportShell(p); shell != "" && serveFileIfExists(w, r, root, shell) {
+			return
+		}
 		http.ServeFileFS(w, r, root, "index.html")
 	})
+}
+
+func dynamicExportShell(p string) string {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) == 3 && parts[0] == "enterprise" && parts[1] == "conclusions" {
+		return "enterprise/conclusions/_/index.html"
+	}
+	if len(parts) >= 3 && parts[0] == "enterprise" && parts[1] == "p" {
+		parts[2] = "_"
+		if len(parts) == 5 && (parts[3] == "findings" || parts[3] == "reports" || parts[3] == "tasks") {
+			parts[4] = "_"
+		}
+		return strings.Join(parts, "/") + "/index.html"
+	}
+	return ""
 }
 
 // serveFileIfExists serves name from fsys when it exists as a regular file.
