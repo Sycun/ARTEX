@@ -371,6 +371,7 @@ type FindingDTO struct {
 	PoeLevel             int    `json:"poe_level,omitempty"`
 	Summary              string `json:"summary"`
 	Evidence             string `json:"evidence"`
+	Remark               string `json:"remark,omitempty"` // 人工备注
 	Report               string `json:"report,omitempty"` // 详细报告(Markdown);仅详情接口返回,列表为空
 	ReportConversationID *int64 `json:"report_conversation_id,omitempty"`
 
@@ -471,6 +472,8 @@ func findingDTOsForOwner(taskID, description string, in []*db.Node, meta map[int
 		if m, ok := meta[n.ID]; ok {
 			d.FindingID = i64s(m.ID)
 			d.Status = m.Status
+			d.Remark = m.Remark
+			d.Evidence = m.Evidence
 			d.TrafficCount = m.TrafficCount
 			d.Assets = findingAssetDTOs(m.AssetIDs, assets)
 		}
@@ -511,6 +514,7 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 		PoeLevel:             f.PoeLevel,
 		Summary:              f.Summary,
 		Evidence:             f.Evidence,
+		Remark:               f.Remark,
 		Report:               f.Report,
 		ReportConversationID: f.ReportConversationID,
 		TS:                   rfc3339(f.CreatedAt),

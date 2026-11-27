@@ -520,10 +520,11 @@ function mockFilterFindings(q: URLSearchParams): (typeof mockFindings)[number][]
 function mockFindingMatchesQuery(finding: (typeof mockFindings)[number], query: string | null): boolean {
   const needle = query?.trim().toLowerCase();
   if (!needle) return true;
-  return [finding.name, finding.vulnclass, finding.summary, finding.evidence, finding.report].some((value) =>
-    String(value ?? "")
-      .toLowerCase()
-      .includes(needle),
+  return [finding.name, finding.vulnclass, finding.summary, finding.evidence, finding.remark, finding.report].some(
+    (value) =>
+      String(value ?? "")
+        .toLowerCase()
+        .includes(needle),
   );
 }
 
@@ -2087,7 +2088,7 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/exploration/finding-case-suggestions" || (path === "/exploration/finding-case-review" && m === "GET"))
     return [];
   if (path === "/exploration/finding-case-review" && m === "POST")
-    throw new Error("演示模式不执行 Reporter 整理，请在已配置模型的实例中使用");
+    throw new Error("演示模式不执行 AI 自动合并，请在已配置模型的实例中使用");
   if (path === "/exploration/finding-cases" && m === "GET") {
     const list = filterAndSortFindings(mockApplyAssetScope(mockFilterFindings(q), q.get("asset_scope")), "all", {
       field: q.get("sort") === "severity" ? "severity" : "time",
@@ -2360,8 +2361,12 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
     if (m === "PATCH") {
       if (typeof b.status === "string") f.status = b.status as typeof f.status;
       if (typeof b.severity === "string") f.severity = b.severity as typeof f.severity;
-      if (typeof b.name === "string") f.name = b.name;
-      if (typeof b.vulnclass === "string") f.vulnclass = b.vulnclass;
+      if (typeof b.name === "string") f.name = b.name.trim();
+      if (typeof b.vulnclass === "string") f.vulnclass = b.vulnclass.trim();
+      if (typeof b.summary === "string") f.summary = b.summary.trim();
+      if (typeof b.evidence === "string") f.evidence = b.evidence.trim() ? b.evidence : "";
+      if (typeof b.report === "string") f.report = b.report.trim() ? b.report : "";
+      if (b.remark !== undefined) f.remark = mockRemark(b.remark);
     }
     const contextTaskId = q.get("context_task");
     const contextTask = contextTaskId ? mockTasks.find((item) => item.id === contextTaskId) : undefined;
@@ -2774,8 +2779,19 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (path === "/intercept/rules" && m === "GET") return { rules: D.interceptRules };
   if (seg[0] === "intercept" && seg[1] === "rules" && seg[3] === "toggle")
     return { ok: true, enabled: b.enabled ?? true };
-  if (path === "/intercept/pending" && m === "GET")
-    return { pending: mockInterceptHistory.filter((r) => r.status === "pending") };
+  if (path === "/intercept/pending/summary" && m === "GET") {
+    const taskId = q.get("task_id")?.trim() || "";
+    const pending = mockInterceptHistory.filter((r) => r.status === "pending" && (!taskId || r.task_id === taskId));
+    if (!taskId) return { count: pending.length };
+    const agentNames = [...new Set(pending.map((r) => r.agent_name).filter(Boolean))].sort();
+    return { count: pending.length, agent_names: agentNames };
+  }
+  if (path === "/intercept/pending" && m === "GET") {
+    const taskId = q.get("task_id")?.trim() || "";
+    return {
+      pending: mockInterceptHistory.filter((r) => r.status === "pending" && (!taskId || r.task_id === taskId)),
+    };
+  }
   if (seg[0] === "intercept" && seg[1] === "pending" && seg[3] === "decide") {
     const id = Number(seg[2]);
     const row = mockInterceptHistory.find((r) => r.id === id) ?? mockInterceptPending.find((r) => r.id === id);
@@ -2834,14 +2850,17 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
           (search.startsWith("#") ? row.id === Number(search.slice(1)) : haystack.includes(search.toLowerCase())))
       );
     });
-    if (!q.has("page") && !q.has("size") && !status && !decisionSource && !search && !from && !to)
-      return { items: filtered, total: filtered.length };
+    if (!q.has("page") && !q.has("size") && !status && !decisionSource && !search && !from && !to) {
+      const capped = filtered.slice(0, 200);
+      return { items: capped, total: capped.length };
+    }
     const page = Math.max(1, Number(q.get("page")) || 1);
     const size = Math.min(100, Math.max(1, Number(q.get("size")) || 20));
     const offset = (page - 1) * size;
     return {
       items: filtered.slice(offset, offset + size),
       total: filtered.length,
+      has_more: offset + size < filtered.length,
       page,
       page_size: size,
     };

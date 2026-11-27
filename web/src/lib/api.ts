@@ -43,7 +43,6 @@ import type {
   FindingCaseDetail,
   FindingCasePage,
   FindingCaseReviewRun,
-  FindingCaseSuggestion,
   FindingDeepenResponse,
   FindingGroupsPage,
   FindingQuery,
@@ -56,9 +55,11 @@ import type {
   IntelligencePage,
   IntentAsset,
   InterceptApprovalFilter,
+  InterceptApprovalPage,
   InterceptApprovalRow,
   InterceptDetail,
   InterceptPending,
+  InterceptPendingSummary,
   InterceptRule,
   JudgeConfig,
   JudgeUsage,
@@ -869,19 +870,24 @@ export const api = {
       method: "DELETE",
       body: JSON.stringify({ reason }),
     }),
-  findingCaseSuggestions: (task?: string) =>
-    get<FindingCaseSuggestion[]>(
-      `/exploration/finding-case-suggestions${task ? `?task_id=${encodeURIComponent(task)}` : ""}`,
+  autoMergeFindings: (filters?: Omit<FindingQuery, "page" | "pageSize">) =>
+    post<{ runs: { conversation_id: number; task_id: string }[]; skipped_busy?: number }>(
+      "/exploration/finding-case-review",
+      filters
+        ? {
+            filters: {
+              severity: filters.severity && filters.severity !== "all" ? filters.severity : undefined,
+              status: filters.status && filters.status !== "all" ? filters.status : undefined,
+              vulnclass: filters.vulnclass && filters.vulnclass !== "all" ? filters.vulnclass : undefined,
+              task_id: filters.task && filters.task !== "all" ? filters.task : undefined,
+              q: filters.query || undefined,
+              from: filters.from || undefined,
+              to: filters.to || undefined,
+              asset_scope: filters.assetScope || undefined,
+            },
+          }
+        : {},
     ),
-  resolveFindingCaseSuggestion: (id: string, accept: boolean, excludeIds?: string[]) =>
-    post<{ case_id: string }>(`/exploration/finding-case-suggestions/${id}`, {
-      accept,
-      ...(excludeIds && excludeIds.length > 0 ? { exclude_ids: excludeIds } : {}),
-    }),
-  reviewFindingCases: (ids: string[]) =>
-    post<{ runs: { conversation_id: number; task_id: string }[] }>("/exploration/finding-case-review", {
-      finding_ids: ids,
-    }),
   regenerateFindingCase: (id: string, contextTask?: string) =>
     post<{ runs: { conversation_id: number; task_id: string }[] }>(
       `/exploration/finding-case-review${contextTask ? `?context_task=${encodeURIComponent(contextTask)}` : ""}`,
@@ -1009,10 +1015,19 @@ export const api = {
   bulkSetFindingStatus: (ids: number[], status: FindingStatus) =>
     post<{ updated: number }>("/exploration/findings/bulk-status", { ids, status }),
   setFindingSeverity: (id: string, severity: Severity) => patch<Finding>(`/exploration/findings/${id}`, { severity }),
-  // 一次保存漏洞的名称/类别/严重等级(发现列表行内编辑用),只传出现的字段。
+  // 保存漏洞的可编辑字段(列表行内编辑与详情页编辑/备注共用),只传出现的字段。
   updateFinding: (
     id: string,
-    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus },
+    fields: {
+      name?: string;
+      vulnclass?: string;
+      severity?: Severity;
+      status?: FindingStatus;
+      summary?: string;
+      evidence?: string;
+      report?: string;
+      remark?: string;
+    },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // 删除漏洞:移除 findings 记录 + 来源探索节点(从发现列表/任务发现 Tab/探索图一并消失)。
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
@@ -1751,7 +1766,17 @@ export const api = {
     post<{ ok: boolean; enabled: boolean }>(`/asset-intercept/rules/${id}/toggle`, { enabled }),
 
   // ---- intercept pending (ask) ----
-  interceptPending: () => get<{ pending: InterceptPending[] }>("/intercept/pending").then((r) => arr(r.pending)),
+  interceptPending: (taskId?: string) =>
+    get<{ pending: InterceptPending[] }>(
+      taskId ? `/intercept/pending?task_id=${encodeURIComponent(taskId)}` : "/intercept/pending",
+    ).then((r) => arr(r.pending)),
+  interceptPendingSummary: (taskId?: string): Promise<InterceptPendingSummary> =>
+    get<{ count?: number; agent_names?: string[] }>(
+      taskId ? `/intercept/pending/summary?task_id=${encodeURIComponent(taskId)}` : "/intercept/pending/summary",
+    ).then((r) => ({
+      count: r.count ?? 0,
+      agent_names: arr(r.agent_names),
+    })),
   interceptGetOne: (id: number) => get<InterceptPending>(`/intercept/pending/${id}`),
   interceptDecide: (id: number, decision: "allowed" | "denied") =>
     post<{ ok: boolean }>(`/intercept/pending/${id}/decide`, { decision }),
@@ -1761,21 +1786,38 @@ export const api = {
     ),
   interceptDetail: (id: number) => get<InterceptDetail>(`/intercept/history/${id}`),
   interceptHistory: () => get<{ items: InterceptApprovalRow[] }>("/intercept/history").then((r) => arr(r.items)),
-  interceptHistoryPage: (page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
-    get<{ items: InterceptApprovalRow[]; total?: number }>(
-      `/intercept/history?${interceptPageQuery(page, size, filter)}`,
-    ).then((r) => ({
+  interceptHistoryPage: (page = 1, size = 20, filter: InterceptApprovalFilter = {}): Promise<InterceptApprovalPage> =>
+    get<{
+      items: InterceptApprovalRow[];
+      total?: number;
+      total_approximate?: boolean;
+      total_capped?: boolean;
+      has_more?: boolean;
+    }>(`/intercept/history?${interceptPageQuery(page, size, filter)}`).then((r) => ({
       items: arr(r.items),
       total: r.total ?? r.items?.length ?? 0,
+      total_approximate: Boolean(r.total_approximate),
+      total_capped: Boolean(r.total_capped),
+      has_more: Boolean(r.has_more),
     })),
-  interceptTask: (taskId: string) =>
-    get<{ items: InterceptApprovalRow[] }>(`/intercept/task/${taskId}`).then((r) => arr(r.items)),
-  interceptTaskPage: (taskId: string, page = 1, size = 20, filter: InterceptApprovalFilter = {}) =>
-    get<{ items: InterceptApprovalRow[]; total?: number }>(
-      `/intercept/task/${encodeURIComponent(taskId)}?${interceptPageQuery(page, size, filter)}`,
-    ).then((r) => ({
+  interceptTaskPage: (
+    taskId: string,
+    page = 1,
+    size = 20,
+    filter: InterceptApprovalFilter = {},
+  ): Promise<InterceptApprovalPage> =>
+    get<{
+      items: InterceptApprovalRow[];
+      total?: number;
+      total_approximate?: boolean;
+      total_capped?: boolean;
+      has_more?: boolean;
+    }>(`/intercept/task/${encodeURIComponent(taskId)}?${interceptPageQuery(page, size, filter)}`).then((r) => ({
       items: arr(r.items),
       total: r.total ?? r.items?.length ?? 0,
+      total_approximate: Boolean(r.total_approximate),
+      total_capped: Boolean(r.total_capped),
+      has_more: Boolean(r.has_more),
     })),
 
   // ---- intercept tool-config (全局工具拦截范围) ----

@@ -282,7 +282,16 @@ func (s *Server) interceptListPending(w http.ResponseWriter, r *http.Request) {
 	if pg == nil {
 		return
 	}
-	pending, err := pg.ListPendingIntercepts()
+	taskID := strings.TrimSpace(r.URL.Query().Get("task_id"))
+	var (
+		pending []db.InterceptPending
+		err     error
+	)
+	if taskID != "" {
+		pending, err = pg.ListPendingInterceptsByTask(taskID)
+	} else {
+		pending, err = pg.ListPendingIntercepts()
+	}
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -292,6 +301,32 @@ func (s *Server) interceptListPending(w http.ResponseWriter, r *http.Request) {
 		out = append(out, pendingDTO(p))
 	}
 	writeJSON(w, 200, map[string]any{"pending": out})
+}
+
+func (s *Server) interceptPendingSummary(w http.ResponseWriter, r *http.Request) {
+	pg := s.pg(w)
+	if pg == nil {
+		return
+	}
+	taskID := strings.TrimSpace(r.URL.Query().Get("task_id"))
+	if taskID == "" {
+		count, err := pg.CountPendingIntercepts()
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]any{"count": count})
+		return
+	}
+	summary, err := pg.TaskPendingInterceptSummary(taskID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if summary.AgentNames == nil {
+		summary.AgentNames = []string{}
+	}
+	writeJSON(w, 200, summary)
 }
 
 func (s *Server) interceptGetOne(w http.ResponseWriter, r *http.Request) {
@@ -333,7 +368,7 @@ func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if q.Get("page") == "" && q.Get("size") == "" && filter == (db.InterceptApprovalFilter{}) {
-		items, err := pg.ListTaskIntercepts(taskID)
+		items, err := pg.ListTaskInterceptsLimit(taskID, 200)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -345,15 +380,12 @@ func (s *Server) interceptListTaskItems(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	page, size := interceptPageParams(q)
-	items, total, err := pg.ListTaskInterceptsPage(taskID, page, size, filter)
+	res, err := pg.ListTaskInterceptsPage(taskID, page, size, filter)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	if items == nil {
-		items = []db.InterceptApprovalRow{}
-	}
-	writeJSON(w, 200, map[string]any{"items": items, "total": total, "page": page, "page_size": size})
+	writeInterceptPage(w, res, page, size)
 }
 
 func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
@@ -380,15 +412,33 @@ func (s *Server) interceptHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, size := interceptPageParams(q)
-	items, total, err := pg.ListAllInterceptsPage(page, size, filter)
+	res, err := pg.ListAllInterceptsPage(page, size, filter)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	writeInterceptPage(w, res, page, size)
+}
+
+func writeInterceptPage(w http.ResponseWriter, res db.InterceptApprovalPage, page, size int) {
+	items := res.Items
 	if items == nil {
 		items = []db.InterceptApprovalRow{}
 	}
-	writeJSON(w, 200, map[string]any{"items": items, "total": total, "page": page, "page_size": size})
+	payload := map[string]any{
+		"items":     items,
+		"total":     res.Total,
+		"has_more":  res.HasMore,
+		"page":      page,
+		"page_size": size,
+	}
+	if res.TotalApproximate {
+		payload["total_approximate"] = true
+	}
+	if res.TotalCapped {
+		payload["total_capped"] = true
+	}
+	writeJSON(w, 200, payload)
 }
 
 func interceptFilterParams(q url.Values) (db.InterceptApprovalFilter, error) {

@@ -6,6 +6,7 @@ export type EngineMode = "exploring" | "paused" | "stalled" | "idle";
 
 // Keep these limits aligned with db.MaxTaskRemarkRunes and db.MaxTaskWorkerCount.
 export const MAX_TASK_REMARK_RUNES = 2000;
+export const MAX_FINDING_REMARK_RUNES = 2000;
 export const MAX_TASK_WORKER_COUNT = 50;
 
 // Parse the optional worker-count input without silently changing invalid values.
@@ -540,6 +541,7 @@ export interface Finding {
   poe_level?: number;
   summary: string;
   evidence: string;
+  remark?: string; // 人工备注
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
   report_conversation_id?: number;
   intent_id?: string;
@@ -1060,18 +1062,18 @@ export interface TrafficHost {
 // ---- App settings (runtime toggles) ----
 export interface Settings {
   traffic_capture: boolean;
-  /** 是否向可见 Agent 暴露浏览器 MCP 的截图工具。默认关闭。 */
+  /** 是否向可见 Agent 暴露浏览器 MCP 的截图工具。默认开启。 */
   browser_screenshot_enabled?: boolean;
-  /** 是否在报告截图右上角显示截图保存时间。默认关闭。 */
+  /** 是否在报告截图右上角显示截图保存时间。默认开启。 */
   browser_screenshot_timestamp_enabled?: boolean;
   /** 是否向 Agent 注入统一 OPSEC 准则。默认关闭。 */
   opsec_enabled?: boolean;
   credential_agent_enabled: boolean;
   credential_traffic_binding: boolean;
-  task_intelligence_enabled: boolean; // 默认关闭；关闭不注入情报工具或提示
+  task_intelligence_enabled: boolean; // 默认开启；关闭不注入情报工具或提示
   task_auto_title_enabled: boolean; // Agent 创建任务时自动生成任务名称
   chat_auto_title_enabled: boolean; // 对话首条消息后自动生成会话标题
-  agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认关闭；不影响人工绑定
+  agent_traffic_binding: boolean; // Agent 自动绑定流量证据，默认开启；不影响人工绑定
   llm_record: boolean; // LLM 录制开关（默认关）；关闭时不记录任何 LLM 调用
   // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
   // (the values are never returned). On PUT, send the corresponding field to set/clear.
@@ -1548,6 +1550,11 @@ export interface InterceptPending {
   created_at: string;
 }
 
+export interface InterceptPendingSummary {
+  count: number;
+  agent_names: string[];
+}
+
 // JudgeConfig: 模型兜底审批(仅当没有任何拦截规则命中时由模型判断)的全局配置。
 export interface JudgeConfig {
   enabled: boolean;
@@ -1592,6 +1599,14 @@ export interface InterceptApprovalRow extends InterceptPending {
   conv_title: string; // "" if no linked conversation
   conv_agent_key: string; // "" if no linked conversation
   rule_name: string; // "" if rule was deleted
+}
+
+export interface InterceptApprovalPage {
+  items: InterceptApprovalRow[];
+  total: number;
+  total_approximate?: boolean;
+  total_capped?: boolean;
+  has_more?: boolean;
 }
 
 // ── 资产同步 (ScopeSentry 数据源) ──────────────────────────────────────────────
@@ -1940,16 +1955,6 @@ export interface FindingCaseEvent {
 export interface FindingCaseDetail {
   case: FindingCase;
   events: FindingCaseEvent[];
-}
-export interface FindingCaseSuggestion {
-  id: string;
-  task_id: string;
-  left_id: string;
-  right_id: string;
-  finding_ids: string[];
-  title: string;
-  reason: string;
-  state: string;
 }
 export interface FindingCaseReviewRun {
   conversation_id: number;

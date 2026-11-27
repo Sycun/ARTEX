@@ -7,6 +7,7 @@ import (
 	"log"
 	"runtime/debug"
 
+	"github.com/Autumn-27/artex/internal/toolguard"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -78,6 +79,17 @@ func AugmentTools(ctx context.Context, agentKey string, base []actool.CoreTool) 
 	}
 	out = applyToolRAG(ctx, agentKey, out, def.Deferred, nil)
 	return out, def, cleanup
+}
+
+// Install the guarded handler before ToolResolve decorates it with DB defaults.
+func guardedDefaultTools() []actool.CoreTool {
+	tools := actool.DefaultTools()
+	for i, t := range tools {
+		if t.Name() == "Bash" {
+			tools[i] = toolguard.NewBash()
+		}
+	}
+	return tools
 }
 
 // guardPanic turns a panicking tool handler into an ordinary tool error. The

@@ -12,13 +12,14 @@ import {
   InfoIcon,
   SearchIcon,
   ShieldAlertIcon,
+  SparklesIcon,
   Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
-import { FindingCaseList } from "@/components/finding-case-list";
+import { FindingCaseList, FindingCaseReviewPanel } from "@/components/finding-case-list";
 import { FindingDateFilter, type FindingDateRange } from "@/components/finding-date-filter";
 import { FindingRetestDialog } from "@/components/finding-retest-dialog";
 import { StatusBadge } from "@/components/status-badge";
@@ -296,6 +297,7 @@ export default function FindingsPage() {
   const [cleanupScope, setCleanupScope] = React.useState<"filtered" | "all" | "selected">("all");
   const [cleaning, setCleaning] = React.useState(false);
   const [caseRefreshKey, setCaseRefreshKey] = React.useState(0);
+  const [reviewRefreshKey, setReviewRefreshKey] = React.useState(0);
 
   const toggleSelected = React.useCallback((id: string, checked: boolean) => {
     setSelectedIds((prev) => {
@@ -781,7 +783,7 @@ export default function FindingsPage() {
         setEdit(null);
         return;
       }
-      setEdit({ name: f.name ?? "", vulnclass: f.vulnclass, severity: f.severity });
+      setEdit({ name: f.name ?? "", vulnclass: f.vulnclass, severity: f.severity, remark: f.remark ?? "" });
       if (!f.finding_id || reports[key]) return;
       const fid = f.finding_id;
       setReports((r) => ({ ...r, [key]: { status: "loading", text: "" } }));
@@ -803,11 +805,18 @@ export default function FindingsPage() {
           name: edit.name.trim(),
           vulnclass: edit.vulnclass.trim(),
           severity: edit.severity,
+          remark: edit.remark.trim(),
         });
         setFindings((cur) =>
           cur.map((x) =>
             isSameFinding(x, f)
-              ? { ...x, name: updated.name, vulnclass: updated.vulnclass, severity: updated.severity }
+              ? {
+                  ...x,
+                  name: updated.name,
+                  vulnclass: updated.vulnclass,
+                  severity: updated.severity,
+                  remark: updated.remark,
+                }
               : x,
           ),
         );
@@ -901,6 +910,51 @@ export default function FindingsPage() {
     }
   }
 
+  const refreshAfterAutoMerge = React.useCallback(() => {
+    void refreshStats();
+    if (view === "cases") {
+      setCaseRefreshKey((v) => v + 1);
+    } else if (view === "asset") {
+      void loadFlat();
+      void loadAssetTree();
+    } else if (view === "flat") {
+      void loadFlat();
+    } else if (view === "grouped") {
+      void refreshGroups();
+    }
+  }, [loadAssetTree, loadFlat, refreshGroups, refreshStats, view]);
+
+  async function doAutoMerge() {
+    if (reviewing) return;
+    setReviewing(true);
+    try {
+      const res = await api.autoMergeFindings({
+        severity,
+        status,
+        vulnclass,
+        task,
+        query,
+        ...dateRange,
+        assetScope: view === "asset" ? (assetScope ?? undefined) : undefined,
+      });
+      setReviewRefreshKey((v) => v + 1);
+      if (res.runs.length > 0) {
+        if (res.skipped_busy && res.skipped_busy > 0) {
+          toast.success(
+            t("findingsAutoMerge.startedWithSkipped", { count: res.runs.length, skipped: res.skipped_busy }),
+          );
+        } else {
+          toast.success(t("findingsAutoMerge.started", { count: res.runs.length }));
+        }
+      } else {
+        toast.info(t("findingsAutoMerge.empty"));
+      }
+    } catch (e) {
+      toast.error(t("findingsAutoMerge.failed", { message: (e as Error).message }));
+    } finally {
+      setReviewing(false);
+    }
+  }
   const openDeepen = React.useCallback((f: Finding) => {
     setDeepenFinding(f);
     setDeepenDescription("");
@@ -1156,23 +1210,11 @@ export default function FindingsPage() {
             <Button
               size="sm"
               variant="outline"
-              disabled={reviewing || selectedIds.size === 0}
-              onClick={async () => {
-                setReviewing(true);
-                try {
-                  await api.reviewFindingCases([...selectedIds]);
-                  toast.success(ui("screen.25ffb72f4218ca"));
-                } catch (e) {
-                  toast.error((e as Error).message);
-                } finally {
-                  setReviewing(false);
-                }
-              }}
+              disabled={reviewing || (statsLoaded && stats.total < 2)}
+              onClick={doAutoMerge}
             >
-              {reviewing ? <Spinner /> : null}
-              {ui("screen.786fe65bb61d85")}
-              {selectedIds.size}
-              {ui("punctuation.f2e44c6c95")}
+              {reviewing ? <Spinner /> : <SparklesIcon />}
+              {reviewing ? t("findingsAutoMerge.running") : t("findingsAutoMerge.button")}
             </Button>
             <Select
               value=""
@@ -1218,6 +1260,12 @@ export default function FindingsPage() {
             </Button>
           </div>
         </div>
+
+        <FindingCaseReviewPanel
+          taskId={task === "all" || task === UNASSIGNED_TASK ? undefined : task}
+          refreshKey={reviewRefreshKey}
+          onChange={refreshAfterAutoMerge}
+        />
 
         {view === "flat" && flatListCard}
 
@@ -1284,6 +1332,7 @@ export default function FindingsPage() {
             query={{ severity, status, vulnclass, task, query, sort, ...dateRange }}
             selectedIds={selectedIds}
             onSelect={toggleSelected}
+            showReviewPanel={false}
             refreshKey={caseRefreshKey}
           />
         )}

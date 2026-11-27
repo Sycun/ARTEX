@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -276,7 +277,7 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 			if err != nil || t == "" {
 				return "", false
 			}
-			if key == "reporter" && m.pg.GetBool(settingBrowserScreenshot, false) {
+			if key == "reporter" && m.pg.GetBool(settingBrowserScreenshot, defaultBrowserScreenshot) {
 				t += `
 
 【报告步骤截图已开启】
@@ -315,7 +316,7 @@ func NewRuntime(ctx context.Context, m *Manager, skillDir string, dataDir string
 			}
 			return a.TaskTimeoutWrapupMaxTurns, true
 		}
-		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
+		wireAgentAugment(m.pg, s.skillDir, m.dir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
 		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
 		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
@@ -1038,6 +1039,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /api/tasks/{id}/constraints/{cid}", s.editConstraint)    // 约束管理:修改约束
 	mux.HandleFunc("DELETE /api/tasks/{id}/constraints/{cid}", s.deleteConstraint) // 约束管理:删除约束
 	mux.HandleFunc("POST /api/tasks/{id}/control", s.control)
+	mux.HandleFunc("POST /api/tasks/{id}/resume", s.resumeTask)
 	mux.HandleFunc("PUT /api/tasks/{id}/llm", s.updateTaskLLMProfiles)
 	mux.HandleFunc("GET /api/tasks/{id}/llm/resolution", s.taskLLMResolutionHandler)
 	mux.HandleFunc("POST /api/tasks/{id}/intents/{iid}/control", s.controlIntent)
@@ -1304,6 +1306,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/asset-intercept/rules/{id}/toggle", s.assetInterceptToggleRule)
 
 	mux.HandleFunc("GET /api/intercept/pending", s.interceptListPending)
+	mux.HandleFunc("GET /api/intercept/pending/summary", s.interceptPendingSummary)
 	mux.HandleFunc("GET /api/intercept/pending/{id}", s.interceptGetOne)
 	mux.HandleFunc("POST /api/intercept/pending/{id}/decide", s.interceptDecide)
 	mux.HandleFunc("POST /api/intercept/pending/batch-decide", s.interceptBatchDecide)
@@ -1585,6 +1588,25 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := s.applyTaskControl(t, req.Action)
+	if err != nil {
+		if writeEnterpriseFail(w, err) {
+			return
+		}
+		writeErr(w, 409, err.Error())
+		return
+	}
+	writeJSON(w, 200, result)
+}
+
+// resumeTask resumes a paused task or reopens a terminal task (done/failed/timeout)
+// in place when it still has open goals or open intents.
+func (s *Server) resumeTask(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.lookupTask(r.PathValue("id"))
+	if !ok {
+		writeErr(w, 404, "task not found")
+		return
+	}
+	result, err := s.resumeOrReopenTask(t, agent.AbortPausedByUser)
 	if err != nil {
 		if writeEnterpriseFail(w, err) {
 			return
@@ -3030,10 +3052,10 @@ func normalizeFindingIDs(ids []int64, capN int) ([]int64, bool) {
 	return out, false
 }
 
-// patchFinding partially updates a finding: any subset of {status, severity}.
-// The id is the standalone findings-table id (DTO finding_id). Severity edits are
-// mirrored onto the originating exploration node so the per-task view stays in
-// sync. Returns the updated finding DTO.
+// patchFinding partially updates a finding: any subset of {status, severity, name, vulnclass,
+// summary, evidence, report, remark}. The id is the standalone findings-table id (DTO finding_id).
+// Core text fields are mirrored onto the originating exploration node so the per-task view stays
+// in sync. Returns the updated finding DTO.
 func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
@@ -3051,20 +3073,38 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		Severity  *string `json:"severity"`
 		Name      *string `json:"name"`
 		VulnClass *string `json:"vulnclass"`
+		Summary   *string `json:"summary"`
+		Evidence  *string `json:"evidence"`
+		Report    *string `json:"report"`
+		Remark    *string `json:"remark"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil {
-		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass")
+	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil &&
+		body.Summary == nil && body.Evidence == nil && body.Report == nil && body.Remark == nil {
+		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass/summary/evidence/report/remark")
 		return
 	}
-	if body.Status != nil {
-		if !db.ValidFindingStatus(*body.Status) {
-			writeErr(w, 400, "bad status: "+*body.Status)
+	// Validate all fields before mutating so invalid input never leaves partial writes.
+	if body.Status != nil && !db.ValidFindingStatus(*body.Status) {
+		writeErr(w, 400, "bad status: "+*body.Status)
+		return
+	}
+	if body.Severity != nil && !db.ValidSeverity(*body.Severity) {
+		writeErr(w, 400, "bad severity: "+*body.Severity)
+		return
+	}
+	var remark string
+	if body.Remark != nil {
+		remark = strings.TrimSpace(*body.Remark)
+		if utf8.RuneCountInString(remark) > db.MaxFindingRemarkRunes {
+			writeErr(w, 400, fmt.Sprintf("备注最多 %d 个字符", db.MaxFindingRemarkRunes))
 			return
 		}
+	}
+	if body.Status != nil {
 		// 走带通知的版本：状态更新与「状态变更推送事件」在同一事务里落库，
 		// 避免出现状态已改而推送事件丢失的窗口。事件登记失败不影响状态更新，
 		// 所以只记日志、不向调用方报错。
@@ -3082,10 +3122,6 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.Severity != nil {
-		if !db.ValidSeverity(*body.Severity) {
-			writeErr(w, 400, "bad severity: "+*body.Severity)
-			return
-		}
 		n, err := s.m.pg.SetFindingSeverity(id, *body.Severity)
 		if err != nil {
 			writeErr(w, 500, err.Error())
@@ -3118,6 +3154,58 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.Summary != nil {
+		n, err := s.m.pg.SetFindingSummary(id, strings.TrimSpace(*body.Summary))
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
+		}
+	}
+	if body.Evidence != nil {
+		ev := *body.Evidence
+		if strings.TrimSpace(ev) == "" {
+			ev = ""
+		}
+		n, err := s.m.pg.SetFindingEvidence(id, ev)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
+		}
+	}
+	if body.Report != nil {
+		rep := *body.Report
+		if strings.TrimSpace(rep) == "" {
+			rep = ""
+		}
+		n, err := s.m.pg.SetFindingReport(id, rep)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
+		}
+	}
+	if body.Remark != nil {
+		n, err := s.m.pg.SetFindingRemark(id, remark)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
+		}
+	}
 	f, err := s.m.pg.GetFinding(id)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -3127,7 +3215,16 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "finding not found")
 		return
 	}
-	writeJSON(w, 200, findingFromDB(f, s.resolveAssetIDs(f.AssetIDs)))
+	dto := findingFromDB(f, s.resolveAssetIDs(f.AssetIDs))
+	cid, err := s.m.pg.FindingCaseID(f.ID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if cid > 0 {
+		dto.CaseID = i64s(cid)
+	}
+	writeJSON(w, 200, dto)
 }
 
 // deleteFinding removes a finding (findings row + originating exploration node).
@@ -4304,11 +4401,11 @@ func (s *Server) settingsPayload() map[string]any {
 	}
 	return map[string]any{
 		"traffic_capture":                      s.m.TrafficEnabled(),
-		"browser_screenshot_enabled":           s.m.pg.GetBool(settingBrowserScreenshot, false),
-		"browser_screenshot_timestamp_enabled": s.m.pg.GetBool(settingScreenshotTimestamp, false),
+		"browser_screenshot_enabled":           s.m.pg.GetBool(settingBrowserScreenshot, defaultBrowserScreenshot),
+		"browser_screenshot_timestamp_enabled": s.m.pg.GetBool(settingScreenshotTimestamp, defaultScreenshotTimestamp),
 		"opsec_enabled":                        s.m.pg.GetBool(settingOpsecEnabled, false),
-		"agent_traffic_binding":                s.m.pg.GetBool(settingAgentTrafficBinding, false),
-		"task_intelligence_enabled":            s.m.pg.GetBool(db.SettingTaskIntelligence, false),
+		"agent_traffic_binding":                s.m.pg.GetBool(settingAgentTrafficBinding, defaultAgentTrafficBinding),
+		"task_intelligence_enabled":            s.m.pg.GetBool(db.SettingTaskIntelligence, db.DefaultTaskIntelligence),
 		db.SettingTaskAutoTitle:                s.m.pg.GetBool(db.SettingTaskAutoTitle, false),
 		db.SettingChatAutoTitle:                s.m.pg.GetBool(db.SettingChatAutoTitle, false),
 		db.SettingCredentialAgent:              s.m.pg.GetBool(db.SettingCredentialAgent, false),

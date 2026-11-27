@@ -22,6 +22,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/config"
+	"github.com/Autumn-27/artex/internal/toolguard"
 	"github.com/Autumn-27/artex/selfupdate"
 	"github.com/Autumn-27/artex/server"
 )
@@ -51,6 +52,9 @@ func printBanner(addr string) {
 // whether to relaunch us (see selfupdate.ExitRestart) — so the body has to live
 // in a function that can *return* rather than os.Exit past its own defers.
 func main() {
+	if code, handled := toolguard.BackgroundHelper(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	// Before any listener or child exists. On Linux this re-execs once so the
 	// kernel environment block drops the startup secrets; the values are restored
 	// into this process and scrubbed after New has copied them into memory.
@@ -224,6 +228,7 @@ func run() int {
 	defer settle.Stop()
 
 	log.Printf("[config] skill 目录: %s", skillDir)
+	log.Printf("[config] 工具资源限制: %s", toolguard.FromEnv().Summary())
 	// NewRuntime reads ARTEX_EVENT_BUS, the LLM credentials and the enterprise
 	// OIDC/S3 settings, then scrubs secretEnv. ARTEX_WORKER_* stay in cfg and in
 	// the environment, so --mode=worker keeps its identity and does not hand

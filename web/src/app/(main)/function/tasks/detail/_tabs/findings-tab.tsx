@@ -3,7 +3,15 @@ import * as React from "react";
 
 import Link from "next/link";
 
-import { ArrowDownIcon, ArrowUpIcon, ArrowUpRightIcon, ChevronRightIcon, SearchIcon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  ArrowUpRightIcon,
+  ChevronRightIcon,
+  SearchIcon,
+  SparklesIcon,
+  StickyNoteIcon,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -16,6 +24,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Spinner } from "@/components/ui/spinner";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { type UITranslate, useUITranslation } from "@/i18n/use-ui-translation";
 import { api } from "@/lib/api";
@@ -85,6 +94,15 @@ function Row({
               )}
             </div>
             <span className="truncate text-xs text-muted-foreground">{f.summary}</span>
+            {f.remark ? (
+              <span
+                className="inline-flex min-w-0 items-center gap-1 truncate text-xs text-amber-700 dark:text-amber-400"
+                title={f.remark}
+              >
+                <StickyNoteIcon className="size-3 shrink-0" />
+                <span className="truncate">{f.remark}</span>
+              </span>
+            ) : null}
           </div>
         </button>
         <Badge variant="outline">
@@ -204,9 +222,31 @@ export function FindingsTab({ taskId }: { taskId: string }) {
     [t, liveUI],
   );
 
+  const [reviewing, setReviewing] = React.useState(false);
+  const [reviewRefreshKey, setReviewRefreshKey] = React.useState(0);
+
   // Discover inherited sources before filtering; finding-cases owns folder matching.
   const taskFindings = findings.filter((f) => f.task_id === taskId || f.inherited);
+  const ownFindingsCount = taskFindings.filter((f) => !f.inherited).length;
   const items = filterAndSortFindings(taskFindings, severity, sortPreference, query);
+
+  async function doAutoMerge() {
+    if (reviewing) return;
+    setReviewing(true);
+    try {
+      const res = await api.autoMergeFindings({ task: taskId });
+      setReviewRefreshKey((v) => v + 1);
+      if (res.runs.length > 0) {
+        toast.success(t("findingsAutoMerge.started", { count: res.runs.length }));
+      } else {
+        toast.info(t("findingsAutoMerge.empty"));
+      }
+    } catch (e) {
+      toast.error(t("findingsAutoMerge.failed", { message: (e as Error).message }));
+    } finally {
+      setReviewing(false);
+    }
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -293,6 +333,17 @@ export function FindingsTab({ taskId }: { taskId: string }) {
             {ui("screen.44ce7ae909bbb2")}
           </Button>
         </form>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="ml-auto"
+          disabled={reviewing || ownFindingsCount < 2}
+          onClick={doAutoMerge}
+        >
+          {reviewing ? <Spinner /> : <SparklesIcon />}
+          {reviewing ? t("findingsAutoMerge.running") : t("findingsAutoMerge.button")}
+        </Button>
       </div>
       <FindingCaseList
         query={{
@@ -303,6 +354,7 @@ export function FindingsTab({ taskId }: { taskId: string }) {
           timeDirection: sortPreference.direction,
         }}
         contextTask={taskId}
+        reviewRefreshKey={reviewRefreshKey}
       />
       {[
         ...new Set(
