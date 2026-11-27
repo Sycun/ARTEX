@@ -229,14 +229,23 @@ func (e *vm) callPkg(pkg, fn string, args []any) any {
 			repl := e.str(args[2])
 			// Each match becomes at most the template with every $ reference
 			// expanded to the whole match, which bounds the result before it is built.
-			var n, matched int64
+			// Charge as soon as the running upper bound exceeds the remaining budget
+			// so a high-match replacement aborts immediately instead of scanning every match.
+			refs := int64(strings.Count(repl, "$"))
+			replLen := int64(len(repl))
+			est := int64(len(s))
+			remaining := e.memLimit - e.memUsed
 			re.ReplaceAllStringFunc(s, func(m string) string {
-				n++
-				matched += int64(len(m))
+				mlen := int64(len(m))
+				est += replLen + refs*mlen - mlen
+				if est > remaining {
+					e.alloc(est)
+				}
 				return ""
 			})
-			refs := int64(strings.Count(repl, "$"))
-			e.alloc(int64(len(s)) - matched + n*int64(len(repl)) + refs*matched)
+			if est > 0 {
+				e.alloc(est)
+			}
 			return re.ReplaceAllString(s, repl)
 		}
 	case "crypto/sha256":

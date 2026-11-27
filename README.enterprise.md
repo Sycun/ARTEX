@@ -45,10 +45,16 @@ flowchart LR
 
 ### 3. 对象存储、数据治理与并行编排
 * **统一对象存储抽象（`storage.BlobStore` / `StreamBlobStore`）**：支持 `LocalFSStore`（单机默认，防路径穿越与符号链接逃逸）与 `S3Store`（兼容 MinIO / AWS S3 / OSS），解耦受限原件、签发报告、任务冷归档与流量正文。
-* **大表按月声明式分区与冷归档**：支持对 `activity`、`ent_audit`、`llm_records` 自动预建按月分区，并将超期历史分区流式导出为 gzipped JSONL 存入 `BlobStore` 后安全清理。
-* **分布式流量索引**：`traffic/` 索引存储接口化，单机默认 SQLite，分布式模式自动切换为 PostgreSQL 元数据索引 + `BlobStore` 按 SHA-256 去重正文。
+* **大表按月声明式分区与冷归档**：支持对 `activity`、`ent_audit`、`llm_records` 自动预建按月分区，并将超期历史分区流式导出为 gzipped JSONL 存入 `BlobStore` 后安全清理（同步维护仪表盘日用量索引 `idx_act_result_created`）。
+* **分布式流量索引**：`traffic/` 索引存储接口化，单机默认 SQLite（含后台异步 FTS 队列与 `(host, ts)` 复合索引），分布式模式自动切换为 PostgreSQL 元数据索引 + `BlobStore` 按 SHA-256 去重正文。
 * **轻量级 Fan-out / Fan-in 批处理**：基于 `batch_jobs` / `batch_shards` 将大批量目标（如资产测绘 `asset_recon`、批量复测 `finding_retest`）去重切片派发给多个 Worker 并行执行，收尾自动归并去重结果。
 * **项目级多租户配额**：支持为每个项目配置最大并发任务数（`max_concurrent_tasks`）及日/月 LLM Token 预算（`daily_token_limit` / `monthly_token_limit`），超限时拦截返回 `429` 并记录审计。
+
+### 4. 安全加固、Agent 纵深防御与高级流量能力（BaaRai 融合特性）
+* **纵深安全基线**：启动后自动擦除环境变量中的数据库/OIDC/S3/LLM 凭据（Linux 支持 `SealProcessEnv` 清除内核环境块，同时保留 `--mode=worker` 节点配置）；非企业单机模式首装校验一次性 `setup_token`；登录/改密按 IP 限流；全站两层安全响应头（不阻断 OIDC 跳转、SSE 与 `/mcp`）；归档自动跳过 FIFO/socket/设备文件；静态加密密钥 `secret.key` 独立存放于 `ARTEX_JWT_KEY_DIR`（与 `jwt.key` 同目录，远离可浏览数据目录）。
+* **Agent 防注入与证据可验证性**：非受信数据随机 Nonce 信封隔离；事实溯源标记（`source` / `origin`）；闭卷式审批裁判（与既有 `freeform` 及 Jev System One 共存）；`argv` 级精确命令拦截与危险前缀黑名单；POE 证据原文逐字核验（`verified`）与确定性漏洞指纹去重（与漏洞归并文件夹、企业报告签发正交并存）；覆盖度账本（Coverage Ledger）；扫描器输出结构化入库（`nmap`/`nuclei`/`httpx`/`ffuf`/`bbot`）；内置离线安全知识包（MITRE ATT&CK / OWASP WSTG / CWE）与 8 个扩展安全 Skills。
+* **高级流量引擎与扩展**：支持 HAR 1.2 导入/导出、WebSocket/SSE 流消息按方向过滤（`c2s`/`s2c`）、声明式流量改写规则（Rewrite Rules，敏感值静态加密）及受限 Go 沙箱篡改 Hook（`traffic/hookvm`，默认关闭）；支持 Opt-in SOCKS5（TCP/UDP）与 Linux 透明 TCP 代理；附带 Chrome 抓包扩展（`extension/`）与可选容器级 DNS 出网白名单（`egress-guard/` + `docker-compose.egress.yml`）。
+* **模型、可观测与运维扩展**：支持 7 种 LLM 协议共存（`openai`、`anthropic`、`openai-responses`、`gemini`、`jev`、`ollama`、`bedrock-gateway`）、任务级多 LLM 并发轮转（与运行中 Worker 并发热更新及 Worker 池并存）、`GET /api/ready` 就绪探针、全局公司视图切换、批量漏洞状态处置、资产范围通配符域名（`*.example.com`），以及可选的 Telegram 双向 Chat Bridge（企业模式下仅平台管理员可配置，与 `notify/enterprise.go` 脱敏通知彻底隔离）。
 
 ---
 
@@ -147,6 +153,31 @@ export ARTEX_TRAFFIC_STORE=pg
 | `ARTEX_TRAFFIC_STORE` | 流量索引后端：`sqlite`（单机默认）或 `pg`（分布式模式默认启用 PG + `BlobStore`） |
 | `ARTEX_S3_ENDPOINT` / `ARTEX_S3_BUCKET` / `ARTEX_S3_REGION` / `ARTEX_S3_ACCESS_KEY` / `ARTEX_S3_SECRET_KEY` | S3/MinIO 对象存储配置（全部配置时自动切换为 `S3Store`） |
 | `ARTEX_PARTITION_RETENTION_DAYS` | 分区保留天数（默认 `0` 不自动清理；设置正整数后 Leader 定期将过期分区归档至 `BlobStore` 并删除） |
+
+### 安全加固与 Opt-in 扩展环境变量（以下高影响开关均默认关闭）
+
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `ARTEX_BIND_ADDR` | `127.0.0.1` | Docker Compose 宿主机监听地址（远程访问需显式设为 `0.0.0.0`） |
+| `ARTEX_JWT_KEY_DIR` | 进程基目录 | `jwt.key` 与静态加密密钥 `secret.key` 存放目录（与工作区 `data/` 隔离） |
+| `ARTEX_SECRET_KEY` | 空 | 可选外部静态加密主密钥；为空时自动生成于 `ARTEX_JWT_KEY_DIR/secret.key` |
+| `ARTEX_TRUSTED_PROXIES` | 空 | 逗号分隔可信反代 CIDR/IP，仅来自可信代理的 `X-Forwarded-Proto: https` 会下发 HSTS |
+| `ARTEX_NOISE_PROFILE` | `off` | 目标噪音限速档位：`off` \| `quiet` \| `balanced` \| `aggressive`（可在设置页热切换） |
+| `ARTEX_TARGET_USER_AGENT` | 空 | 在启用噪音档位时覆盖缺省目标请求 `User-Agent` |
+| `ARTEX_TOOL_RAG` | 关闭 | 设为 `1` 启用按意图动态裁剪工具列表的 Tool RAG |
+| `ARTEX_TASK_BUDGET_TOKENS` / `ARTEX_TASK_BUDGET_TURNS` | `0`（不限） | 任务级层级 Token / 轮次预算上限（与企业项目配额独立互补） |
+| `ARTEX_INTENT_BUDGET_TOKENS` / `ARTEX_INTENT_BUDGET_TURNS` | `0`（不限） | 单意图层级 Token / 轮次预算上限 |
+| `ARTEX_TAMPER_HOOKS_ENABLED` | 关闭 | 设为 `1` 启用受限 Go 沙箱流量篡改 Hook（`traffic/hookvm`） |
+| `ARTEX_SOCKS5_ENABLED` / `ARTEX_SOCKS5_ADDR` | 关闭 / `127.0.0.1:1080` | 设为 `1` 启用回环 SOCKS5 入站代理与原始 TCP 流录制 |
+| `ARTEX_SOCKS5_UDP_ENABLED` | 关闭 | 设为 `1` 启用 SOCKS5 `UDP ASSOCIATE` 与原始 UDP 录制 |
+| `ARTEX_TRANSPARENT_TCP_ENABLED` / `ARTEX_TRANSPARENT_TCP_ADDR` | 关闭 / `127.0.0.1:1081` | Linux 专用，设为 `1` 启用透明 TCP 入站录制（需宿主机重定向规则） |
+| `ARTEX_CONTEXT_TELEMETRY` | 关闭 | 设为 `1` 记录脱敏后的每轮 LLM 上下文大小遥测至 `llm_context` 表 |
+| `ARTEX_CACHE_PREFIX` | 关闭 | 设为 `1` 启用 Worker System Prompt 静态/动态缓存前缀拆分 |
+
+### 升级与兼容注意事项
+* **单机首装 vs 企业 SSO**：`ARTEX_ENTERPRISE=1` 时跳过一次性 `setup_token`；单机全新部署初始化 `/setup` 需从服务端标准错误输出读取 `Setup token`。
+* **密钥迁移**：首次升级启动时若发现旧路径 `data/secret.key`，会自动迁移至 `ARTEX_JWT_KEY_DIR/secret.key` 并清理旧文件。
+* **数据库幂等升级**：所有新增表、列与索引均通过 `db/schema.sql` 幂等追加；`llm_profiles_format_check` 同时保留全部 7 种模型格式，既有按月分区与企业表不受影响。
 
 ---
 
