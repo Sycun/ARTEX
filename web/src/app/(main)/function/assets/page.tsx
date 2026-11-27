@@ -65,6 +65,7 @@ import { api } from "@/lib/api";
 import { parseCompanyScopeText } from "@/lib/company-scope";
 import type { Asset, Company, CompanyScopeRule } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useActiveCompanyID } from "@/stores/company/company-store";
 
 const METHOD_COLOR: Record<string, string> = {
   GET: "bg-emerald-100 text-emerald-700",
@@ -114,6 +115,7 @@ function AssetsContent() {
   const { ui, liveUI } = useUITranslation();
 
   const searchParams = useSearchParams();
+  const companyId = useActiveCompanyID();
   const requestedAsset = searchParams.get("asset") ?? "";
   const [assetTarget, setAssetTarget] = React.useState<{ id: number; type: string }>();
   const [assetTargetError, setAssetTargetError] = React.useState("");
@@ -276,7 +278,7 @@ function AssetsContent() {
   }, [tab, assetTarget]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: these controls intentionally reset server pagination.
-  React.useEffect(() => setPage(0), [tab, size, query]);
+  React.useEffect(() => setPage(0), [tab, size, query, companyId]);
 
   const dslMode = query.trim() !== "";
 
@@ -290,7 +292,9 @@ function AssetsContent() {
     const offset = page * size;
     const run = async () => {
       try {
-        const r = dsl ? await api.searchAssets(dsl, tab, size, offset) : await api.assets(tab, size, offset);
+        const r = dsl
+          ? await api.searchAssets(dsl, tab, size, offset, companyId)
+          : await api.assets(tab, size, offset, companyId);
         if (assetsRequestRef.current !== request) return;
         setRows(r.assets);
         setRowsTab(tab);
@@ -314,7 +318,7 @@ function AssetsContent() {
       clearTimeout(tid);
       if (assetsRequestRef.current === request) assetsRequestRef.current++;
     };
-  }, [tab, page, size, query, refreshKey]);
+  }, [tab, page, size, query, refreshKey, companyId]);
 
   React.useEffect(() => {
     if (tab === "company") return;

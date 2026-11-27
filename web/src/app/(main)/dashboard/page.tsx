@@ -46,6 +46,7 @@ import type {
   UsageStats,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useActiveCompany } from "@/stores/company/company-store";
 
 // ── chart constants ───────────────────────────────────────────────────────────
 
@@ -163,6 +164,7 @@ function SectionTitle({
 
 export default function DashboardPage() {
   const { t: translate } = useLiveTranslation();
+  const company = useActiveCompany();
   const dailyTrendConfig = {
     input: { label: translate("overview.input"), color: "hsl(217 91% 60%)" },
     output: { label: translate("overview.output"), color: "hsl(263 70% 60%)" },
@@ -253,7 +255,7 @@ export default function DashboardPage() {
       loading = true;
       try {
         const [findings, stats, settings, pending, activity, tokens, conversationTokens] = await Promise.all([
-          api.findings(),
+          api.findings(undefined, company),
           api.stats(),
           api.settings(),
           api.interceptPending(),
@@ -281,7 +283,7 @@ export default function DashboardPage() {
       alive = false;
       clearInterval(timer);
     };
-  }, []);
+  }, [company]);
 
   // slow poll: traffic, assets, system-static (every 15s)
   React.useEffect(() => {

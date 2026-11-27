@@ -55,7 +55,7 @@ export default function LoginPage() {
           auth.clearStoredToken();
           setSwitchReader(status.idp === "demo" && query.get("switch") === "reader");
           setEnterprise(status.idp_available ? "ready" : "down");
-          if (down && status.idp_available) setError("企业身份源暂不可用，请重试。");
+          if (down && status.idp_available) setError("auth.enterpriseIdpRetry");
           if (!down && auth.hasEnterpriseSession()) {
             try {
               await ent("/me");
@@ -133,15 +133,15 @@ export default function LoginPage() {
         <div className="w-full max-w-md space-y-10 py-24 lg:py-32">
           <div className="space-y-4 text-center">
             <h2 className="text-2xl font-medium tracking-tight">
-              {enterprise === "off" ? t("auth.login") : "使用企业账号登录"}
+              {enterprise === "off" ? t("auth.login") : t("auth.enterpriseLoginTitle")}
             </h2>
             <p className="mx-auto max-w-xl text-muted-foreground">
               {enterprise === "down"
-                ? "企业登录暂不可用，请等身份源恢复后再试。"
+                ? t("auth.enterpriseUnavailableDesc")
                 : enterprise === "ready"
                   ? switchReader
-                    ? "下一步会打开企业登录。请选择梁阅，身份是项目 A 只读审核。口令使用下一页已经填好的虚构口令。这是重新登录，不会沿用平台管理员的权限。"
-                    : "使用企业账号登录。员工进入原来的任务工作台，领导进入报告与结论，平台管理员进入管理后台。岗位由服务端认定。"
+                    ? t("auth.enterpriseSwitchReaderDesc")
+                    : t("auth.enterpriseReadyDesc")
                   : t("auth.welcome")}
             </p>
           </div>
@@ -149,7 +149,7 @@ export default function LoginPage() {
             <div className="flex flex-col gap-4">
               {enterprise === "down" ? (
                 <p className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-                  企业登录暂不可用
+                  {t("auth.enterpriseUnavailable")}
                 </p>
               ) : (
                 <Button
@@ -160,7 +160,7 @@ export default function LoginPage() {
                       : "/api/enterprise/login";
                   }}
                 >
-                  使用企业账号登录
+                  {t("auth.enterpriseLoginTitle")}
                 </Button>
               )}
               {error && <p className="text-sm text-destructive">{t(error)}</p>}

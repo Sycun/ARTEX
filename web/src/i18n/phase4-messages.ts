@@ -74,4 +74,22 @@ export const phase4Messages = {
   "chatBridge.tested": ["连接成功", "Connection succeeded"],
   "chatBridge.failed": ["操作失败：{{error}}", "Request failed: {{error}}"],
   "chatBridge.state": ["状态", "State"],
+  "auth.enterpriseLoginTitle": ["使用企业账号登录", "Sign in with enterprise SSO"],
+  "auth.enterpriseUnavailable": ["企业登录暂不可用", "Enterprise SSO is currently unavailable"],
+  "auth.enterpriseUnavailableDesc": [
+    "企业登录暂不可用，请等身份源恢复后再试。",
+    "Enterprise SSO is currently unavailable. Try again after the identity provider recovers.",
+  ],
+  "auth.enterpriseIdpRetry": [
+    "企业身份源暂不可用，请重试。",
+    "Enterprise identity provider is unavailable. Please try again.",
+  ],
+  "auth.enterpriseSwitchReaderDesc": [
+    "下一步会打开企业登录。请选择梁阅，身份是项目 A 只读审核。口令使用下一页已经填好的虚构口令。这是重新登录，不会沿用平台管理员的权限。",
+    "Next, enterprise sign-in will open. Select the read-only project reviewer account with the prefilled demo password on the next page. This starts a fresh session without inheriting platform administrator permissions.",
+  ],
+  "auth.enterpriseReadyDesc": [
+    "使用企业账号登录。员工进入原来的任务工作台，领导进入报告与结论，平台管理员进入管理后台。岗位由服务端认定。",
+    "Sign in with your enterprise account. Analysts enter the task workbench, leaders enter reports and conclusions, and platform administrators enter the admin console. Roles are determined by the server.",
+  ],
 } as const;

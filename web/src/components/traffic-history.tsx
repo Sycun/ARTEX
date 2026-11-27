@@ -55,6 +55,7 @@ import { api } from "@/lib/api";
 import { useStoredSortPreference } from "@/lib/sort-preference";
 import type { TrafficDetail, TrafficExchange, TrafficHost, TrafficResp } from "@/lib/types";
 import { cn, copyText } from "@/lib/utils";
+import { useActiveCompanyID } from "@/stores/company/company-store";
 
 function fmtTime(ts: string, ui: UITranslate) {
   return new Date(ts).toLocaleString(ui("screen.91610255157661"), {
@@ -148,8 +149,10 @@ const STATUS_BUCKETS = ["2xx", "3xx", "4xx", "5xx"];
 
 export function TrafficHistory({ taskId }: { taskId?: string }) {
   const { ui, liveUI } = useUITranslation();
+  const activeCompanyId = useActiveCompanyID();
 
   const taskScoped = Boolean(taskId);
+  const companyId = taskScoped ? null : activeCompanyId;
   const [selectedFlows, setSelectedFlows] = React.useState<Map<string, TrafficExchange>>(() => new Map());
   const router = useRouter();
   const [importing, setImporting] = React.useState(false);
@@ -237,7 +240,7 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values intentionally trigger a page reset.
   React.useEffect(() => {
     setPage(0);
-  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, taskId, rewritten]);
+  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, taskId, rewritten, companyId]);
 
   // Load the current page. Auto-refresh only on page 0 (newest) so paging back
   // through history isn't yanked out from under the user.
@@ -256,6 +259,7 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
           respMax: respMaxQ,
           sort: sort.field,
           order: sort.direction,
+          company: companyId,
         })
         .then((r) => {
           if (alive) setTraffic(r);
@@ -301,6 +305,7 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
     reloadTick,
     taskId,
     taskScoped,
+    companyId,
   ]);
 
   // Delete traffic for the current host filter (substring) or the checked

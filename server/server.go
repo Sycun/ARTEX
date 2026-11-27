@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1464,8 +1465,13 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	metrics, _ := s.m.PG().TaskListMetricsAll()
 	distinct, _ := s.m.pg.DistinctFindingStatsByTask()
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
+	companyParam := strings.TrimSpace(r.URL.Query().Get("company"))
+	companyID, companyErr := strconv.ParseInt(companyParam, 10, 64)
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
+		if companyParam != "" && (companyErr != nil || !slices.Contains(t.lifecycleSnapshot().CompanyIDs, companyID)) {
+			continue
+		}
 		dto := taskDTO(t, s.resolvedTaskStatus(t))
 		dto.WorkerActualCount, dto.WorkerTargetCount = s.engine.WorkerCounts(t)
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
@@ -2558,7 +2564,12 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		// 带 page/limit → 服务端分页 {items,total,...}；不带 → 裸数组（dashboard 汇总用，
 		// 与 intents 端点的兼容策略一致）。筛选/排序统一下推到 SQL。
 		if q.Get("page") == "" && q.Get("limit") == "" {
-			fs, _ := s.m.pg.ListFindings(500)
+			var fs []*db.DBFinding
+			if f := findingFilterFromQuery(q); f.Company != "" || f.Severity != "" || f.Status != "" || f.VulnClass != "" || f.Query != "" || f.AssetScope != "" {
+				fs, _, _ = s.m.pg.ListFindingsPage(f, 1, 500)
+			} else {
+				fs, _ = s.m.pg.ListFindings(500)
+			}
 			assets := s.resolveFindingAssets(fs)
 			out := make([]FindingDTO, 0, len(fs))
 			for _, f := range fs {
@@ -4048,6 +4059,29 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 			"total": 0, "page": page, "size": size, "exchanges": []any{},
 		})
 		return
+	}
+	if !taskScoped {
+		if companyParam := strings.TrimSpace(q.Get("company")); companyParam != "" {
+			companyID, cerr := strconv.ParseInt(companyParam, 10, 64)
+			var companyHosts []string
+			if cerr == nil && companyID > 0 {
+				var herr error
+				companyHosts, herr = s.companyHosts(companyID)
+				if herr != nil {
+					writeErr(w, http.StatusInternalServerError, herr.Error())
+					return
+				}
+			}
+			if len(companyHosts) == 0 {
+				count, _ := tr.Count()
+				writeJSON(w, 200, map[string]any{
+					"enabled": s.m.TrafficEnabled(), "proxy": s.m.ProxyAddr(), "count": count,
+					"total": 0, "page": page, "size": size, "exchanges": []any{},
+				})
+				return
+			}
+			taskHosts = companyHosts
+		}
 	}
 	pageQuery := traffic.PageQuery{
 		Hosts:     taskHosts,

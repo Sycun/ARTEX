@@ -26,3 +26,7 @@ export function useActiveCompany(): string | undefined {
   const companyId = useCompanyStore((s) => s.companyId);
   return companyId === null ? undefined : String(companyId);
 }
+
+export function useActiveCompanyID(): number | null {
+  return useCompanyStore((s) => s.companyId);
+}

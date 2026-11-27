@@ -89,7 +89,11 @@ function visible(html) {
 // replaced. They validate rendering, not browser clicks or post-fetch behavior.
 test("all main pages render English fixed labels and switch back", async () => {
   const main = base + "/src/app/(main)";
-  const files = fs.readdirSync(main, { recursive: true }).filter((f) => f.endsWith("page.tsx"));
+  // The enterprise workbench subtree (/enterprise/**) is a standalone Chinese-only
+  // enterprise edition module, separate from the bilingual ARTEX console pages.
+  const files = fs
+    .readdirSync(main, { recursive: true })
+    .filter((f) => f.endsWith("page.tsx") && !f.startsWith("enterprise/") && !f.startsWith("enterprise\\"));
   assert.ok(files.length >= 27);
   for (const f of files) {
     route = "/" + f.replace("/page.tsx", "");
@@ -316,6 +320,7 @@ test("every fixed UI key resolves and English resources contain no untranslated 
   for (const dir of ["app", "components"])
     for (const relative of fs.readdirSync(base + "/src/" + dir, { recursive: true })) {
       if (!relative.endsWith(".tsx")) continue;
+      if (/(^|[\\/])enterprise([\\/]|$)/.test(relative)) continue;
       const file = base + "/src/" + dir + "/" + relative;
       const source = fs.readFileSync(file, "utf8");
       const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
