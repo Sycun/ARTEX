@@ -23,6 +23,7 @@ import (
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/traffic/rewrite"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -287,6 +288,13 @@ type Manager struct {
 	traffic          *traffic.Traffic       // process-wide recording proxy (may be nil)
 	enrich           *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor      *intercept.Interceptor // user-configured tool-call interception rules
+
+	rewriteMu     sync.Mutex
+	rewriteSet    atomic.Pointer[rewrite.Set]
+	rewriteErrors rewrite.ErrorLog
+	hookMu        sync.Mutex
+	hookSet       atomic.Pointer[traffic.HookSet]
+	hookLoadErrs  map[int64]string
 
 	companyMu sync.Mutex // serializes task/company-scope commits with live handle registration
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
@@ -640,6 +648,10 @@ func newManager(dir, proxyAddr, mode string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := pg.InitSecrets(dir); err != nil {
+		pg.Close()
+		return nil, fmt.Errorf("init secrets: %w", err)
+	}
 	egress.SetProfile(startupNoiseProfile(pg))
 	backend, err := traffic.Backend(mode)
 	if err != nil {
@@ -714,6 +726,22 @@ func newManager(dir, proxyAddr, mode string) (*Manager, error) {
 		}
 		if tr != nil {
 			m.traffic = tr
+			m.reloadRewriteRules()
+			m.reloadTamperHooks()
+			if scfg, ok := traffic.SOCKS5ConfigFromEnv(); ok {
+				if bound, serr := tr.StartSOCKS5(scfg); serr != nil {
+					log.Printf("[traffic] SOCKS5 未启动: %v", serr)
+				} else {
+					log.Printf("[traffic] SOCKS5 on %s udp=%v", bound, tr.SOCKS5UDPEnabled())
+				}
+			}
+			if tcfg, ok := traffic.TransparentTCPConfigFromEnv(); ok {
+				if bound, terr := tr.StartTransparentTCP(tcfg); terr != nil {
+					log.Printf("[traffic] 透明 TCP 代理未启动: %v", terr)
+				} else {
+					log.Printf("[traffic] transparent TCP on %s", bound)
+				}
+			}
 			go func() {
 				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
 				if err := tr.Start(); err != nil {

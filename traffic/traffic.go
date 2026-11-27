@@ -35,6 +35,8 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
 	_ "modernc.org/sqlite"
+
+	"github.com/Autumn-27/artex/traffic/rewrite"
 )
 
 const indexSchema = `
@@ -51,7 +53,9 @@ CREATE TABLE IF NOT EXISTS exchanges (
   resp_len     INTEGER,
   path         TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_ex_host ON exchanges(host);
+-- Replaces idx_ex_host(host): host lists skip the ts sort and Hosts() reads only the index.
+CREATE INDEX IF NOT EXISTS idx_ex_host_ts ON exchanges(host, ts);
+DROP INDEX IF EXISTS idx_ex_host;
 CREATE INDEX IF NOT EXISTS idx_ex_tmpl ON exchanges(host, url_template);
 CREATE INDEX IF NOT EXISTS idx_ex_ts   ON exchanges(ts);
 CREATE INDEX IF NOT EXISTS idx_ex_status ON exchanges(status);
@@ -73,6 +77,83 @@ CREATE TABLE IF NOT EXISTS blob_refs (
   PRIMARY KEY (hash, exchange_id)
 );
 CREATE INDEX IF NOT EXISTS idx_blob_refs_ex ON blob_refs(exchange_id);
+
+-- WebSocket messages and SSE events of a stream exchange, in arrival order.
+CREATE TABLE IF NOT EXISTS stream_messages (
+  exchange_id  TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  ts           INTEGER NOT NULL,
+  direction    TEXT NOT NULL,
+  kind         INTEGER NOT NULL,
+  event        TEXT NOT NULL DEFAULT '',
+  event_id     TEXT NOT NULL DEFAULT '',
+  retry        INTEGER NOT NULL DEFAULT 0,
+  size         INTEGER NOT NULL,
+  payload      BLOB,
+  payload_blob TEXT,
+  truncated    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (exchange_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_stream_messages_ex ON stream_messages(exchange_id, seq);
+
+-- Rewrite-rule trace. An exchange is rewritten when it has an 'applied' row.
+CREATE TABLE IF NOT EXISTS exchange_rewrites (
+  exchange_id   TEXT NOT NULL,
+  seq           INTEGER NOT NULL,
+  phase         TEXT NOT NULL,
+  source_kind   TEXT NOT NULL DEFAULT 'rule',
+  rule_id       INTEGER,
+  hook_id       INTEGER,
+  hook_version  INTEGER,
+  rule_snapshot TEXT,
+  action        TEXT,
+  field         TEXT,
+  outcome       TEXT NOT NULL,
+  reason        TEXT NOT NULL DEFAULT '',
+  before_hash   TEXT,
+  after_hash    TEXT,
+  after_inline  BLOB,
+  after_blob    TEXT,
+  PRIMARY KEY (exchange_id, seq)
+);
+
+-- Raw TCP streams relayed through the opt-in SOCKS5 CONNECT listener.
+-- Stored separately from HTTP exchanges.
+CREATE TABLE IF NOT EXISTS raw_tcp_streams (
+  id          TEXT PRIMARY KEY,
+  protocol    TEXT NOT NULL DEFAULT 'tcp',
+  host        TEXT NOT NULL,
+  port        INTEGER NOT NULL,
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  c2s_bytes   INTEGER NOT NULL DEFAULT 0,
+  s2c_bytes   INTEGER NOT NULL DEFAULT 0,
+  truncated   INTEGER NOT NULL DEFAULT 0,
+  c2s_preview BLOB,
+  c2s_blob    TEXT,
+  s2c_preview BLOB,
+  s2c_blob    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_tcp_host    ON raw_tcp_streams(host);
+CREATE INDEX IF NOT EXISTS idx_raw_tcp_started ON raw_tcp_streams(started_at DESC, id DESC);
+
+-- Raw UDP datagrams relayed through opt-in SOCKS5 UDP ASSOCIATE.
+CREATE TABLE IF NOT EXISTS raw_udp_datagrams (
+  id             TEXT PRIMARY KEY,
+  association_id TEXT NOT NULL,
+  protocol       TEXT NOT NULL DEFAULT 'udp',
+  host           TEXT NOT NULL,
+  port           INTEGER NOT NULL,
+  direction      TEXT NOT NULL,
+  ts             INTEGER NOT NULL,
+  size           INTEGER NOT NULL DEFAULT 0,
+  preview        BLOB,
+  blob           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_assoc ON raw_udp_datagrams(association_id, ts);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_host  ON raw_udp_datagrams(host);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_ts    ON raw_udp_datagrams(ts DESC, id DESC);
 `
 
 // ftsSchema is applied separately from indexSchema: a driver build without FTS5
@@ -90,6 +171,11 @@ const (
 	// maxInlineBody is the cutoff between a body stored inline (SQLite column) and
 	// one spilled to the content-addressed blob store.
 	maxInlineBody = 256 * 1024
+	// maxStreamPayload is how much of one WebSocket message or SSE event is kept.
+	maxStreamPayload = 1024 * 1024
+	// maxStreamMessages and maxStreamBytes bound one stream exchange.
+	maxStreamMessages = 10000
+	maxStreamBytes    = 32 * 1024 * 1024
 	// blobPreview is how much of a spilled body stays inline so readers can tell
 	// what it is (JSON shape, SQL dump header, ZIP magic) without fetching it.
 	blobPreview = 8 * 1024
@@ -164,7 +250,7 @@ type Traffic struct {
 	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
 	// reason; connections to them are tunneled transparently (fail-open) so the
 	// request still reaches the target — unrecorded — instead of being killed.
-	pass sync.Map // hostname(string) -> struct{}
+	pass sync.Map // hostname(string) -> time.Time (passthrough expiry)
 	// upstream is the global egress proxy every captured request is forwarded
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
@@ -174,6 +260,21 @@ type Traffic struct {
 	upstreamFailure func(error)
 	// index replaces the sidecar SQLite index when set (PostgreSQL + BlobStore).
 	index IndexStore
+	// ftsq writes the full-text index off the request path. Nil when fts is off.
+	ftsq *ftsQueue
+	// pass values are expiry times. After passthroughTTL, interception is tried again.
+	// rewriteRules is the compiled snapshot applied by the sink.
+	rewriteRules atomic.Pointer[rewrite.Set]
+	// tamperHooks is nil unless ARTEX_TAMPER_HOOKS_ENABLED is on and hooks are loaded.
+	tamperHooks atomic.Pointer[HookSet]
+	// snaps keeps the original of each rewritten request until its exchange is recorded.
+	snaps *snapTable
+	// sweeping tracks the snapshot sweeper until Close.
+	sweeping      sync.WaitGroup
+	socksMu       sync.Mutex
+	socks         *socks5Server
+	transparentMu sync.Mutex
+	transparent   *transparentServer
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
@@ -204,10 +305,14 @@ func Open(dir, addr string) (*Traffic, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{})}
+	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{}), snaps: newSnapTable()}
 	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if t.fts {
+		t.ftsq = newFTSQueue(t)
+		t.ftsq.resume()
 	}
 
 	p, err := mproxy.NewProxy(&mproxy.Options{
@@ -218,6 +323,11 @@ func Open(dir, addr string) (*Traffic, error) {
 	if err != nil {
 		db.Close()
 		return nil, err
+	}
+	// The CA private key is process-local. The certificate beside it stays readable.
+	if err := os.Chmod(filepath.Join(dir, "_ca", "mitmproxy-ca.pem"), 0o600); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("restrict the MITM CA key: %w", err)
 	}
 	// Upstream selection. By default (no global egress proxy set) targets are
 	// dialed DIRECTLY: go-mitmproxy's own default upstream uses
@@ -232,11 +342,11 @@ func Open(dir, addr string) (*Traffic, error) {
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
 	p.SetShouldInterceptRule(func(req *http.Request) bool {
-		_, tunnel := t.pass.Load(hostOnly(req.Host))
-		return !tunnel
+		return !t.tunneling(hostOnly(req.Host))
 	})
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
+	t.sweeping.Go(t.sweepSnapshots)
 	return t, nil
 }
 
@@ -292,12 +402,106 @@ func (t *Traffic) initIndex() error {
 	if _, err := conn.ExecContext(ctx, indexSchema); err != nil {
 		return err
 	}
+	if err := ensureExchangeRewritesHookColumns(ctx, conn); err != nil {
+		return err
+	}
 	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
 		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
 		return nil
 	}
+	if _, err := conn.ExecContext(ctx, ftsPendingSchema); err != nil {
+		return err
+	}
 	t.fts = true
 	return nil
+}
+
+// SetTamperHooks atomically swaps the compiled tampering-hook snapshot.
+// Passing nil disables hook execution.
+func (t *Traffic) SetTamperHooks(hs *HookSet) {
+	if t == nil {
+		return
+	}
+	t.tamperHooks.Store(hs)
+}
+
+// TamperHooks returns the currently active HookSet, or nil when disabled.
+func (t *Traffic) TamperHooks() *HookSet {
+	if t == nil {
+		return nil
+	}
+	return t.tamperHooks.Load()
+}
+
+func ensureExchangeRewritesHookColumns(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `PRAGMA table_info(exchange_rewrites)`)
+	if err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range []struct{ name, ddl string }{
+		{"source_kind", `ALTER TABLE exchange_rewrites ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'rule'`},
+		{"hook_id", `ALTER TABLE exchange_rewrites ADD COLUMN hook_id INTEGER`},
+		{"hook_version", `ALTER TABLE exchange_rewrites ADD COLUMN hook_version INTEGER`},
+	} {
+		if existing[col.name] {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, col.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetRewriteRules publishes a compiled snapshot of the rewrite rules.
+// The swap is atomic; nil clears the rules.
+func (t *Traffic) SetRewriteRules(s *rewrite.Set) {
+	if t == nil {
+		return
+	}
+	t.rewriteRules.Store(s)
+}
+
+// RewriteRules returns the snapshot last published, nil when there is none.
+func (t *Traffic) RewriteRules() *rewrite.Set {
+	if t == nil {
+		return nil
+	}
+	return t.rewriteRules.Load()
+}
+
+// passthroughTTL is how long a host stays tunneled after a proxy-caused MITM failure.
+const passthroughTTL = time.Minute
+
+// tunneling reports whether host is inside an unexpired passthrough mark.
+func (t *Traffic) tunneling(host string) bool {
+	v, ok := t.pass.Load(host)
+	if !ok {
+		return false
+	}
+	until, ok := v.(time.Time)
+	if !ok || !time.Now().Before(until) {
+		t.pass.CompareAndDelete(host, v)
+		return false
+	}
+	return true
 }
 
 // hostOnly strips an optional :port, so passthrough keys match whether the host
@@ -405,7 +609,25 @@ func (t *Traffic) Close() error {
 	if t.closed != nil {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
+	t.socksMu.Lock()
+	srv := t.socks
+	t.socks = nil
+	t.socksMu.Unlock()
+	if srv != nil {
+		_ = srv.Close()
+	}
+	t.transparentMu.Lock()
+	tsrv := t.transparent
+	t.transparent = nil
+	t.transparentMu.Unlock()
+	if tsrv != nil {
+		_ = tsrv.Close()
+	}
 	t.reaping.Wait()
+	t.sweeping.Wait()
+	if t.ftsq != nil {
+		t.ftsq.close()
+	}
 	return t.db.Close()
 }
 
@@ -432,40 +654,14 @@ func (t *Traffic) Store() IndexStore {
 	return NewSQLiteStore(t.db, t.dir)
 }
 
-// sink is the go-mitmproxy addon that records completed exchanges.
+// sink is the go-mitmproxy addon that records completed exchanges and paces
+// connections marked with the artex-pace proxy credential (pace.go).
 type sink struct {
 	mproxy.BaseAddon
-	t *Traffic
-}
-
-// Preserve an absent User-Agent when go-mitmproxy creates its outbound Go
-// request. An explicit empty value suppresses net/http's automatic default.
-func (s *sink) Requestheaders(f *mproxy.Flow) {
-	if f.Request == nil {
-		return
-	}
-	if f.Request.Header == nil {
-		f.Request.Header = make(http.Header)
-	}
-	if _, present := f.Request.Header["User-Agent"]; !present {
-		f.Request.Header.Set("User-Agent", "")
-	}
-}
-
-func (s *sink) Response(f *mproxy.Flow) {
-	if f.Request == nil || f.Response == nil {
-		return
-	}
-	s.t.record(f)
-}
-
-// RequestError fires when a request through an established MITM tunnel fails. If
-// the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
-// errors) — not a plain target-unreachable error — we flag the host for
-// transparent passthrough so future requests to it succeed instead of dying.
-func (s *sink) RequestError(f *mproxy.Flow, err error) {
-	s.t.reportUpstreamFailure(err)
-	s.t.maybePassthrough(f, err)
+	t       *Traffic
+	paced   sync.Map // ClientConn.Id -> struct{}
+	streams sync.Map // *mproxy.Flow -> *streamState
+	bypass  sync.Map // flowKey -> struct{}
 }
 
 func (s *sink) HTTPConnectError(_ *mproxy.Flow, err error) {
@@ -483,8 +679,12 @@ func (t *Traffic) maybePassthrough(f *mproxy.Flow, err error) {
 	if host == "" {
 		return
 	}
-	if _, loaded := t.pass.LoadOrStore(host, struct{}{}); !loaded {
-		log.Printf("[traffic] 与 %s 的 MITM 出错，改为透传（该 host 后续直连目标、不再记录，但请求照常）：%v", host, err)
+	if t.tunneling(host) {
+		return
+	}
+	until := time.Now().Add(passthroughTTL)
+	if _, loaded := t.pass.LoadOrStore(host, until); !loaded {
+		log.Printf("[traffic] 与 %s 的 MITM 出错，改为透传（%s 内直连目标、不再记录，但请求照常）：%v", host, passthroughTTL, err)
 	}
 }
 
@@ -500,87 +700,14 @@ func proxyCausedErr(err error) bool {
 	return false
 }
 
-// record persists one exchange entirely in SQLite: metadata, bodies and the
-// full-text index. Nothing is written to a per-request directory — only bodies
-// above maxInlineBody spill to the content-addressed blob store.
+// record persists one exchange. The PostgreSQL index, when configured, is the
+// distributed store. Otherwise the sidecar SQLite index is written and its
+// full-text row is queued for the background indexer.
 func (t *Traffic) record(f *mproxy.Flow) {
-	if t.index != nil {
-		t.recordToIndex(f)
+	if f == nil || f.Request == nil || f.Response == nil {
 		return
 	}
-	// The write lock covers blob + index writes, so DeleteHost (and its blob GC)
-	// can run under the same lock without racing a concurrent record.
-	t.wmu.Lock()
-	defer t.wmu.Unlock()
-	host := f.Request.URL.Hostname()
-	method := f.Request.Method
-	tmpl := db.TemplatePath(f.Request.URL.EscapedPath())
-	n := t.seq.Add(1)
-	now := time.Now()
-	id := fmt.Sprintf("%d-%04d", now.Unix(), n%10000)
-
-	ct := f.Response.Header.Get("Content-Type")
-	url := f.Request.URL.String()
-	reqHead := fmt.Sprintf("%s %s %s\n%s", method, f.Request.URL.RequestURI(), f.Request.Proto, requestHeaderLines(f.Request))
-	respHead := fmt.Sprintf("HTTP %d\n%s", f.Response.StatusCode, headerLines(f.Response.Header))
-	// Bodies are spilled before the transaction opens: blob writes are filesystem
-	// work and must not sit inside the SQLite write lock.
-	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
-	respB := t.spill(f.Response.Body, ct)
-
-	tx, err := t.db.Begin()
-	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（开启事务）：%v", url, err)
-		return
-	}
-	defer tx.Rollback() //nolint:errcheck // no-op once committed
-
-	// path stays empty for db-resident exchanges; a non-empty path marks a legacy
-	// row whose bodies still live in the old on-disk tree (see Get).
-	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
-VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
-		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
-	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", url, err)
-		return
-	}
-	rowid, err := res.LastInsertId()
-	if err != nil {
-		log.Printf("[traffic] 记录 %s 失败（取 rowid）：%v", url, err)
-		return
-	}
-
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO exchange_bodies(id,req_head,req_body,req_blob,resp_head,resp_body,resp_blob)
-VALUES(?,?,?,?,?,?,?)`,
-		id, reqHead, reqB.inline, nullIfEmpty(reqB.hash), respHead, respB.inline, nullIfEmpty(respB.hash)); err != nil {
-		log.Printf("[traffic] 记录 %s 失败（写正文）：%v", url, err)
-		return
-	}
-
-	for _, h := range []string{reqB.hash, respB.hash} {
-		if h == "" {
-			continue
-		}
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO blob_refs(hash,exchange_id) VALUES(?,?)`, h, id); err != nil {
-			log.Printf("[traffic] 记录 %s 失败（登记 blob 引用）：%v", url, err)
-			return
-		}
-	}
-
-	if t.fts {
-		// The index is fed from memory, so a body that spilled to _blobs is still
-		// fully searchable even though only its preview is stored inline.
-		idx := strings.Join([]string{url, reqHead, reqB.index, respHead, respB.index}, "\n")
-		if _, err := tx.Exec(`INSERT INTO ex_fts(rowid,content) VALUES(?,?)`, rowid, idx); err != nil {
-			log.Printf("[traffic] 记录 %s 失败（写全文索引）：%v", url, err)
-			return
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		log.Printf("[traffic] 记录 %s 失败（提交）：%v", url, err)
-	}
+	t.recordViews(flowRequestView(f.Request), flowResponseView(f.Response), nil)
 }
 
 func (t *Traffic) recordToIndex(f *mproxy.Flow) {
@@ -611,7 +738,7 @@ func (t *Traffic) recordToIndex(f *mproxy.Flow) {
 func (t *Traffic) pageIndex(f PageQuery, page, size int) ([]ExchangeMeta, int, error) {
 	rows, total, err := t.index.ListExchanges(context.Background(), ListQuery{
 		Host: f.Host, HostLike: true, Hosts: f.Hosts, Method: f.Method, Path: f.Path,
-		Query: f.Query, Body: f.Body, Status: f.Status,
+		Query: f.Query, Body: f.Body, Status: f.Status, Rewritten: f.Rewritten,
 		RespMin: f.RespMin, RespMax: f.RespMax, Sort: f.Sort, Order: f.Order,
 		Page: page, Size: size,
 	})
@@ -681,6 +808,11 @@ func tightenBlobPerms(root string) {
 // are handed to the full-text index in full (up to maxIndexBody) — indexing is
 // independent of where the bytes end up.
 func (t *Traffic) spill(body []byte, contentType string) storedBody {
+	return t.spillAt(body, contentType, maxInlineBody)
+}
+
+// spillAt is spill with an explicit inline threshold. Stream payloads use a lower one.
+func (t *Traffic) spillAt(body []byte, contentType string, maxInline int) storedBody {
 	if len(body) == 0 {
 		return storedBody{}
 	}
@@ -691,7 +823,7 @@ func (t *Traffic) spill(body []byte, contentType string) storedBody {
 		}
 		return string(clipBytes(body, maxIndexBody))
 	}
-	if len(body) <= maxInlineBody {
+	if len(body) <= maxInline {
 		return storedBody{inline: body, index: indexText()}
 	}
 
@@ -814,23 +946,15 @@ func headerLines(h map[string][]string) string {
 // Request.Host rather than in Header. Keeping it in request.http makes the raw
 // capture complete and directly replayable.
 func requestHeaderLines(req *mproxy.Request) string {
-	headers := req.Header.Clone()
-	headers.Del("Host")
-	if headers.Get("User-Agent") == "" {
-		headers.Del("User-Agent") // Empty suppression value is not sent on the wire.
+	if req == nil {
+		return ""
 	}
-	host := req.URL.Host
-	if raw := req.Raw(); raw != nil && strings.TrimSpace(raw.Host) != "" {
-		host = raw.Host
+	v := flowRequestView(req)
+	host := ""
+	if req.URL != nil {
+		host = req.URL.Host
 	}
-	var b strings.Builder
-	if host = strings.TrimSpace(host); host != "" {
-		b.WriteString("Host: ")
-		b.WriteString(host)
-		b.WriteByte('\n')
-	}
-	b.WriteString(headerLines(headers))
-	return b.String()
+	return requestHeaderLinesOf(v.header, host, v.rawHost)
 }
 
 func sanitize(s string) string {
@@ -897,14 +1021,9 @@ func (t *Traffic) BlobRange(hash string, offset, length int64) (data []byte, tot
 		return nil, 0, err
 	}
 	defer f.Close()
-	if offset < 0 {
-		offset = 0
-	}
-	if offset >= size {
+	offset, length, empty := clampBlobRange(offset, length, size)
+	if empty {
 		return nil, size, nil
-	}
-	if length <= 0 || offset+length > size {
-		length = size - offset
 	}
 	buf := make([]byte, length)
 	n, err := f.ReadAt(buf, offset)
@@ -926,7 +1045,10 @@ type ExchangeMeta struct {
 	ContentType string `json:"content_type"`
 	RespLen     int    `json:"resp_len"`
 	Path        string `json:"path"`
+	Rewritten   bool   `json:"rewritten"`
 }
+
+const rewrittenExistsSQL = `EXISTS(SELECT 1 FROM exchange_rewrites r WHERE r.exchange_id=exchanges.id AND r.outcome='applied')`
 
 // Search returns paged exchange metadata (never bodies).
 func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
@@ -937,7 +1059,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 		rows, _, err := t.index.ListExchanges(context.Background(), ListQuery{Host: host, Page: page, Size: size, RespMin: -1, RespMax: -1})
 		return rows, err
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges`
+	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,` + rewrittenExistsSQL + ` FROM exchanges`
 	args := []any{}
 	if host != "" {
 		q += ` WHERE host=?`
@@ -953,7 +1075,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.Rewritten); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -970,6 +1092,9 @@ func (t *Traffic) ftsFilter(term string) (cond string, arg any, ok bool) {
 	if !t.fts || utf8.RuneCountInString(term) < minTrigram {
 		return "", nil, false
 	}
+	if t.ftsq != nil {
+		t.ftsq.wait()
+	}
 	return `rowid IN (SELECT rowid FROM ex_fts WHERE ex_fts MATCH ?)`, ftsQuote(term), true
 }
 
@@ -985,17 +1110,35 @@ func ftsQuote(s string) string {
 // of -1 skip the response-size bounds. An empty Sort/Order defaults to
 // newest-first by timestamp.
 type PageQuery struct {
-	Host    string   // host substring
-	Hosts   []string // task-scoped host candidates (exact host or host:port)
-	Method  string   // exact method (case-insensitive)
-	Query   string   // broad search box: metadata columns OR captured text
-	Body    string   // content box: captured request/response text only (full-text)
-	Path    string   // url_template substring — the vulnerability's path
-	Status  string   // exact code ("404") or class bucket ("4xx")
-	RespMin int64    // minimum resp_len, or -1 when unset
-	RespMax int64    // maximum resp_len, or -1 when unset
-	Sort    string   // ts | status | resp_len (default ts)
-	Order   string   // asc | desc (default desc)
+	Host      string   // host substring
+	Hosts     []string // task-scoped host candidates (exact host or host:port)
+	Method    string   // exact method (case-insensitive)
+	Query     string   // broad search box: metadata columns OR captured text
+	Body      string   // content box: captured request/response text only (full-text)
+	Path      string   // url_template substring — the vulnerability's path
+	Status    string   // exact code ("404") or class bucket ("4xx")
+	Rewritten string   // all (default) | rewritten | original
+	RespMin   int64    // minimum resp_len, or -1 when unset
+	RespMax   int64    // maximum resp_len, or -1 when unset
+	Sort      string   // ts | status | resp_len (default ts)
+	Order     string   // asc | desc (default desc)
+}
+
+const (
+	RewriteFilterAll       = "all"
+	RewriteFilterRewritten = "rewritten"
+	RewriteFilterOriginal  = "original"
+)
+
+func rewriteFilterSQL(s string) (cond string, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case RewriteFilterRewritten, "true", "1":
+		return rewrittenExistsSQL, true
+	case RewriteFilterOriginal, "false", "0":
+		return "NOT " + rewrittenExistsSQL, true
+	default:
+		return "", false
+	}
 }
 
 // hostScopeClause limits traffic to the hosts attached to a task. Captures
@@ -1061,18 +1204,9 @@ func statusFilter(s string) (cond string, args []any, ok bool) {
 // Body narrows to exchanges whose captured text matches, via that same index.
 // Also returns the total number of rows matching the filter (for the UI's
 // pagination). Bodies are never included in the rows.
-func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
-	if t.index != nil {
-		return t.pageIndex(f, page, size)
-	}
-	if size <= 0 || size > 500 {
-		size = 100
-	}
-	if page < 0 {
-		page = 0
-	}
-	where := ""
-	var args []any
+// pageWhere builds the SQL WHERE clause shared by Page and ExportHAR.
+// Hosts keeps the task-scope matcher (exact host or host:port), not a raw IN list.
+func (t *Traffic) pageWhere(f PageQuery) (where string, args []any) {
 	add := func(cond string, vs ...any) {
 		if where == "" {
 			where = " WHERE "
@@ -1097,6 +1231,9 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	if cond, sargs, ok := statusFilter(f.Status); ok {
 		add(cond, sargs...)
 	}
+	if cond, ok := rewriteFilterSQL(f.Rewritten); ok {
+		add(cond)
+	}
 	if f.RespMin >= 0 {
 		add("resp_len>=?", f.RespMin)
 	}
@@ -1106,23 +1243,31 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	if s := strings.TrimSpace(f.Query); s != "" {
 		like := "%" + s + "%"
 		const meta = "id LIKE ? OR host LIKE ? OR url LIKE ? OR url_template LIKE ? OR method LIKE ? OR content_type LIKE ? OR CAST(status AS TEXT) LIKE ?"
-		// Metadata match OR full-text match: one search box, widest recall. Terms
-		// too short for trigram silently fall back to metadata only.
 		if cond, arg, ok := t.ftsFilter(s); ok {
 			add("(("+meta+") OR "+cond+")", like, like, like, like, like, like, like, arg)
 		} else {
 			add("("+meta+")", like, like, like, like, like, like, like)
 		}
 	}
-	// Body is the dedicated content box: it only searches captured request/response
-	// text, so it goes straight to the full-text index with no metadata fallback. A
-	// term too short for the trigram tokenizer cannot be served and is skipped
-	// rather than guessed at — the UI hints at the three-character minimum.
 	if b := strings.TrimSpace(f.Body); b != "" {
 		if cond, arg, ok := t.ftsFilter(b); ok {
 			add(cond, arg)
 		}
 	}
+	return where, args
+}
+
+func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total int, err error) {
+	if t.index != nil {
+		return t.pageIndex(f, page, size)
+	}
+	if size <= 0 || size > 500 {
+		size = 100
+	}
+	if page < 0 {
+		page = 0
+	}
+	where, args := t.pageWhere(f)
 	if err = t.db.QueryRow(`SELECT COUNT(*) FROM exchanges`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
@@ -1136,7 +1281,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	}
 	// id embeds capture timestamp + sequence, so a trailing id DESC makes the order
 	// total and pagination stable even when the sort column has many ties.
-	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges` +
+	sel := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,` + rewrittenExistsSQL + ` FROM exchanges` +
 		where + ` ORDER BY ` + col + ` ` + dir + `, id DESC LIMIT ? OFFSET ?`
 	qargs := append(append([]any{}, args...), size, page*size)
 	rs, err := t.db.Query(sel, qargs...)
@@ -1146,7 +1291,7 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	defer rs.Close()
 	for rs.Next() {
 		var m ExchangeMeta
-		if err := rs.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rs.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.Rewritten); err != nil {
 			return nil, 0, err
 		}
 		rows = append(rows, m)
@@ -1452,6 +1597,17 @@ func (t *Traffic) deleteWhere(tx *sql.Tx, where string, args ...any) (int64, err
 	if _, err := tx.Exec(`DELETE FROM exchange_bodies WHERE id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
 		return 0, fmt.Errorf("删除正文: %w", err)
 	}
+	if _, err := tx.Exec(`DELETE FROM stream_messages WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("删除流消息: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+		return 0, fmt.Errorf("删除改写记录: %w", err)
+	}
+	if t.fts {
+		if _, err := tx.Exec(`DELETE FROM ex_fts_pending WHERE id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
+			return 0, fmt.Errorf("删除待索引全文: %w", err)
+		}
+	}
 	if _, err := tx.Exec(`DELETE FROM blob_refs WHERE exchange_id IN (SELECT id FROM exchanges WHERE `+where+`)`, args...); err != nil {
 		return 0, fmt.Errorf("删除 blob 引用: %w", err)
 	}
@@ -1481,7 +1637,9 @@ func (t *Traffic) hostTrees(where string, args ...any) ([]string, error) {
 		if err := rows.Scan(&h); err != nil {
 			return nil, err
 		}
-		dirs = append(dirs, filepath.Join(t.dir, sanitize(h)))
+		if dir, ok := hostDir(t.dir, h); ok {
+			dirs = append(dirs, dir)
+		}
 	}
 	return dirs, rows.Err()
 }
@@ -1715,7 +1873,9 @@ func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64)
 	// own an orphaned directory that this deletion should take with it.
 	legacy := make([]string, 0, len(unique))
 	for _, h := range unique {
-		legacy = append(legacy, filepath.Join(t.dir, sanitize(h)))
+		if dir, ok := hostDir(t.dir, h); ok {
+			legacy = append(legacy, dir)
+		}
 	}
 
 	tx, err := t.db.Begin()
@@ -2374,7 +2534,15 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text("=== REQUEST ===\n" + clip(req, 2500) + "\n\n=== RESPONSE ===\n" + clip(resp, 4000)), nil
+			rewritten, ruleIDs, err := t.RewriteInfo(a.ID)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			head := ""
+			if rewritten {
+				head = fmt.Sprintf("=== REWRITTEN === rewrite rules %v changed this exchange in the proxy. Shown below: the request as the client sent it and the response as the target sent it, not the rewritten values.\n\n", ruleIDs)
+			}
+			return actool.Text(head + "=== REQUEST ===\n" + clip(req, 2500) + "\n\n=== RESPONSE ===\n" + clip(resp, 4000)), nil
 		},
 	})
 
@@ -2417,7 +2585,76 @@ func (t *Traffic) Tools() []actool.CoreTool {
 		},
 	})
 
-	return []actool.CoreTool{search, get, blob}
+	messages := actool.Build(actool.Spec{
+		Name:        "traffic_messages",
+		Description: "按顺序列出一条 WebSocket 或 SSE 流量的消息：方向 c2s（客户端到服务端）或 s2c（服务端到客户端）、类型、大小和最多 1KB 预览。direction 只看一侧时仍保留 meta 截断提示。默认 20 条，最多 50 条，用 offset 翻页。",
+		Schema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"id":        map[string]any{"type": "string", "description": "traffic_search 返回的流量 ID（WebSocket 101 或 SSE）"},
+				"direction": map[string]any{"type": "string", "enum": []any{"c2s", "s2c"}, "description": "只看该方向：c2s 或 s2c；省略则两边都返回"},
+				"offset":    map[string]any{"type": "integer", "description": "跳过的消息数，默认 0"},
+				"limit":     map[string]any{"type": "integer", "description": "返回条数，默认 20，最大 50"},
+			},
+			"required": []any{"id"},
+		},
+		ReadOnly:    ro,
+		Permissions: allow,
+		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+			var a struct {
+				ID        string
+				Direction string
+				Offset    int
+				Limit     int
+			}
+			_ = json.Unmarshal(in, &a)
+			if strings.TrimSpace(a.ID) == "" {
+				return actool.Errorf("id is a required parameter"), nil
+			}
+			if a.Limit <= 0 {
+				a.Limit = 20
+			}
+			if a.Limit > 50 {
+				a.Limit = 50
+			}
+			if a.Offset < 0 {
+				a.Offset = 0
+			}
+			a.Direction = strings.ToLower(strings.TrimSpace(a.Direction))
+			msgs, total, err := t.StreamMessagesByDirection(a.ID, a.Direction, a.Offset, a.Limit)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if total == 0 {
+				if a.Direction != "" {
+					return actool.Text(fmt.Sprintf("No %s stream messages recorded for this id (not a WebSocket/SSE record, or no message was sent in that direction).", a.Direction)), nil
+				}
+				return actool.Text("No stream messages recorded for this id (not a WebSocket/SSE record, or no message was exchanged)."), nil
+			}
+			type liteMsg struct {
+				Seq       int64  `json:"seq"`
+				Direction string `json:"direction"`
+				Type      string `json:"type"`
+				Event     string `json:"event,omitempty"`
+				Size      int    `json:"size"`
+				Preview   string `json:"preview"`
+				Blob      string `json:"blob,omitempty"`
+				Truncated bool   `json:"truncated,omitempty"`
+			}
+			lite := make([]liteMsg, 0, len(msgs))
+			for _, m := range msgs {
+				l := liteMsg{Seq: m.Seq, Direction: m.Direction, Type: m.Type, Event: m.Event, Size: m.Size, Preview: streamToolPreview(m), Truncated: m.Truncated}
+				if m.Blob != "" {
+					l.Blob = "@blob sha256:" + m.Blob
+				}
+				lite = append(lite, l)
+			}
+			b, _ := json.Marshal(lite)
+			return actool.Text(fmt.Sprintf("[messages %d-%d of %d]\n", a.Offset+1, a.Offset+len(msgs), total) + string(b)), nil
+		},
+	})
+
+	return []actool.CoreTool{search, get, blob, messages}
 }
 
 // SeedToolMetas returns the traffic tools built on a ZERO receiver, for seeding the

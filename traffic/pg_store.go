@@ -60,21 +60,48 @@ func (s *PGStore) InsertExchange(ctx context.Context, ex ExchangeWrite) error {
 		_, err = tx.ExecContext(ctx, `
 INSERT INTO traffic_exchanges(
     id, task_id, project_id, ts, host, method, url_template, url, status, content_type,
-    req_len, resp_len, req_head, resp_head, req_blob_key, resp_blob_key)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+    req_len, resp_len, req_head, resp_head, req_blob_key, resp_blob_key, rewritten)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 			ex.ID, ex.TaskID, ex.ProjectID, ex.TS.UTC(), ex.Host, ex.Method, ex.URLTemplate, ex.URL, ex.Status, ex.ContentType,
-			ex.ReqLen, ex.RespLen, ex.ReqHead, ex.RespHead, reqKey, respKey)
+			ex.ReqLen, ex.RespLen, ex.ReqHead, ex.RespHead, reqKey, respKey, ex.Rewritten)
 	} else {
 		_, err = tx.ExecContext(ctx, `
 UPDATE traffic_exchanges SET
     task_id=$2, project_id=$3, ts=$4, host=$5, method=$6, url_template=$7, url=$8, status=$9,
-    content_type=$10, req_len=$11, resp_len=$12, req_head=$13, resp_head=$14, req_blob_key=$15, resp_blob_key=$16
+    content_type=$10, req_len=$11, resp_len=$12, req_head=$13, resp_head=$14, req_blob_key=$15, resp_blob_key=$16,
+    rewritten=$17
 WHERE id=$1`,
 			ex.ID, ex.TaskID, ex.ProjectID, ex.TS.UTC(), ex.Host, ex.Method, ex.URLTemplate, ex.URL, ex.Status, ex.ContentType,
-			ex.ReqLen, ex.RespLen, ex.ReqHead, ex.RespHead, reqKey, respKey)
+			ex.ReqLen, ex.RespLen, ex.ReqHead, ex.RespHead, reqKey, respKey, ex.Rewritten)
 	}
 	if err != nil {
 		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM exchange_rewrites WHERE exchange_id=$1`, ex.ID); err != nil {
+		return err
+	}
+	for _, line := range ex.Rewrites {
+		var ruleID, hookID, hookVer any
+		if line.RuleID != 0 {
+			ruleID = line.RuleID
+		}
+		if line.HookID != 0 {
+			hookID = line.HookID
+		}
+		if line.HookVersion != 0 {
+			hookVer = line.HookVersion
+		}
+		kind := line.SourceKind
+		if kind == "" {
+			kind = "rule"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exchange_rewrites(
+exchange_id,seq,phase,source_kind,rule_id,hook_id,hook_version,rule_snapshot,action,field,outcome,reason,before_hash,after_hash,after_inline,after_blob)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+			ex.ID, line.Seq, line.Phase, kind, ruleID, hookID, hookVer, nullIfEmpty(line.RuleSnapshot), nullIfEmpty(line.Action), nullIfEmpty(line.Field),
+			line.Outcome, line.Reason, nullIfEmpty(line.BeforeHash), nullIfEmpty(line.AfterHash), line.AfterInline, nullIfEmpty(line.AfterBlob)); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -113,7 +140,7 @@ func (s *PGStore) ListExchanges(ctx context.Context, q ListQuery) ([]ExchangeMet
 	c := pgExchangeCols()
 	limit := a.ph(q.Size)
 	offset := a.ph(q.Page * q.Size)
-	query := `SELECT id, (extract(epoch FROM ts))::bigint, host, method, url_template, url, status, content_type, resp_len
+	query := `SELECT id, (extract(epoch FROM ts))::bigint, host, method, url_template, url, status, content_type, resp_len, '', rewritten
 FROM traffic_exchanges` + where + ` ORDER BY ` + orderSQL(q.Sort, q.Order, c) + ` LIMIT ` + limit + ` OFFSET ` + offset
 	rows, err := s.db.QueryContext(ctx, query, a.vals...)
 	if err != nil {
@@ -123,7 +150,7 @@ FROM traffic_exchanges` + where + ` ORDER BY ` + orderSQL(q.Sort, q.Order, c) + 
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.Rewritten); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, m)

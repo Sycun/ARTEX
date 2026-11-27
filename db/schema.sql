@@ -2395,3 +2395,137 @@ CREATE TABLE IF NOT EXISTS coverage_ledger_history (
     recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_coverage_ledger_history_task ON coverage_ledger_history(task_id, id);
+
+-- =====================================================================
+-- Phase 3: capture-proxy rewrite rules, tamper hooks, HAR/stream metadata.
+-- Appended idempotently. Sensitive JSON/text is sealed by db/secrets.go.
+-- =====================================================================
+
+ALTER TABLE traffic_exchanges ADD COLUMN IF NOT EXISTS rewritten BOOLEAN NOT NULL DEFAULT false;
+
+CREATE TABLE IF NOT EXISTS exchange_rewrites (
+    exchange_id   TEXT NOT NULL REFERENCES traffic_exchanges(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL,
+    phase         TEXT NOT NULL,
+    source_kind   TEXT NOT NULL DEFAULT 'rule',
+    rule_id       BIGINT,
+    hook_id       BIGINT,
+    hook_version  INTEGER,
+    rule_snapshot TEXT,
+    action        TEXT,
+    field         TEXT,
+    outcome       TEXT NOT NULL,
+    reason        TEXT NOT NULL DEFAULT '',
+    before_hash   TEXT,
+    after_hash    TEXT,
+    after_inline  BYTEA,
+    after_blob    TEXT,
+    PRIMARY KEY (exchange_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_exchange_rewrites_applied
+    ON exchange_rewrites (exchange_id) WHERE outcome = 'applied';
+
+CREATE TABLE IF NOT EXISTS traffic_stream_messages (
+    exchange_id  TEXT NOT NULL REFERENCES traffic_exchanges(id) ON DELETE CASCADE,
+    seq          INTEGER NOT NULL,
+    ts           BIGINT NOT NULL,
+    direction    TEXT NOT NULL,
+    kind         INTEGER NOT NULL,
+    event        TEXT NOT NULL DEFAULT '',
+    event_id     TEXT NOT NULL DEFAULT '',
+    retry        INTEGER NOT NULL DEFAULT 0,
+    size         INTEGER NOT NULL,
+    payload      BYTEA,
+    payload_blob TEXT,
+    truncated    BOOLEAN NOT NULL DEFAULT false,
+    PRIMARY KEY (exchange_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_stream_dir
+    ON traffic_stream_messages (exchange_id, direction, seq);
+
+-- Raw relay capture. Disabled unless SOCKS5 / transparent mode is explicitly on.
+-- PostgreSQL stores the same rows the SQLite sidecar stores; an empty backend
+-- returns a controlled error instead of panicking.
+CREATE TABLE IF NOT EXISTS raw_tcp_streams (
+    id          TEXT PRIMARY KEY,
+    protocol    TEXT NOT NULL DEFAULT 'tcp',
+    host        TEXT NOT NULL,
+    port        INTEGER NOT NULL,
+    started_at  BIGINT NOT NULL,
+    ended_at    BIGINT NOT NULL,
+    duration_ms BIGINT NOT NULL,
+    c2s_bytes   BIGINT NOT NULL DEFAULT 0,
+    s2c_bytes   BIGINT NOT NULL DEFAULT 0,
+    truncated   BOOLEAN NOT NULL DEFAULT false,
+    c2s_preview BYTEA,
+    c2s_blob    TEXT,
+    s2c_preview BYTEA,
+    s2c_blob    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_tcp_host ON raw_tcp_streams(host);
+CREATE INDEX IF NOT EXISTS idx_raw_tcp_started ON raw_tcp_streams(started_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS raw_udp_datagrams (
+    id             TEXT PRIMARY KEY,
+    association_id TEXT NOT NULL,
+    protocol       TEXT NOT NULL DEFAULT 'udp',
+    host           TEXT NOT NULL,
+    port           INTEGER NOT NULL,
+    direction      TEXT NOT NULL,
+    ts             BIGINT NOT NULL,
+    size           BIGINT NOT NULL DEFAULT 0,
+    preview        BYTEA,
+    blob           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_assoc ON raw_udp_datagrams(association_id, ts);
+CREATE INDEX IF NOT EXISTS idx_raw_udp_host ON raw_udp_datagrams(host);
+
+CREATE TABLE IF NOT EXISTS traffic_rewrite_rules (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT NOT NULL,
+    enabled    BOOLEAN NOT NULL DEFAULT false,
+    phase      TEXT NOT NULL CHECK (phase IN ('request', 'response')),
+    priority   INTEGER NOT NULL DEFAULT 0,
+    matchers   JSONB NOT NULL,
+    actions    JSONB NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+DROP TRIGGER IF EXISTS trg_traffic_rewrite_rules_upd ON traffic_rewrite_rules;
+CREATE TRIGGER trg_traffic_rewrite_rules_upd BEFORE UPDATE ON traffic_rewrite_rules
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS traffic_tamper_hooks (
+    id            BIGSERIAL PRIMARY KEY,
+    name          TEXT NOT NULL,
+    enabled       BOOLEAN NOT NULL DEFAULT false,
+    phase         TEXT NOT NULL CHECK (phase IN ('request', 'response')),
+    priority      INTEGER NOT NULL DEFAULT 0,
+    matchers      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source        TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    version       INTEGER NOT NULL DEFAULT 1,
+    note          TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+DROP TRIGGER IF EXISTS trg_traffic_tamper_hooks_upd ON traffic_tamper_hooks;
+CREATE TRIGGER trg_traffic_tamper_hooks_upd BEFORE UPDATE ON traffic_tamper_hooks
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS traffic_tamper_hook_versions (
+    id            BIGSERIAL PRIMARY KEY,
+    hook_id       BIGINT NOT NULL REFERENCES traffic_tamper_hooks(id) ON DELETE CASCADE,
+    version       INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    phase         TEXT NOT NULL CHECK (phase IN ('request', 'response')),
+    priority      INTEGER NOT NULL DEFAULT 0,
+    matchers      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source        TEXT NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    note          TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (hook_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_tamper_hook_versions_hook ON traffic_tamper_hook_versions(hook_id, version DESC);

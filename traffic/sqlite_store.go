@@ -52,7 +52,40 @@ VALUES(?,?,?,NULL,?,?,NULL)`,
 		ex.ID, ex.ReqHead, ex.ReqBody, ex.RespHead, ex.RespBody); err != nil {
 		return err
 	}
+	if err := writeSQLiteRewrites(ctx, tx, ex); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func writeSQLiteRewrites(ctx context.Context, tx *sql.Tx, ex ExchangeWrite) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM exchange_rewrites WHERE exchange_id=?`, ex.ID); err != nil {
+		return err
+	}
+	for _, line := range ex.Rewrites {
+		var ruleID, hookID, hookVer any
+		if line.RuleID != 0 {
+			ruleID = line.RuleID
+		}
+		if line.HookID != 0 {
+			hookID = line.HookID
+		}
+		if line.HookVersion != 0 {
+			hookVer = line.HookVersion
+		}
+		kind := line.SourceKind
+		if kind == "" {
+			kind = "rule"
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO exchange_rewrites(
+exchange_id,seq,phase,source_kind,rule_id,hook_id,hook_version,rule_snapshot,action,field,outcome,reason,before_hash,after_hash,after_inline,after_blob)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			ex.ID, line.Seq, line.Phase, kind, ruleID, hookID, hookVer, nullIfEmpty(line.RuleSnapshot), nullIfEmpty(line.Action), nullIfEmpty(line.Field),
+			line.Outcome, line.Reason, nullIfEmpty(line.BeforeHash), nullIfEmpty(line.AfterHash), line.AfterInline, nullIfEmpty(line.AfterBlob)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) ListExchanges(ctx context.Context, q ListQuery) ([]ExchangeMeta, int, error) {
@@ -68,7 +101,8 @@ func (s *SQLiteStore) ListExchanges(ctx context.Context, q ListQuery) ([]Exchang
 		return nil, 0, err
 	}
 	c := sqliteExchangeCols()
-	query := `SELECT e.id,e.ts,e.host,e.method,COALESCE(e.url_template,''),e.url,e.status,COALESCE(e.content_type,''),e.resp_len,COALESCE(e.path,'')` +
+	rewrittenCol := strings.ReplaceAll(rewrittenExistsSQL, "exchanges.id", "e.id")
+	query := `SELECT e.id,e.ts,e.host,e.method,COALESCE(e.url_template,''),e.url,e.status,COALESCE(e.content_type,''),e.resp_len,COALESCE(e.path,''),` + rewrittenCol +
 		from + where + ` ORDER BY ` + orderSQL(q.Sort, q.Order, c) + ` LIMIT ? OFFSET ?`
 	args := append(append([]any{}, a.vals...), q.Size, q.Page*q.Size)
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -79,7 +113,7 @@ func (s *SQLiteStore) ListExchanges(ctx context.Context, q ListQuery) ([]Exchang
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.Rewritten); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, m)

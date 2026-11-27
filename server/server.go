@@ -1093,7 +1093,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic/hosts", s.deleteTrafficHosts)
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
+	mux.HandleFunc("GET /api/traffic/stream", s.getTrafficStream)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
+	mux.HandleFunc("POST /api/traffic/ingest", s.ingestTraffic)
+	mux.HandleFunc("POST /api/traffic/replay", s.replayTraffic)
+	mux.HandleFunc("POST /api/traffic/import/har", s.importTrafficHAR)
+	mux.HandleFunc("GET /api/traffic/export/har", s.exportTrafficHAR)
+	mux.HandleFunc("GET /api/traffic/rewrite-rules", s.rewriteListRules)
+	mux.HandleFunc("POST /api/traffic/rewrite-rules", s.rewriteCreateRule)
+	mux.HandleFunc("PUT /api/traffic/rewrite-rules/{id}", s.rewriteUpdateRule)
+	mux.HandleFunc("DELETE /api/traffic/rewrite-rules/{id}", s.rewriteDeleteRule)
+	mux.HandleFunc("POST /api/traffic/rewrite-rules/{id}/toggle", s.rewriteToggleRule)
+	mux.HandleFunc("GET /api/traffic/hooks", s.tamperListHooks)
+	mux.HandleFunc("POST /api/traffic/hooks", s.tamperCreateHook)
+	mux.HandleFunc("PUT /api/traffic/hooks/{id}", s.tamperUpdateHook)
+	mux.HandleFunc("DELETE /api/traffic/hooks/{id}", s.tamperDeleteHook)
+	mux.HandleFunc("POST /api/traffic/hooks/{id}/toggle", s.tamperToggleHook)
+	mux.HandleFunc("GET /api/traffic/hooks/{id}/versions", s.tamperListHookVersions)
+	mux.HandleFunc("POST /api/traffic/hooks/{id}/rollback", s.tamperRollbackHook)
+	mux.HandleFunc("POST /api/traffic/hooks/dry-run", s.tamperDryRunHook)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // 按工具聚合调用次数
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
@@ -3920,17 +3938,18 @@ func (s *Server) getTraffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pageQuery := traffic.PageQuery{
-		Hosts:   taskHosts,
-		Host:    q.Get("host"),
-		Method:  q.Get("method"),
-		Query:   q.Get("q"),
-		Body:    q.Get("body"),
-		Path:    q.Get("path"),
-		Status:  q.Get("status"),
-		RespMin: int64(atoiDefault(q.Get("resp_min"), -1)),
-		RespMax: int64(atoiDefault(q.Get("resp_max"), -1)),
-		Sort:    q.Get("sort"),
-		Order:   q.Get("order"),
+		Hosts:     taskHosts,
+		Host:      q.Get("host"),
+		Method:    q.Get("method"),
+		Query:     q.Get("q"),
+		Body:      q.Get("body"),
+		Path:      q.Get("path"),
+		Status:    q.Get("status"),
+		Rewritten: q.Get("rewritten"),
+		RespMin:   int64(atoiDefault(q.Get("resp_min"), -1)),
+		RespMax:   int64(atoiDefault(q.Get("resp_max"), -1)),
+		Sort:      q.Get("sort"),
+		Order:     q.Get("order"),
 	}
 	ex, matched, _ := tr.Page(pageQuery, page, size)
 	count, _ := tr.Count() // global total, for the stat card
@@ -4083,7 +4102,15 @@ func (s *Server) getTrafficExchange(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"req": req, "resp": resp})
+	count, kind, serr := tr.StreamInfo(id)
+	if serr != nil {
+		log.Printf("[traffic] stream info for %s: %v", id, serr)
+	}
+	rewritten, ruleIDs, _ := tr.RewriteInfo(id)
+	writeJSON(w, 200, map[string]any{
+		"req": req, "resp": resp, "stream_count": count, "stream_kind": kind,
+		"rewritten": rewritten, "rewrite_rules": ruleIDs,
+	})
 }
 
 // getTrafficBlob streams one oversized body by its sha256. Bodies past the inline

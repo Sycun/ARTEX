@@ -3,8 +3,8 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
-import type { ChatMention } from "@/lib/chat-mentions";
 import { auth } from "@/lib/auth";
+import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle, mockTaskFileURL } from "@/lib/mock/handler";
 import type {
@@ -92,6 +92,8 @@ import type {
   SSTask,
   Stats,
   SystemMetrics,
+  TamperHook,
+  TamperHookVersion,
   Task,
   TaskArchive,
   TaskArchivePage,
@@ -114,8 +116,12 @@ import type {
   TrafficDetail,
   TrafficEvidenceRef,
   TrafficEvidenceRole,
+  TrafficHARImportResult,
   TrafficHost,
+  TrafficReplayResult,
   TrafficResp,
+  TrafficStreamDirection,
+  TrafficStreamPage,
   UpdateCheck,
   UpdateSettings,
   UsageStats,
@@ -1138,6 +1144,7 @@ export const api = {
       respMax?: string;
       sort?: string;
       order?: string;
+      rewritten?: string;
     } = {},
   ) =>
     get<TrafficResp>(
@@ -1149,6 +1156,7 @@ export const api = {
         (opts.body ? `&body=${encodeURIComponent(opts.body)}` : "") +
         (opts.path ? `&path=${encodeURIComponent(opts.path)}` : "") +
         (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
+        (opts.rewritten && opts.rewritten !== "all" ? `&rewritten=${encodeURIComponent(opts.rewritten)}` : "") +
         (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
         (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
         (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
@@ -1162,6 +1170,51 @@ export const api = {
   // Purges every exchange and compacts the index; `reclaimed` is the bytes of
   // index handed back to the filesystem. Evidence bound to findings is kept.
   trafficDeleteAll: () => del<{ deleted: number; reclaimed: number }>(`/traffic/all`),
+  trafficStream: (id: string, offset = 0, limit = 50, direction: TrafficStreamDirection = "") =>
+    get<TrafficStreamPage>(
+      `/traffic/stream?exchange=${encodeURIComponent(id)}&offset=${offset}&limit=${limit}${direction ? `&direction=${encodeURIComponent(direction)}` : ""}`,
+    ),
+  trafficReplay: (req: {
+    method: string;
+    url: string;
+    headers?: { name: string; value: string }[];
+    body?: string;
+    apply_rules?: boolean;
+  }) => post<TrafficReplayResult>("/traffic/replay", req),
+  trafficImportHAR: (rawJSON: string) =>
+    http<TrafficHARImportResult>("/traffic/import/har", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: rawJSON,
+    }),
+  trafficExportHAR: async (query: string) => {
+    const token = getToken();
+    const r = await apiFetch(`/api/traffic/export/har${query ? `?${query}` : ""}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!r.ok) throw new Error(`export: ${r.status}`);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "artex-traffic.har";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+  trafficHooks: () => get<{ hooks: TamperHook[]; enabled_by_env: boolean }>("/traffic/hooks"),
+  createTrafficHook: (body: { name: string; phase: string; priority: number; source: string; note: string }) =>
+    post<TamperHook>("/traffic/hooks", { ...body, enabled: false, matchers: {} }),
+  toggleTrafficHook: (id: number, enabled: boolean) => post<TamperHook>(`/traffic/hooks/${id}/toggle`, { enabled }),
+  trafficHookVersions: (id: number) => get<{ versions: TamperHookVersion[] }>(`/traffic/hooks/${id}/versions`),
+  rollbackTrafficHook: (id: number, version: number) => post<TamperHook>(`/traffic/hooks/${id}/rollback`, { version }),
+  dryRunTrafficHook: (body: {
+    source: string;
+    phase: string;
+    request: { method: string; url: string; headers: Record<string, string[]>; body: string };
+    response: { status: number; headers: Record<string, string[]>; body: string };
+  }) => post<Record<string, unknown>>("/traffic/hooks/dry-run", body),
 
   // ---- app settings (runtime toggles) ----
   intelligence: (scope: "tasks" | "assets", id: string, query: URLSearchParams) =>

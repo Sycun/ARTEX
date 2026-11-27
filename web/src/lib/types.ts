@@ -959,6 +959,7 @@ export interface TrafficExchange {
   status: number;
   content_type: string;
   resp_len: number;
+  rewritten?: boolean;
 }
 
 export interface TrafficResp {
@@ -975,6 +976,75 @@ export interface TrafficResp {
 export interface TrafficDetail {
   req: string;
   resp: string;
+  stream_count?: number;
+  stream_kind?: string;
+  rewritten?: boolean;
+  rewrite_rules?: number[];
+}
+
+export type TrafficStreamDirection = "" | "c2s" | "s2c";
+
+export interface TrafficStreamMessage {
+  seq: number;
+  ts: number;
+  direction: string;
+  type: string;
+  event?: string;
+  size: number;
+  payload: string;
+  encoding?: string;
+  blob?: string;
+  truncated?: boolean;
+}
+
+export interface TrafficStreamPage {
+  items: TrafficStreamMessage[];
+  total: number;
+  message_total: number;
+}
+
+export interface TrafficReplayHeader {
+  name: string;
+  value: string;
+}
+
+export interface TrafficReplayResult {
+  status: number;
+  headers: TrafficReplayHeader[];
+  raw: string;
+  duration_ms: number;
+  truncated: boolean;
+  recorded: boolean;
+}
+
+export interface TrafficHARImportResult {
+  imported: number;
+  skipped: number;
+  errors?: string[];
+}
+
+export interface TamperHook {
+  id: number;
+  name: string;
+  enabled: boolean;
+  phase: string;
+  priority: number;
+  source: string;
+  version: number;
+  note: string;
+  load_error?: string;
+  last_error?: { class?: string; message?: string };
+}
+
+export interface TamperHookVersion {
+  id: number;
+  hook_id: number;
+  version: number;
+  name: string;
+  phase: string;
+  source: string;
+  note: string;
+  created_at: string;
 }
 
 // One distinct recorded host with its exchange count (target picker).

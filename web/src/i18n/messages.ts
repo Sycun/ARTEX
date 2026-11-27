@@ -9,12 +9,14 @@ import { settingsMessages } from "./settings-messages";
 import { settingsRuntimeMessages } from "./settings-runtime-messages";
 import { taskMessages } from "./task-messages";
 import { termsMessages } from "./terms";
+import { trafficMessages } from "./traffic-messages";
 
 // Keep both languages together so each product message has an explicit translation.
 export const messages = {
   ...(screenCatalog as unknown as Record<string, readonly [string, string]>),
   ...termsMessages,
   ...taskMessages,
+  ...trafficMessages,
   ...notifyMessages,
   ...inlineEditorMessages,
   ...scheduleMessages,

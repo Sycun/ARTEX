@@ -24,6 +24,12 @@ import { LinkTrafficDialog } from "@/components/link-traffic-dialog";
 import { requestFromTraffic } from "@/components/repeater/repeater-http";
 import { seedFromEvidence } from "@/components/repeater/repeater-store";
 import {
+  TrafficHarActions,
+  TrafficHooksButton,
+  TrafficReplayPanel,
+  TrafficStreamPanel,
+} from "@/components/traffic-capture-tools";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -165,6 +171,7 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
   const [path, setPath] = React.useState("");
   const [pathQ, setPathQ] = React.useState("");
   const [statusFilter, setStatusFilter] = React.useState("all");
+  const [rewritten, setRewritten] = React.useState("all");
   const [respMin, setRespMin] = React.useState("");
   const [respMinQ, setRespMinQ] = React.useState("");
   const [respMax, setRespMax] = React.useState("");
@@ -211,13 +218,15 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
     return () => clearTimeout(t);
   }, [respMax]);
 
-  const hasAdvancedFilter = Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all";
+  const hasAdvancedFilter =
+    Boolean(bodyQ || pathQ || respMinQ || respMaxQ) || statusFilter !== "all" || rewritten !== "all";
   const resetAdvancedFilters = () => {
     setBody("");
     setBodyQ("");
     setPath("");
     setPathQ("");
     setStatusFilter("all");
+    setRewritten("all");
     setRespMin("");
     setRespMinQ("");
     setRespMax("");
@@ -228,7 +237,7 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values intentionally trigger a page reset.
   React.useEffect(() => {
     setPage(0);
-  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, taskId]);
+  }, [hostQ, queryQ, method, size, bodyQ, pathQ, statusFilter, respMinQ, respMaxQ, sort, taskId, rewritten]);
 
   // Load the current page. Auto-refresh only on page 0 (newest) so paging back
   // through history isn't yanked out from under the user.
@@ -242,6 +251,7 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
           body: bodyQ,
           path: pathQ,
           status: statusFilter,
+          rewritten,
           respMin: respMinQ,
           respMax: respMaxQ,
           sort: sort.field,
@@ -284,6 +294,7 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
     bodyQ,
     pathQ,
     statusFilter,
+    rewritten,
     respMinQ,
     respMaxQ,
     sort,
@@ -702,6 +713,24 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
             className="h-8 w-24"
           />
         </div>
+        <Select value={rewritten} onValueChange={setRewritten}>
+          <SelectTrigger className="h-8 w-36">
+            <SelectValue placeholder={ui("traffic.rewriteFilter")} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{ui("traffic.rewriteAll")}</SelectItem>
+            <SelectItem value="rewritten">{ui("traffic.rewriteOnly")}</SelectItem>
+            <SelectItem value="original">{ui("traffic.rewriteOriginal")}</SelectItem>
+          </SelectContent>
+        </Select>
+        <TrafficHarActions
+          query={new URLSearchParams({
+            ...(hostQ ? { host: hostQ } : {}),
+            ...(rewritten !== "all" ? { rewritten } : {}),
+          }).toString()}
+          onImported={() => setReloadTick((tick) => tick + 1)}
+        />
+        <TrafficHooksButton />
         {hasAdvancedFilter ? (
           <Button variant="ghost" size="sm" className="h-8" onClick={resetAdvancedFilters}>
             <FilterXIcon className="size-3.5" />
@@ -815,7 +844,10 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
                     <TableCell className="text-xs text-muted-foreground tabular-nums">{fmtTime(e.ts, ui)}</TableCell>
                     <TableCell className="font-mono text-xs">{e.host}</TableCell>
                     <TableCell>
-                      <MethodBadge method={e.method} />
+                      <div className="flex items-center gap-1">
+                        <MethodBadge method={e.method} />
+                        {e.rewritten ? <Badge variant="secondary">{ui("traffic.rewritten")}</Badge> : null}
+                      </div>
                     </TableCell>
                     <TableCell className="max-w-0">
                       <span className="block truncate font-mono text-xs">{e.url}</span>
@@ -877,6 +909,8 @@ export function TrafficHistory({ taskId }: { taskId?: string }) {
                   {importing ? ui("screen.73a589a315aab8") : ui("screen.f69052b85f5594")}
                 </Button>
               </SheetHeader>
+              <TrafficReplayPanel detail={detail} />
+              <TrafficStreamPanel exchangeId={selected.id} kind={detail?.stream_kind} />
               <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-hidden p-2 sm:grid-cols-2">
                 {[
                   ["request", ui("screen.719dd828ca88c8"), requestWithHost(detail?.req ?? "", selected)],

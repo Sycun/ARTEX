@@ -44,6 +44,27 @@ type ExchangeWrite struct {
 	RespHead    string
 	ReqBody     []byte
 	RespBody    []byte
+	Rewritten   bool
+	Rewrites    []RewriteTraceWrite
+}
+
+// RewriteTraceWrite is one rewrite or hook trace row stored with an exchange.
+type RewriteTraceWrite struct {
+	Seq          int
+	Phase        string
+	SourceKind   string
+	RuleID       int64
+	HookID       int64
+	HookVersion  int
+	RuleSnapshot string
+	Action       string
+	Field        string
+	Outcome      string
+	Reason       string
+	BeforeHash   string
+	AfterHash    string
+	AfterInline  []byte
+	AfterBlob    string
 }
 
 // ExchangeRead is metadata plus the raw bodies.
@@ -84,6 +105,7 @@ type ListQuery struct {
 	Query      string
 	Body       string
 	Status     string
+	Rewritten  string
 	RespMin    int64
 	RespMax    int64
 	TaskID     string
@@ -192,6 +214,9 @@ func whereSQL(q ListQuery, a *sqlArgs, c exchangeCols) (string, error) {
 	}
 	if cond, ok := statusSQL(q.Status, c.status, a.ph); ok {
 		add(cond)
+	}
+	if cond, ok := rewriteFilterSQL(q.Rewritten); ok {
+		add(strings.ReplaceAll(cond, "exchanges.id", c.id))
 	}
 	if q.RespMin >= 0 {
 		add(c.resp + " >= " + a.ph(q.RespMin))
